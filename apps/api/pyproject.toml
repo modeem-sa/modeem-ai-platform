@@ -3,6 +3,7 @@ name = "modeem-ai-api"
 version = "0.1.0"
 description = "Modeem AI Platform API — foundation phase"
 requires-python = ">=3.12"
+
 dependencies = [
     "fastapi",
     "uvicorn",
@@ -19,7 +20,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "httpx", "ruff"]
+dev = [
+    "pytest",
+    "httpx",
+    "ruff",
+]
 
 [tool.ruff]
 line-length = 100
@@ -30,4 +35,12 @@ target-version = "py312"
 ignore = ["B008"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = [
+    "tests"
+]
+
+# Fix package discovery for Docker build
+[tool.setuptools.packages.find]
+include = [
+    "app*"
+]
