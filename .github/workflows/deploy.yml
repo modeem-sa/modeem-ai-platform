@@ -1,0 +1,20 @@
+name: Deploy Modeem AI Platform
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run deployment script
+        run: |
+          chmod +x /home/ubuntu/deploy-modeem.sh
+          /home/ubuntu/deploy-modeem.sh
