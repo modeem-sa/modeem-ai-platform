@@ -1,21 +1,19 @@
-"""Centralized read-policy registry (Phase 2D, typed in Phase 2E).
+"""Centralized read-policy registry for bounded, read-only Odoo resources.
 
 The API caller NEVER supplies a raw Odoo model name, method name, raw
 domain, order string, or field TYPE. Callers use a Modeem `resource_key`;
 every model, field (with its expected value type), filter operator, and
 order field is allowlisted here, server-side only.
 
-Phase 2E ships ONLY the technical `countries` resource (res.country) to
-validate the generic read infrastructure. Business resources (partners,
-invoices, employees, ...) are added only after explicit approval of each
-domain — do not add them here speculatively. Only the value types needed
-by the current resource exist; relational/date types are added when a
-real approved resource requires them.
+Each business resource is added only after explicit approval of its model,
+server-owned base domain and minimal field set. Customer and customer-invoice
+summaries intentionally exclude private notes, banking data, invoice lines,
+attachments and every write operation.
 """
 
 import re
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 # Global request-shape bounds for the read-preview phase.
 MAX_FILTERS = 5
@@ -30,7 +28,7 @@ ABSOLUTE_MAX_PAGE_SIZE = 50
 # parent_of, raw domains, or arbitrary operators.
 SAFE_OPERATORS = frozenset({"=", "!=", "in", "ilike"})
 
-FieldValueType = Literal["integer", "string", "boolean", "number"]
+FieldValueType = Literal["integer", "string", "boolean", "number", "date", "many2one"]
 
 
 @dataclass(frozen=True)
@@ -65,6 +63,7 @@ class ReadPolicy:
     allowed_filter_fields: frozenset[str]
     allowed_filter_operators: frozenset[str]
     allowed_order_fields: frozenset[str]
+    base_domain: tuple[tuple[Any, ...], ...] = ()
     max_page_size: int = field(default=ABSOLUTE_MAX_PAGE_SIZE)
 
     @property
@@ -159,9 +158,122 @@ _BENEFICIARIES_SUMMARY = ReadPolicy(
     max_page_size=ABSOLUTE_MAX_PAGE_SIZE,
 )
 
+# Read-only customer summary. A server-owned domain restricts this resource to
+# customer partners; callers cannot remove or replace it. Private notes,
+# addresses, bank details, credit limits and chatter data are deliberately
+# excluded.
+_CUSTOMERS = ReadPolicy(
+    resource_key="customers",
+    odoo_model="res.partner",
+    fields=_fields(
+        ReadFieldPolicy(name="id", value_type="integer", nullable=False),
+        ReadFieldPolicy(
+            name="name",
+            value_type="string",
+            nullable=False,
+            max_length=255,
+            pattern=r"[^\x00-\x1f\x7f%_\\]{1,255}",
+        ),
+        ReadFieldPolicy(name="email", value_type="string", nullable=True, max_length=320),
+        ReadFieldPolicy(name="phone", value_type="string", nullable=True, max_length=64),
+        ReadFieldPolicy(name="mobile", value_type="string", nullable=True, max_length=64),
+        ReadFieldPolicy(name="vat", value_type="string", nullable=True, max_length=64),
+        ReadFieldPolicy(
+            name="company_type",
+            value_type="string",
+            nullable=False,
+            max_length=16,
+            pattern=r"(person|company)",
+        ),
+        ReadFieldPolicy(
+            name="customer_rank",
+            value_type="integer",
+            nullable=False,
+            min_value=0,
+        ),
+        ReadFieldPolicy(name="active", value_type="boolean", nullable=False),
+    ),
+    default_fields=(
+        "id",
+        "name",
+        "email",
+        "phone",
+        "mobile",
+        "vat",
+        "company_type",
+        "active",
+    ),
+    allowed_filter_fields=frozenset(
+        {"id", "name", "email", "vat", "company_type", "active"}
+    ),
+    allowed_filter_operators=SAFE_OPERATORS,
+    allowed_order_fields=frozenset({"id", "name"}),
+    base_domain=(("customer_rank", ">", 0),),
+    max_page_size=ABSOLUTE_MAX_PAGE_SIZE,
+)
+
+# Read-only customer invoice summary. Vendor bills, journal entries, lines,
+# attachments and free-text narration are outside this resource.
+_INVOICES = ReadPolicy(
+    resource_key="invoices",
+    odoo_model="account.move",
+    fields=_fields(
+        ReadFieldPolicy(name="id", value_type="integer", nullable=False),
+        ReadFieldPolicy(name="name", value_type="string", nullable=False, max_length=255),
+        ReadFieldPolicy(
+            name="move_type",
+            value_type="string",
+            nullable=False,
+            max_length=32,
+            pattern=r"(out_invoice|out_refund)",
+        ),
+        ReadFieldPolicy(
+            name="state",
+            value_type="string",
+            nullable=False,
+            max_length=16,
+            pattern=r"(draft|posted|cancel)",
+        ),
+        ReadFieldPolicy(name="invoice_date", value_type="date", nullable=True),
+        ReadFieldPolicy(name="invoice_date_due", value_type="date", nullable=True),
+        ReadFieldPolicy(name="partner_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="currency_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="amount_total", value_type="number", nullable=False),
+        ReadFieldPolicy(name="amount_residual", value_type="number", nullable=False),
+        ReadFieldPolicy(
+            name="payment_state",
+            value_type="string",
+            nullable=True,
+            max_length=32,
+        ),
+    ),
+    default_fields=(
+        "id",
+        "name",
+        "move_type",
+        "state",
+        "invoice_date",
+        "invoice_date_due",
+        "partner_id",
+        "currency_id",
+        "amount_total",
+        "amount_residual",
+        "payment_state",
+    ),
+    allowed_filter_fields=frozenset(
+        {"id", "name", "move_type", "state", "invoice_date", "payment_state"}
+    ),
+    allowed_filter_operators=SAFE_OPERATORS,
+    allowed_order_fields=frozenset({"id", "name", "invoice_date", "amount_total"}),
+    base_domain=(("move_type", "in", ("out_invoice", "out_refund")),),
+    max_page_size=ABSOLUTE_MAX_PAGE_SIZE,
+)
+
 READ_POLICIES: dict[str, ReadPolicy] = {
     _COUNTRIES.resource_key: _COUNTRIES,
     _BENEFICIARIES_SUMMARY.resource_key: _BENEFICIARIES_SUMMARY,
+    _CUSTOMERS.resource_key: _CUSTOMERS,
+    _INVOICES.resource_key: _INVOICES,
 }
 
 

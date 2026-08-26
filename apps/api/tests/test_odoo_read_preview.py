@@ -715,7 +715,14 @@ def test_every_policy_filter_field_has_explicit_spec():
     for policy in READ_POLICIES.values():
         assert policy.allowed_filter_fields <= set(policy.fields)
         for spec in policy.fields.values():
-            assert spec.value_type in ("integer", "string", "boolean", "number")
+            assert spec.value_type in (
+                "integer",
+                "string",
+                "boolean",
+                "number",
+                "date",
+                "many2one",
+            )
 
 def test_endpoint_rejects_bad_value_type_with_422(roles_seed, fake_odoo):
     client = _client()
@@ -748,3 +755,110 @@ def test_ilike_not_allowed_on_int_fields(fake_odoo):
     with pytest.raises(ReadPolicyError):
         _read(filters=[{"field": "id", "operator": "ilike", "value": "1"}])
     assert fake_odoo.xmlrpc_calls == []
+
+
+# --- Approved customer and invoice summaries ---------------------------------
+
+
+def test_customers_policy_is_read_only_customer_subset():
+    policy = get_policy("customers")
+    assert policy.odoo_model == "res.partner"
+    assert policy.base_domain == (("customer_rank", ">", 0),)
+    assert "comment" not in policy.allowed_fields
+    assert "bank_ids" not in policy.allowed_fields
+    assert "credit_limit" not in policy.allowed_fields
+
+
+def test_customer_read_uses_server_owned_domain(fake_odoo):
+    fake_odoo.records = [
+        {
+            "id": 10,
+            "name": "Acme Customer",
+            "email": "customer@example.com",
+            "phone": False,
+            "mobile": "+966500000000",
+            "vat": False,
+            "company_type": "company",
+            "active": True,
+        }
+    ]
+    page = _read(resource="customers", order_by="name")
+    assert page["records"][0]["phone"] is None
+    assert page["records"][0]["vat"] is None
+    execs = [p for m, p in fake_odoo.xmlrpc_calls if m == "execute_kw"]
+    assert execs[0][3] == "res.partner"
+    assert ["customer_rank", ">", 0] in execs[0][5][0]
+    assert execs[0][4] == "search_read"
+
+
+def test_invoices_policy_excludes_vendor_bills_and_lines():
+    policy = get_policy("invoices")
+    assert policy.odoo_model == "account.move"
+    assert policy.base_domain == (
+        ("move_type", "in", ("out_invoice", "out_refund")),
+    )
+    assert "invoice_line_ids" not in policy.allowed_fields
+    assert "line_ids" not in policy.allowed_fields
+    assert "narration" not in policy.allowed_fields
+
+
+def test_invoice_read_sanitizes_dates_and_relations(fake_odoo):
+    fake_odoo.records = [
+        {
+            "id": 20,
+            "name": "INV/2026/0001",
+            "move_type": "out_invoice",
+            "state": "posted",
+            "invoice_date": "2026-08-26",
+            "invoice_date_due": False,
+            "partner_id": [10, "Acme Customer"],
+            "currency_id": [2, "SAR"],
+            "amount_total": 1150.0,
+            "amount_residual": 0.0,
+            "payment_state": "paid",
+            "invoice_line_ids": [1, 2, 3],
+        }
+    ]
+    page = _read(resource="invoices", order_by="invoice_date", order_direction="desc")
+    record = page["records"][0]
+    assert record["invoice_date_due"] is None
+    assert record["partner_id"] == [10, "Acme Customer"]
+    assert "invoice_line_ids" not in record
+    execs = [p for m, p in fake_odoo.xmlrpc_calls if m == "execute_kw"]
+    assert execs[0][3] == "account.move"
+    assert ["move_type", "in", ["out_invoice", "out_refund"]] in execs[0][5][0]
+
+
+def test_invoice_json2_uses_allowlisted_model_and_domain(fake_odoo):
+    fake_odoo.records = []
+    _read(
+        resource="invoices",
+        transport="json2",
+        secret="valid-api-key",
+        order_by="name",
+    )
+    url, body, _headers = fake_odoo.json2_calls[0]
+    assert url.endswith("/json/2/account.move/search_read")
+    assert ["move_type", "in", ["out_invoice", "out_refund"]] in body["domain"]
+    assert "invoice_line_ids" not in body["fields"]
+
+
+def test_malformed_invoice_relation_is_rejected(fake_odoo):
+    fake_odoo.records = [
+        {
+            "id": 20,
+            "name": "INV/1",
+            "move_type": "out_invoice",
+            "state": "posted",
+            "invoice_date": "2026-08-26",
+            "invoice_date_due": False,
+            "partner_id": ["bad-id", "Customer"],
+            "currency_id": [2, "SAR"],
+            "amount_total": 10.0,
+            "amount_residual": 10.0,
+            "payment_state": "not_paid",
+        }
+    ]
+    with pytest.raises(ConnectorError) as exc:
+        _read(resource="invoices")
+    assert exc.value.code == "unsupported_response"

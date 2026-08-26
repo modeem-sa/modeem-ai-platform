@@ -50,9 +50,12 @@ def fake_odoo(monkeypatch, allow_outbound):
 
 
 def test_registry_contains_exactly_approved_resources():
-    # Phase 2F added beneficiaries_summary; nothing else may exist without
-    # explicit approval.
-    assert set(READ_POLICIES) == {"countries", "beneficiaries_summary"}
+    assert set(READ_POLICIES) == {
+        "countries",
+        "beneficiaries_summary",
+        "customers",
+        "invoices",
+    }
 
 
 def test_country_id_field_policy_is_integer():
@@ -491,10 +494,13 @@ def test_audit_never_contains_secret_or_username(roles_seed, monkeypatch):
 # --- Scope guards (38-41) ---------------------------------------------------------------------
 
 
-def test_no_new_business_resource():
-    # Phase 2F approved beneficiaries_summary; the registry may contain
-    # exactly the approved resources and nothing more.
-    assert list(READ_POLICIES) == ["countries", "beneficiaries_summary"]
+def test_only_approved_resources_are_registered():
+    assert list(READ_POLICIES) == [
+        "countries",
+        "beneficiaries_summary",
+        "customers",
+        "invoices",
+    ]
     policy = READ_POLICIES["countries"]
     assert policy.odoo_model == "res.country"
     assert set(policy.fields) == {"id", "name", "code"}

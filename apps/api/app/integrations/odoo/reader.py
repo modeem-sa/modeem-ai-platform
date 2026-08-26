@@ -16,6 +16,7 @@ Odoo record is persisted locally.
 """
 
 import re
+from datetime import date
 from typing import Any
 
 from . import http as safe_http
@@ -92,6 +93,16 @@ def _validate_typed_scalar(field_policy: ReadFieldPolicy, value: Any) -> Any:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ReadPolicyError("filter value type mismatch")
         return value
+    if kind == "date":
+        if not isinstance(value, str):
+            raise ReadPolicyError("filter value type mismatch")
+        try:
+            date.fromisoformat(value)
+        except ValueError as exc:
+            raise ReadPolicyError("filter value has invalid format") from exc
+        return value
+    if kind == "many2one":
+        raise ReadPolicyError("relational filters are not supported")
     raise ReadPolicyError("unsupported filter value type")
 
 
@@ -155,13 +166,15 @@ def _validate_pagination(policy: ReadPolicy, limit: int, offset: int) -> None:
         raise ReadPolicyError("offset out of range")
 
 
-def _check_output_value(field_policy: ReadFieldPolicy, value: Any) -> None:
+def _sanitize_output_value(field_policy: ReadFieldPolicy, value: Any) -> Any:
     """Strict output-type validation per the server-side field policy.
     NO silent coercion of attacker-controlled upstream values; a mismatch
     raises safe unsupported_response with NO raw value in the detail."""
-    if value is None:
+    if value is None or (
+        value is False and field_policy.nullable and field_policy.value_type != "boolean"
+    ):
         if field_policy.nullable:
-            return
+            return None
         raise ConnectorError("unsupported_response", "null field value")
     kind = field_policy.value_type
     if kind == "integer":
@@ -178,8 +191,30 @@ def _check_output_value(field_policy: ReadFieldPolicy, value: Any) -> None:
     elif kind == "number":
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ConnectorError("unsupported_response", "field type mismatch")
-    else:  # pragma: no cover - registry only defines the four types
+    elif kind == "date":
+        if not isinstance(value, str):
+            raise ConnectorError("unsupported_response", "field type mismatch")
+        try:
+            date.fromisoformat(value)
+        except ValueError as exc:
+            raise ConnectorError(
+                "unsupported_response", "invalid date value"
+            ) from exc
+    elif kind == "many2one":
+        if (
+            not isinstance(value, (list, tuple))
+            or len(value) != 2
+            or isinstance(value[0], bool)
+            or not isinstance(value[0], int)
+            or value[0] <= 0
+            or not isinstance(value[1], str)
+            or len(value[1]) > 255
+        ):
+            raise ConnectorError("unsupported_response", "invalid relation value")
+        return [value[0], value[1]]
+    else:  # pragma: no cover - registry defines only the listed types
         raise ConnectorError("unsupported_response", "unknown field type")
+    return value
 
 
 def _sanitize_records(
@@ -206,8 +241,7 @@ def _sanitize_records(
         for k in fields:
             if k not in record:
                 continue
-            _check_output_value(policy.fields[k], record[k])
-            clean[k] = record[k]
+            clean[k] = _sanitize_output_value(policy.fields[k], record[k])
         sanitized.append(clean)
     return sanitized
 
@@ -236,7 +270,8 @@ def read_page(
     if policy is None:
         raise ReadPolicyError("unknown resource")
     safe_fields = _validate_fields(policy, fields)
-    domain = _validate_filters(policy, filters)
+    domain = [list(term) for term in policy.base_domain]
+    domain.extend(_validate_filters(policy, filters))
     safe_order = _validate_order(policy, order_by, order_direction)
     _validate_pagination(policy, limit, offset)
     if transport not in _ALLOWED_TRANSPORTS:

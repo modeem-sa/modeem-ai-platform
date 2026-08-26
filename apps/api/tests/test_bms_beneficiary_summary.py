@@ -94,8 +94,8 @@ def _read(transport="xmlrpc", secret=SECRET, **overrides):
 # --- Registry & field policy (spec 1-19) -------------------------------------
 
 
-def test_registry_has_exactly_two_resources():
-    assert set(READ_POLICIES) == {"countries", "beneficiaries_summary"}
+def test_registry_keeps_beneficiary_resource_registered():
+    assert {"countries", "beneficiaries_summary"} <= set(READ_POLICIES)
 
 
 def test_maps_exactly_to_bms_beneficiary_model():

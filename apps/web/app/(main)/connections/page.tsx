@@ -26,7 +26,7 @@ type ConnectionOut = {
   updated_at: string;
 };
 
-type PreviewResource = "countries" | "beneficiaries_summary";
+type PreviewResource = "countries" | "beneficiaries_summary" | "customers" | "invoices";
 
 type PreviewRecord = {
   id?: number;
@@ -35,6 +35,21 @@ type PreviewRecord = {
   is_family?: boolean;
   total_draft_supports?: number;
   total_paid_supports?: number;
+  email?: string | null;
+  phone?: string | null;
+  mobile?: string | null;
+  vat?: string | null;
+  company_type?: string;
+  active?: boolean;
+  move_type?: string;
+  state?: string;
+  invoice_date?: string | null;
+  invoice_date_due?: string | null;
+  partner_id?: [number, string] | null;
+  currency_id?: [number, string] | null;
+  amount_total?: number;
+  amount_residual?: number;
+  payment_state?: string | null;
 };
 
 type PreviewPage = {
@@ -45,15 +60,6 @@ type PreviewPage = {
   returned_count: number;
   has_more: boolean;
   next_offset: number | null;
-};
-
-type TestResult = {
-  success: boolean;
-  error_code: string | null;
-  odoo_version: string | null;
-  edition: string | null;
-  transport: string | null;
-  tested_at: string;
 };
 
 function csrfHeaders(): Record<string, string> {
@@ -93,7 +99,6 @@ export default function ConnectionsPage() {
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [testingId, setTestingId] = useState<string | null>(null);
-  const [testResults, setTestResults] = useState<Record<string, TestResult>>({});
   const [previewConn, setPreviewConn] = useState<ConnectionOut | null>(null);
   const [previewResource, setPreviewResource] = useState<PreviewResource>("countries");
   const [previewPage, setPreviewPage] = useState<PreviewPage | null>(null);
@@ -211,8 +216,7 @@ export default function ConnectionsPage() {
         headers: csrfHeaders(),
       });
       if (res.ok) {
-        const data: TestResult = await res.json();
-        setTestResults((prev) => ({ ...prev, [c.id]: data }));
+        await res.json();
       }
       await load();
     } finally {
@@ -442,7 +446,7 @@ export default function ConnectionsPage() {
 
         {previewConn && canWrite && (
           <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-            <div className="w-full max-w-2xl rounded-xl border border-slate-800 bg-slate-900 p-6 shadow-xl">
+            <div className="w-full max-w-6xl rounded-xl border border-slate-800 bg-slate-900 p-6 shadow-xl">
               <div className="flex items-center justify-between">
                 <h2 className="text-lg font-semibold text-white">
                   {t("connPreviewTitle")} — {previewConn.name}
@@ -467,6 +471,8 @@ export default function ConnectionsPage() {
                   >
                     <option value="countries">{t("previewCountries")}</option>
                     <option value="beneficiaries_summary">{t("previewBeneficiaries")}</option>
+                    <option value="customers">{t("previewCustomers")}</option>
+                    <option value="invoices">{t("previewInvoices")}</option>
                   </select>
                 </label>
                 <label>
@@ -502,11 +508,29 @@ export default function ConnectionsPage() {
                         <th className="px-4 py-2 text-start font-medium">{t("previewName")}</th>
                         {previewResource === "countries" ? (
                           <th className="px-4 py-2 text-start font-medium">{t("previewCode")}</th>
-                        ) : (
+                        ) : previewResource === "beneficiaries_summary" ? (
                           <>
                             <th className="px-4 py-2 text-start font-medium">{t("previewIsFamily")}</th>
                             <th className="px-4 py-2 text-start font-medium">{t("previewDraftSupports")}</th>
                             <th className="px-4 py-2 text-start font-medium">{t("previewPaidSupports")}</th>
+                          </>
+                        ) : previewResource === "customers" ? (
+                          <>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewEmail")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewPhone")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewVat")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewCompanyType")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("active")}</th>
+                          </>
+                        ) : (
+                          <>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewCustomer")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewInvoiceDate")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewDueDate")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewTotal")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewResidual")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewPaymentState")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("status")}</th>
                           </>
                         )}
                       </tr>
@@ -518,7 +542,7 @@ export default function ConnectionsPage() {
                           <td className="px-4 py-2">{r.name ?? "—"}</td>
                           {previewResource === "countries" ? (
                             <td className="px-4 py-2" dir="ltr">{r.code ?? "—"}</td>
-                          ) : (
+                          ) : previewResource === "beneficiaries_summary" ? (
                             <>
                               <td className="px-4 py-2">
                                 {typeof r.is_family === "boolean"
@@ -537,6 +561,44 @@ export default function ConnectionsPage() {
                                   ? r.total_paid_supports
                                   : "—"}
                               </td>
+                            </>
+                          ) : previewResource === "customers" ? (
+                            <>
+                              <td className="px-4 py-2" dir="ltr">{r.email ?? "—"}</td>
+                              <td className="px-4 py-2" dir="ltr">
+                                {r.phone ?? r.mobile ?? "—"}
+                              </td>
+                              <td className="px-4 py-2" dir="ltr">{r.vat ?? "—"}</td>
+                              <td className="px-4 py-2">
+                                {r.company_type === "company"
+                                  ? t("previewCompany")
+                                  : t("previewPerson")}
+                              </td>
+                              <td className="px-4 py-2">
+                                {typeof r.active === "boolean"
+                                  ? r.active
+                                    ? t("previewYes")
+                                    : t("previewNo")
+                                  : "—"}
+                              </td>
+                            </>
+                          ) : (
+                            <>
+                              <td className="px-4 py-2">{r.partner_id?.[1] ?? "—"}</td>
+                              <td className="px-4 py-2" dir="ltr">{r.invoice_date ?? "—"}</td>
+                              <td className="px-4 py-2" dir="ltr">{r.invoice_date_due ?? "—"}</td>
+                              <td className="px-4 py-2" dir="ltr">
+                                {typeof r.amount_total === "number"
+                                  ? `${r.amount_total} ${r.currency_id?.[1] ?? ""}`.trim()
+                                  : "—"}
+                              </td>
+                              <td className="px-4 py-2" dir="ltr">
+                                {typeof r.amount_residual === "number"
+                                  ? `${r.amount_residual} ${r.currency_id?.[1] ?? ""}`.trim()
+                                  : "—"}
+                              </td>
+                              <td className="px-4 py-2">{r.payment_state ?? "—"}</td>
+                              <td className="px-4 py-2">{r.state ?? "—"}</td>
                             </>
                           )}
                         </tr>
