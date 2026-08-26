@@ -55,6 +55,7 @@ def test_registry_contains_exactly_approved_resources():
         "beneficiaries_summary",
         "customers",
         "invoices",
+        "installed_modules",
     }
 
 
@@ -500,6 +501,7 @@ def test_only_approved_resources_are_registered():
         "beneficiaries_summary",
         "customers",
         "invoices",
+        "installed_modules",
     ]
     policy = READ_POLICIES["countries"]
     assert policy.odoo_model == "res.country"

@@ -862,3 +862,29 @@ def test_malformed_invoice_relation_is_rejected(fake_odoo):
     with pytest.raises(ConnectorError) as exc:
         _read(resource="invoices")
     assert exc.value.code == "unsupported_response"
+
+
+def test_installed_modules_policy_is_inventory_only():
+    policy = get_policy("installed_modules")
+    assert policy.odoo_model == "ir.module.module"
+    assert policy.base_domain == (("state", "=", "installed"),)
+    assert "state" not in policy.allowed_filter_fields
+    assert "latest_version" not in policy.allowed_fields
+
+
+def test_installed_module_read_uses_fixed_installed_domain(fake_odoo):
+    fake_odoo.records = [
+        {
+            "id": 100,
+            "name": "modeem_bms",
+            "shortdesc": "Modeem Beneficiary Management",
+            "installed_version": "16.0.1.0.0",
+            "application": True,
+            "category_id": [1, "Services"],
+        }
+    ]
+    page = _read(resource="installed_modules", order_by="name")
+    assert page["records"][0]["name"] == "modeem_bms"
+    execs = [p for m, p in fake_odoo.xmlrpc_calls if m == "execute_kw"]
+    assert execs[0][3] == "ir.module.module"
+    assert ["state", "=", "installed"] in execs[0][5][0]

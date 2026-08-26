@@ -269,11 +269,57 @@ _INVOICES = ReadPolicy(
     max_page_size=ABSOLUTE_MAX_PAGE_SIZE,
 )
 
+# Technical module inventory used to compare the live Odoo database with the
+# approved repository catalog. Only installed modules are returned; callers
+# cannot query uninstalled applications or arbitrary ir.model metadata.
+_INSTALLED_MODULES = ReadPolicy(
+    resource_key="installed_modules",
+    odoo_model="ir.module.module",
+    fields=_fields(
+        ReadFieldPolicy(name="id", value_type="integer", nullable=False),
+        ReadFieldPolicy(
+            name="name",
+            value_type="string",
+            nullable=False,
+            max_length=255,
+            pattern=r"[A-Za-z0-9_]{1,255}",
+        ),
+        ReadFieldPolicy(
+            name="shortdesc",
+            value_type="string",
+            nullable=False,
+            max_length=255,
+        ),
+        ReadFieldPolicy(
+            name="installed_version",
+            value_type="string",
+            nullable=True,
+            max_length=64,
+        ),
+        ReadFieldPolicy(name="application", value_type="boolean", nullable=False),
+        ReadFieldPolicy(name="category_id", value_type="many2one", nullable=True),
+    ),
+    default_fields=(
+        "id",
+        "name",
+        "shortdesc",
+        "installed_version",
+        "application",
+        "category_id",
+    ),
+    allowed_filter_fields=frozenset({"id", "name", "application"}),
+    allowed_filter_operators=SAFE_OPERATORS,
+    allowed_order_fields=frozenset({"id", "name"}),
+    base_domain=(("state", "=", "installed"),),
+    max_page_size=ABSOLUTE_MAX_PAGE_SIZE,
+)
+
 READ_POLICIES: dict[str, ReadPolicy] = {
     _COUNTRIES.resource_key: _COUNTRIES,
     _BENEFICIARIES_SUMMARY.resource_key: _BENEFICIARIES_SUMMARY,
     _CUSTOMERS.resource_key: _CUSTOMERS,
     _INVOICES.resource_key: _INVOICES,
+    _INSTALLED_MODULES.resource_key: _INSTALLED_MODULES,
 }
 
 

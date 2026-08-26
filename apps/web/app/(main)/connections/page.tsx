@@ -26,7 +26,12 @@ type ConnectionOut = {
   updated_at: string;
 };
 
-type PreviewResource = "countries" | "beneficiaries_summary" | "customers" | "invoices";
+type PreviewResource =
+  | "countries"
+  | "beneficiaries_summary"
+  | "customers"
+  | "invoices"
+  | "installed_modules";
 
 type PreviewRecord = {
   id?: number;
@@ -50,6 +55,10 @@ type PreviewRecord = {
   amount_total?: number;
   amount_residual?: number;
   payment_state?: string | null;
+  shortdesc?: string;
+  installed_version?: string | null;
+  application?: boolean;
+  category_id?: [number, string] | null;
 };
 
 type PreviewPage = {
@@ -473,6 +482,7 @@ export default function ConnectionsPage() {
                     <option value="beneficiaries_summary">{t("previewBeneficiaries")}</option>
                     <option value="customers">{t("previewCustomers")}</option>
                     <option value="invoices">{t("previewInvoices")}</option>
+                    <option value="installed_modules">{t("previewInstalledModules")}</option>
                   </select>
                 </label>
                 <label>
@@ -522,7 +532,7 @@ export default function ConnectionsPage() {
                             <th className="px-4 py-2 text-start font-medium">{t("previewCompanyType")}</th>
                             <th className="px-4 py-2 text-start font-medium">{t("active")}</th>
                           </>
-                        ) : (
+                        ) : previewResource === "invoices" ? (
                           <>
                             <th className="px-4 py-2 text-start font-medium">{t("previewCustomer")}</th>
                             <th className="px-4 py-2 text-start font-medium">{t("previewInvoiceDate")}</th>
@@ -531,6 +541,13 @@ export default function ConnectionsPage() {
                             <th className="px-4 py-2 text-start font-medium">{t("previewResidual")}</th>
                             <th className="px-4 py-2 text-start font-medium">{t("previewPaymentState")}</th>
                             <th className="px-4 py-2 text-start font-medium">{t("status")}</th>
+                          </>
+                        ) : (
+                          <>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewModuleTitle")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewModuleVersion")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewModuleCategory")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewModuleApplication")}</th>
                           </>
                         )}
                       </tr>
@@ -582,7 +599,7 @@ export default function ConnectionsPage() {
                                   : "—"}
                               </td>
                             </>
-                          ) : (
+                          ) : previewResource === "invoices" ? (
                             <>
                               <td className="px-4 py-2">{r.partner_id?.[1] ?? "—"}</td>
                               <td className="px-4 py-2" dir="ltr">{r.invoice_date ?? "—"}</td>
@@ -599,6 +616,21 @@ export default function ConnectionsPage() {
                               </td>
                               <td className="px-4 py-2">{r.payment_state ?? "—"}</td>
                               <td className="px-4 py-2">{r.state ?? "—"}</td>
+                            </>
+                          ) : (
+                            <>
+                              <td className="px-4 py-2">{r.shortdesc ?? "—"}</td>
+                              <td className="px-4 py-2" dir="ltr">
+                                {r.installed_version ?? "—"}
+                              </td>
+                              <td className="px-4 py-2">{r.category_id?.[1] ?? "—"}</td>
+                              <td className="px-4 py-2">
+                                {typeof r.application === "boolean"
+                                  ? r.application
+                                    ? t("previewYes")
+                                    : t("previewNo")
+                                  : "—"}
+                              </td>
                             </>
                           )}
                         </tr>
