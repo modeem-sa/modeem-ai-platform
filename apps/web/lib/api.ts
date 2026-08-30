@@ -11,11 +11,13 @@
 const FETCH_BASE = process.env.NEXT_PUBLIC_API_BASE_URL?.trim() || "/backend";
 
 export class ApiError extends Error {
+  public readonly status: number;
   constructor(
-    public readonly status: number,
+    status: number,
     message: string,
   ) {
     super(message);
+    this.status = status;
     this.name = "ApiError";
   }
 }
