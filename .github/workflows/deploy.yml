@@ -4,6 +4,10 @@ on:
   push:
     branches:
       - main
+    paths-ignore:
+      - 'replit.md'
+      - 'README.md'
+      - 'docs/**'
   workflow_dispatch:
 
 concurrency:
