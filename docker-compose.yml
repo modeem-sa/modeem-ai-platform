@@ -1,6 +1,7 @@
 # Docker Compose for local development OUTSIDE Replit.
 # (Replit does not run containers; there the services run via Replit workflows
 # and the built-in PostgreSQL database.)
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -32,47 +33,53 @@ services:
     build:
       context: .
       dockerfile: infrastructure/docker/api.Dockerfile
+
+    # Load local server environment variables
+    # .env stays outside Git and will not be modified by CI/CD
+    env_file:
+      - .env
+
     environment:
       ENVIRONMENT: development
+      SESSION_SECRET: modeem-dev-secret-change-later
       DATABASE_URL: postgresql://modeem:modeem@postgres:5432/modeem
       REDIS_URL: redis://redis:6379/0
-      SESSION_SECRET: ${SESSION_SECRET}
-      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
-      CONNECTION_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
-      AI_INTEGRATIONS_OPENAI_BASE_URL: ${AI_INTEGRATIONS_OPENAI_BASE_URL}
-      AI_INTEGRATIONS_OPENAI_API_KEY: ${AI_INTEGRATIONS_OPENAI_API_KEY}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      MODEEM_AI_MODEL: ${MODEEM_AI_MODEL}
+
     ports:
       - "8000:8000"
+
     depends_on:
       postgres:
         condition: service_healthy
+
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')\""]
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')\""
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
+
 
   operations-worker:
     build:
       context: .
       dockerfile: infrastructure/docker/api.Dockerfile
+
+    env_file:
+      - .env
+
     environment:
       ENVIRONMENT: development
+      SESSION_SECRET: modeem-dev-secret-change-later
       DATABASE_URL: postgresql://modeem:modeem@postgres:5432/modeem
       REDIS_URL: redis://redis:6379/0
-      SESSION_SECRET: ${SESSION_SECRET}
-      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
-      CONNECTION_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
-      AI_INTEGRATIONS_OPENAI_BASE_URL: ${AI_INTEGRATIONS_OPENAI_BASE_URL}
-      AI_INTEGRATIONS_OPENAI_API_KEY: ${AI_INTEGRATIONS_OPENAI_API_KEY}
-      OPENAI_BASE_URL: ${OPENAI_BASE_URL}
-      OPENAI_API_KEY: ${OPENAI_API_KEY}
-      MODEEM_AI_MODEL: ${MODEEM_AI_MODEL}
+
     command: python -m app.workers.operations
     restart: unless-stopped
+
     depends_on:
       api:
         condition: service_healthy
@@ -81,10 +88,19 @@ services:
     build:
       context: .
       dockerfile: infrastructure/docker/web.Dockerfile
+
+    # Load local server environment variables
+    # .env stays outside Git and will not be modified by CI/CD
+    env_file:
+      - .env
+
     environment:
-      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL}
+      SESSION_SECRET: modeem-dev-secret-change-later
+
     ports:
       - "3000:3000"
+
     depends_on:
       - api
 
