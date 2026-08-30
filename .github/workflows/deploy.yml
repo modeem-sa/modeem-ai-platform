@@ -1,0 +1,115 @@
+name: Deploy Modeem AI Platform
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'replit.md'
+      - 'README.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+concurrency:
+  group: modeem-ai-platform-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # -------------------------------------------------------
+      # Guard 1: Production must never depend on Replit runtime
+      # -------------------------------------------------------
+      - name: Block Replit-only production dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking for Replit-only production references..."
+
+          if grep -RInE \
+            'package-firewall\.replit\.local|replit\.local|replit\.dev|replit\.app' \
+            apps/web/package-lock.json \
+            apps/web/package.json \
+            apps/api/pyproject.toml \
+            infrastructure/docker \
+            docker-compose.yml
+          then
+            echo "::error::Replit-specific production dependency detected."
+            echo "::error::Production is deployed on an external Ubuntu Docker server."
+            exit 1
+          fi
+
+          echo "OK - No Replit-only production dependencies found."
+
+      # -------------------------------------------------------
+      # Guard 2: Protect Python API packaging fix
+      # -------------------------------------------------------
+      - name: Validate API packaging configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE="apps/api/pyproject.toml"
+
+          grep -Fq '[build-system]' "$FILE" || {
+            echo "::error::Missing [build-system] in pyproject.toml"
+            exit 1
+          }
+
+          grep -Fq 'build-backend = "setuptools.build_meta"' "$FILE" || {
+            echo "::error::Missing setuptools build backend"
+            exit 1
+          }
+
+          grep -Fq '[tool.setuptools.packages.find]' "$FILE" || {
+            echo "::error::Missing setuptools package discovery configuration"
+            exit 1
+          }
+
+          grep -Fq 'include = ["app*"]' "$FILE" || {
+            echo "::error::API package discovery protection was removed"
+            exit 1
+          }
+
+          echo "OK - API packaging protection exists."
+
+      # -------------------------------------------------------
+      # Guard 3: Protect deterministic Web Docker build
+      # -------------------------------------------------------
+      - name: Validate Web Dockerfile
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          FILE="infrastructure/docker/web.Dockerfile"
+
+          grep -Eq 'RUN[[:space:]]+npm ci([[:space:]]|$)' "$FILE" || {
+            echo "::error::Web Dockerfile must use npm ci"
+            exit 1
+          }
+
+          if grep -Eq 'RUN[[:space:]]+npm install([[:space:]]|&&|$)' "$FILE"; then
+            echo "::error::Do not replace npm ci with npm install in the production Web Dockerfile"
+            exit 1
+          fi
+
+          echo "OK - Web Dockerfile protection exists."
+
+      # -------------------------------------------------------
+      # Production deployment
+      # deploy-modeem.sh already performs:
+      # git update -> Docker build -> Docker up -> health check
+      # -------------------------------------------------------
+      - name: Run deployment script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x /home/ubuntu/deploy-modeem.sh
+          /home/ubuntu/deploy-modeem.sh
