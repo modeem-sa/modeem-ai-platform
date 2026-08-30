@@ -364,12 +364,12 @@ export default function ConnectionsPage() {
   const openPreview = (c: ConnectionOut) => {
     setPreviewConn(c);
     setPreviewPage(null);
-    setPreviewResource("countries");
+    setPreviewResource("companies");
     setInstalledModules(new Set());
     setCompanies([]);
     setCompanyId(null);
     void loadPreviewContext(c);
-    void loadPreview(c, 25, 0, "countries");
+    void loadPreview(c, 25, 0, "companies");
   };
 
   const changePreviewResource = (resource: PreviewResource) => {
@@ -407,9 +407,9 @@ export default function ConnectionsPage() {
   });
 
   return (
-    <div className="flex-1 flex flex-col">
+    <div className="flex min-w-0 flex-1 flex-col">
       <Header titleKey="connections" />
-      <main className="flex-1 p-6">
+      <main className="min-w-0 flex-1 p-6">
         <div className="mb-4 flex items-center justify-between">
           <div />
           {canWrite && (
@@ -559,16 +559,25 @@ export default function ConnectionsPage() {
         ) : null}
 
         {previewConn && canWrite && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
-            <div className="w-full max-w-6xl rounded-xl border border-slate-800 bg-slate-900 p-6 shadow-xl">
-              <div className="flex items-center justify-between">
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+            onClick={closePreview}
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              className="max-h-[calc(100vh-2rem)] w-full max-w-6xl overflow-y-auto rounded-xl border border-slate-800 bg-slate-900 p-6 shadow-xl"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <div className="sticky top-0 z-20 -mx-6 -mt-6 flex items-center justify-between border-b border-slate-800 bg-slate-900 px-6 py-4">
                 <h2 className="text-lg font-semibold text-white">
                   {t("connPreviewTitle")} — {previewConn.name}
                 </h2>
                 <button
                   onClick={closePreview}
-                  className="rounded-md border border-slate-700 px-3 py-1 text-sm text-slate-300 hover:bg-slate-800"
+                  className="rounded-md border border-slate-700 px-3 py-1.5 text-sm text-slate-200 hover:bg-slate-800"
                 >
+                  <span aria-hidden="true" className="me-1 text-base">×</span>
                   {t("connClose")}
                 </button>
               </div>
