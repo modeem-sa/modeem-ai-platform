@@ -437,7 +437,7 @@ def read_preview(
     Phase 2D. No Odoo record is ever persisted locally."""
     from app.integrations.odoo import reader as odoo_reader
     from app.integrations.odoo.errors import ConnectorError
-    from app.integrations.odoo.reader import ReadPolicyError
+    from app.integrations.odoo.reader import ReadPolicyError, ResourceUnavailableError
 
     conn = _scoped_get(db, ctx, connection_id)
     if not conn.is_active or conn.status == "disabled":
@@ -534,12 +534,19 @@ def read_preview(
             offset=body.offset,
             order_by=body.order_by,
             order_direction=body.order_direction,
+            company_id=body.company_id,
         )
     except ReadPolicyError as exc:
         # Modeem-side policy violation: safe static message, never sent
         # to Odoo and no upstream call was made.
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.message
+        ) from exc
+    except ResourceUnavailableError as exc:
+        _audit(success=False, returned_count=None, error_code="resource_unavailable")
+        db.flush()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=exc.message
         ) from exc
     except ConnectorError as exc:
         _audit(success=False, returned_count=None, error_code=exc.code)

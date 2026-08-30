@@ -31,7 +31,13 @@ type PreviewResource =
   | "beneficiaries_summary"
   | "customers"
   | "invoices"
-  | "installed_modules";
+  | "installed_modules"
+  | "companies"
+  | "employees_summary"
+  | "departments_summary"
+  | "vendor_bills"
+  | "payments_summary"
+  | "journals_summary";
 
 type PreviewRecord = {
   id?: number;
@@ -59,6 +65,16 @@ type PreviewRecord = {
   installed_version?: string | null;
   application?: boolean;
   category_id?: [number, string] | null;
+  job_title?: string | null;
+  department_id?: [number, string] | null;
+  manager_id?: [number, string] | null;
+  company_id?: [number, string] | null;
+  country_id?: [number, string] | null;
+  date?: string;
+  amount?: number;
+  payment_type?: string;
+  partner_type?: string;
+  type?: string;
 };
 
 type PreviewPage = {
@@ -70,6 +86,19 @@ type PreviewPage = {
   has_more: boolean;
   next_offset: number | null;
 };
+
+const COMPANY_SCOPED_RESOURCES = new Set<PreviewResource>([
+  "invoices",
+  "employees_summary",
+  "departments_summary",
+  "vendor_bills",
+  "payments_summary",
+  "journals_summary",
+]);
+
+function resourceRequiresCompany(resource: PreviewResource): boolean {
+  return COMPANY_SCOPED_RESOURCES.has(resource);
+}
 
 function csrfHeaders(): Record<string, string> {
   const match = document.cookie.match(/(?:^|;\s*)modeem_csrf=([^;]+)/);
@@ -107,6 +136,10 @@ export default function ConnectionsPage() {
   const [form, setForm] = useState<FormState>(emptyForm);
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const credentialMustBeReentered =
+    !editing ||
+    form.username.trim() !== (editing.username ?? "").trim() ||
+    form.auth_mode !== (editing.auth_mode ?? "auto");
   const [testingId, setTestingId] = useState<string | null>(null);
   const [previewConn, setPreviewConn] = useState<ConnectionOut | null>(null);
   const [previewResource, setPreviewResource] = useState<PreviewResource>("countries");
@@ -114,7 +147,10 @@ export default function ConnectionsPage() {
   const [previewLimit, setPreviewLimit] = useState(25);
   const [previewOffset, setPreviewOffset] = useState(0);
   const [previewLoading, setPreviewLoading] = useState(false);
-  const [previewError, setPreviewError] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [installedModules, setInstalledModules] = useState<Set<string>>(new Set());
+  const [companies, setCompanies] = useState<PreviewRecord[]>([]);
+  const [companyId, setCompanyId] = useState<number | null>(null);
   // Guards against out-of-order preview responses (e.g. switching
   // resource while a slower previous request is still in flight).
   const previewReqRef = useRef(0);
@@ -158,6 +194,10 @@ export default function ConnectionsPage() {
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (credentialMustBeReentered && !form.secret) {
+      setFormError(t("connSecretRequiredAfterIdentityChange"));
+      return;
+    }
     setSaving(true);
     setFormError(null);
     try {
@@ -238,28 +278,86 @@ export default function ConnectionsPage() {
     limit: number,
     offset: number,
     resource: PreviewResource,
+    selectedCompanyId: number | null = companyId,
   ) => {
     const reqId = ++previewReqRef.current;
     setPreviewLoading(true);
-    setPreviewError(false);
+    setPreviewError(null);
     try {
       const res = await fetch(`/backend/api/v1/connections/${c.id}/read-preview`, {
         method: "POST",
         credentials: "same-origin",
         headers: { "Content-Type": "application/json", ...csrfHeaders() },
         // Ordering uses only server-allowlisted fields (name for both resources).
-        body: JSON.stringify({ resource, limit, offset, order_by: "name", order_direction: "asc" }),
+        body: JSON.stringify({
+          resource,
+          limit,
+          offset,
+          order_by: "name",
+          order_direction: "asc",
+          ...(resourceRequiresCompany(resource) && selectedCompanyId
+            ? { company_id: selectedCompanyId }
+            : {}),
+        }),
       });
       if (reqId !== previewReqRef.current) return; // stale response; ignore
-      if (!res.ok) throw new Error();
+      if (!res.ok) {
+        const data = await res.json().catch(() => null);
+        const code = data?.detail?.error_code;
+        if (res.status === 409) throw new Error("unavailable");
+        if (code === "access_denied") throw new Error("access_denied");
+        throw new Error("preview");
+      }
       setPreviewPage(await res.json());
       setPreviewLimit(limit);
       setPreviewOffset(offset);
-    } catch {
+    } catch (error) {
       if (reqId !== previewReqRef.current) return;
-      setPreviewError(true);
+      const message = error instanceof Error ? error.message : "preview";
+      setPreviewError(
+        message === "unavailable"
+          ? t("previewModuleUnavailable")
+          : message === "access_denied"
+            ? t("previewAccessDenied")
+            : t("previewError"),
+      );
     } finally {
       if (reqId === previewReqRef.current) setPreviewLoading(false);
+    }
+  };
+
+  const loadPreviewContext = async (c: ConnectionOut) => {
+    const request = (body: Record<string, unknown>) =>
+      fetch(`/backend/api/v1/connections/${c.id}/read-preview`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", ...csrfHeaders() },
+        body: JSON.stringify(body),
+      });
+    try {
+      const [moduleRes, companyRes] = await Promise.all([
+        request({
+          resource: "installed_modules",
+          filters: [{ field: "name", operator: "in", value: ["hr", "account"] }],
+          limit: 10,
+          order_by: "name",
+        }),
+        request({ resource: "companies", limit: 50, order_by: "name" }),
+      ]);
+      if (moduleRes.ok) {
+        const page: PreviewPage = await moduleRes.json();
+        setInstalledModules(new Set(page.records.map((r) => r.name).filter(Boolean) as string[]));
+      }
+      if (companyRes.ok) {
+        const page: PreviewPage = await companyRes.json();
+        setCompanies(page.records);
+        const firstId = page.records.find((r) => typeof r.id === "number")?.id ?? null;
+        setCompanyId(firstId);
+      }
+    } catch {
+      setInstalledModules(new Set());
+      setCompanies([]);
+      setCompanyId(null);
     }
   };
 
@@ -267,6 +365,10 @@ export default function ConnectionsPage() {
     setPreviewConn(c);
     setPreviewPage(null);
     setPreviewResource("countries");
+    setInstalledModules(new Set());
+    setCompanies([]);
+    setCompanyId(null);
+    void loadPreviewContext(c);
     void loadPreview(c, 25, 0, "countries");
   };
 
@@ -281,10 +383,13 @@ export default function ConnectionsPage() {
   const closePreview = () => {
     setPreviewConn(null);
     setPreviewPage(null);
-    setPreviewError(false);
+    setPreviewError(null);
     setPreviewOffset(0);
     setPreviewLimit(25);
     setPreviewResource("countries");
+    setInstalledModules(new Set());
+    setCompanies([]);
+    setCompanyId(null);
   };
 
   const disable = async (c: ConnectionOut) => {
@@ -483,8 +588,50 @@ export default function ConnectionsPage() {
                     <option value="customers">{t("previewCustomers")}</option>
                     <option value="invoices">{t("previewInvoices")}</option>
                     <option value="installed_modules">{t("previewInstalledModules")}</option>
+                    <option value="companies">{t("previewCompanies")}</option>
+                    {installedModules.has("hr") && (
+                      <>
+                        <option value="employees_summary">{t("previewEmployees")}</option>
+                        <option value="departments_summary">{t("previewDepartments")}</option>
+                      </>
+                    )}
+                    {installedModules.has("account") && (
+                      <>
+                        <option value="vendor_bills">{t("previewVendorBills")}</option>
+                        <option value="payments_summary">{t("previewPayments")}</option>
+                        <option value="journals_summary">{t("previewJournals")}</option>
+                      </>
+                    )}
                   </select>
                 </label>
+                {resourceRequiresCompany(previewResource) && (
+                  <label>
+                    {t("previewCompanyScope")}
+                    <select
+                      value={companyId ?? ""}
+                      onChange={(e) => {
+                        const next = Number(e.target.value);
+                        setCompanyId(next);
+                        setPreviewPage(null);
+                        setPreviewOffset(0);
+                        void loadPreview(
+                          previewConn,
+                          previewLimit,
+                          0,
+                          previewResource,
+                          next,
+                        );
+                      }}
+                      className="ms-2 rounded-md border border-slate-700 bg-slate-950 px-2 py-1 text-white"
+                    >
+                      {companies.map((company) => (
+                        <option key={company.id} value={company.id}>
+                          {company.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
                 <label>
                   {t("previewPageSize")}
                   <select
@@ -503,7 +650,7 @@ export default function ConnectionsPage() {
 
               {previewError && (
                 <p className="mt-4 rounded-md border border-red-800 bg-red-950/40 p-3 text-sm text-red-300">
-                  {t("previewError")}
+                  {previewError}
                 </p>
               )}
 
@@ -532,7 +679,7 @@ export default function ConnectionsPage() {
                             <th className="px-4 py-2 text-start font-medium">{t("previewCompanyType")}</th>
                             <th className="px-4 py-2 text-start font-medium">{t("active")}</th>
                           </>
-                        ) : previewResource === "invoices" ? (
+                        ) : previewResource === "invoices" || previewResource === "vendor_bills" ? (
                           <>
                             <th className="px-4 py-2 text-start font-medium">{t("previewCustomer")}</th>
                             <th className="px-4 py-2 text-start font-medium">{t("previewInvoiceDate")}</th>
@@ -542,12 +689,43 @@ export default function ConnectionsPage() {
                             <th className="px-4 py-2 text-start font-medium">{t("previewPaymentState")}</th>
                             <th className="px-4 py-2 text-start font-medium">{t("status")}</th>
                           </>
-                        ) : (
+                        ) : previewResource === "installed_modules" ? (
                           <>
                             <th className="px-4 py-2 text-start font-medium">{t("previewModuleTitle")}</th>
                             <th className="px-4 py-2 text-start font-medium">{t("previewModuleVersion")}</th>
                             <th className="px-4 py-2 text-start font-medium">{t("previewModuleCategory")}</th>
                             <th className="px-4 py-2 text-start font-medium">{t("previewModuleApplication")}</th>
+                          </>
+                        ) : previewResource === "companies" ? (
+                          <>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewCountry")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewCurrency")}</th>
+                          </>
+                        ) : previewResource === "employees_summary" ? (
+                          <>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewJobTitle")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewDepartment")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("active")}</th>
+                          </>
+                        ) : previewResource === "departments_summary" ? (
+                          <>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewManager")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("active")}</th>
+                          </>
+                        ) : previewResource === "payments_summary" ? (
+                          <>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewDate")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewAmount")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewPaymentType")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewPartner")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("status")}</th>
+                          </>
+                        ) : (
+                          <>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewCode")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("type")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewCurrency")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("active")}</th>
                           </>
                         )}
                       </tr>
@@ -599,7 +777,7 @@ export default function ConnectionsPage() {
                                   : "—"}
                               </td>
                             </>
-                          ) : previewResource === "invoices" ? (
+                          ) : previewResource === "invoices" || previewResource === "vendor_bills" ? (
                             <>
                               <td className="px-4 py-2">{r.partner_id?.[1] ?? "—"}</td>
                               <td className="px-4 py-2" dir="ltr">{r.invoice_date ?? "—"}</td>
@@ -617,7 +795,7 @@ export default function ConnectionsPage() {
                               <td className="px-4 py-2">{r.payment_state ?? "—"}</td>
                               <td className="px-4 py-2">{r.state ?? "—"}</td>
                             </>
-                          ) : (
+                          ) : previewResource === "installed_modules" ? (
                             <>
                               <td className="px-4 py-2">{r.shortdesc ?? "—"}</td>
                               <td className="px-4 py-2" dir="ltr">
@@ -630,6 +808,47 @@ export default function ConnectionsPage() {
                                     ? t("previewYes")
                                     : t("previewNo")
                                   : "—"}
+                              </td>
+                            </>
+                          ) : previewResource === "companies" ? (
+                            <>
+                              <td className="px-4 py-2">{r.country_id?.[1] ?? "—"}</td>
+                              <td className="px-4 py-2">{r.currency_id?.[1] ?? "—"}</td>
+                            </>
+                          ) : previewResource === "employees_summary" ? (
+                            <>
+                              <td className="px-4 py-2">{r.job_title ?? "—"}</td>
+                              <td className="px-4 py-2">{r.department_id?.[1] ?? "—"}</td>
+                              <td className="px-4 py-2">
+                                {r.active ? t("previewYes") : t("previewNo")}
+                              </td>
+                            </>
+                          ) : previewResource === "departments_summary" ? (
+                            <>
+                              <td className="px-4 py-2">{r.manager_id?.[1] ?? "—"}</td>
+                              <td className="px-4 py-2">
+                                {r.active ? t("previewYes") : t("previewNo")}
+                              </td>
+                            </>
+                          ) : previewResource === "payments_summary" ? (
+                            <>
+                              <td className="px-4 py-2" dir="ltr">{r.date ?? "—"}</td>
+                              <td className="px-4 py-2" dir="ltr">
+                                {typeof r.amount === "number"
+                                  ? `${r.amount} ${r.currency_id?.[1] ?? ""}`.trim()
+                                  : "—"}
+                              </td>
+                              <td className="px-4 py-2">{r.payment_type ?? "—"}</td>
+                              <td className="px-4 py-2">{r.partner_id?.[1] ?? "—"}</td>
+                              <td className="px-4 py-2">{r.state ?? "—"}</td>
+                            </>
+                          ) : (
+                            <>
+                              <td className="px-4 py-2" dir="ltr">{r.code ?? "—"}</td>
+                              <td className="px-4 py-2">{r.type ?? "—"}</td>
+                              <td className="px-4 py-2">{r.currency_id?.[1] ?? "—"}</td>
+                              <td className="px-4 py-2">
+                                {r.active ? t("previewYes") : t("previewNo")}
                               </td>
                             </>
                           )}
@@ -756,17 +975,23 @@ export default function ConnectionsPage() {
                 </label>
                 <label className="text-sm text-slate-300">
                   {t("connPasswordLabel")}
+                  {credentialMustBeReentered && <span className="text-red-400"> *</span>}
                   <input
                     type="password"
                     autoComplete="new-password"
-                    required={!editing}
+                    required={credentialMustBeReentered}
                     value={form.secret}
                     onChange={(e) => setForm({ ...form, secret: e.target.value })}
                     className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-white outline-none focus:border-emerald-500"
                   />
-                  {editing && (
+                  {editing && !credentialMustBeReentered && (
                     <span className="mt-1 block text-xs text-slate-500">
                       {t("connKeepSecretHint")}
+                    </span>
+                  )}
+                  {editing && credentialMustBeReentered && (
+                    <span className="mt-1 block text-xs text-amber-400">
+                      {t("connSecretRequiredAfterIdentityChange")}
                     </span>
                   )}
                 </label>

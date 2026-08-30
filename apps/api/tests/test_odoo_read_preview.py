@@ -800,6 +800,14 @@ def test_invoices_policy_excludes_vendor_bills_and_lines():
     assert "invoice_line_ids" not in policy.allowed_fields
     assert "line_ids" not in policy.allowed_fields
     assert "narration" not in policy.allowed_fields
+    assert policy.required_module == "account"
+    assert policy.requires_company_scope is True
+
+
+def test_invoice_company_scope_required_before_network(fake_odoo):
+    with pytest.raises(ReadPolicyError, match="company_id is required"):
+        _read(resource="invoices")
+    assert fake_odoo.xmlrpc_calls == []
 
 
 def test_invoice_read_sanitizes_dates_and_relations(fake_odoo):
@@ -813,33 +821,50 @@ def test_invoice_read_sanitizes_dates_and_relations(fake_odoo):
             "invoice_date_due": False,
             "partner_id": [10, "Acme Customer"],
             "currency_id": [2, "SAR"],
+            "company_id": [15, "جمعية الاختبار"],
             "amount_total": 1150.0,
             "amount_residual": 0.0,
             "payment_state": "paid",
             "invoice_line_ids": [1, 2, 3],
         }
     ]
-    page = _read(resource="invoices", order_by="invoice_date", order_direction="desc")
+    page = _read(
+        resource="invoices",
+        company_id=15,
+        order_by="invoice_date",
+        order_direction="desc",
+    )
     record = page["records"][0]
     assert record["invoice_date_due"] is None
     assert record["partner_id"] == [10, "Acme Customer"]
     assert "invoice_line_ids" not in record
     execs = [p for m, p in fake_odoo.xmlrpc_calls if m == "execute_kw"]
-    assert execs[0][3] == "account.move"
-    assert ["move_type", "in", ["out_invoice", "out_refund"]] in execs[0][5][0]
+    assert execs[1][3] == "account.move"
+    assert ["move_type", "in", ["out_invoice", "out_refund"]] in execs[1][5][0]
+    assert ["company_id", "=", 15] in execs[1][5][0]
 
 
-def test_invoice_json2_uses_allowlisted_model_and_domain(fake_odoo):
+def test_invoice_json2_uses_allowlisted_model_and_domain(fake_odoo, monkeypatch):
     fake_odoo.records = []
+    original = json2.search_read
+
+    def installed_account(*args, model, **kwargs):
+        if model == "ir.module.module":
+            return [{"name": "account"}]
+        return original(*args, model=model, **kwargs)
+
+    monkeypatch.setattr(json2, "search_read", installed_account)
     _read(
         resource="invoices",
         transport="json2",
         secret="valid-api-key",
+        company_id=15,
         order_by="name",
     )
     url, body, _headers = fake_odoo.json2_calls[0]
     assert url.endswith("/json/2/account.move/search_read")
     assert ["move_type", "in", ["out_invoice", "out_refund"]] in body["domain"]
+    assert ["company_id", "=", 15] in body["domain"]
     assert "invoice_line_ids" not in body["fields"]
 
 
@@ -854,13 +879,14 @@ def test_malformed_invoice_relation_is_rejected(fake_odoo):
             "invoice_date_due": False,
             "partner_id": ["bad-id", "Customer"],
             "currency_id": [2, "SAR"],
+            "company_id": [15, "جمعية الاختبار"],
             "amount_total": 10.0,
             "amount_residual": 10.0,
             "payment_state": "not_paid",
         }
     ]
     with pytest.raises(ConnectorError) as exc:
-        _read(resource="invoices")
+        _read(resource="invoices", company_id=15)
     assert exc.value.code == "unsupported_response"
 
 

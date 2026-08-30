@@ -45,6 +45,14 @@ class ReadPolicyError(Exception):
         self.message = message
 
 
+class ResourceUnavailableError(Exception):
+    """The resource is safe but unavailable on this live Odoo database."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+        self.message = message
+
+
 def _validate_fields(policy: ReadPolicy, fields: list[str] | None) -> list[str]:
     if fields is None:
         return list(policy.default_fields)
@@ -261,6 +269,7 @@ def read_page(
     offset: int,
     order_by: str | None = None,
     order_direction: str = "asc",
+    company_id: int | None = None,
 ) -> dict[str, Any]:
     """Read exactly ONE bounded page. Raises ReadPolicyError for Modeem-side
     violations (before any network call) and ConnectorError for safe
@@ -271,6 +280,12 @@ def read_page(
         raise ReadPolicyError("unknown resource")
     safe_fields = _validate_fields(policy, fields)
     domain = [list(term) for term in policy.base_domain]
+    if policy.requires_company_scope:
+        if isinstance(company_id, bool) or not isinstance(company_id, int) or company_id < 1:
+            raise ReadPolicyError("company_id is required for this resource")
+        domain.append(["company_id", "=", company_id])
+    elif company_id is not None:
+        raise ReadPolicyError("company_id is not allowed for this resource")
     domain.extend(_validate_filters(policy, filters))
     safe_order = _validate_order(policy, order_by, order_direction)
     _validate_pagination(policy, limit, offset)
@@ -282,6 +297,43 @@ def read_page(
 
     upstream_limit = limit + 1  # one extra record only, to compute has_more
     with safe_http.build_client(environment) as client:
+        if policy.required_module:
+            module_domain = [
+                ["name", "=", policy.required_module],
+                ["state", "=", "installed"],
+            ]
+            module_fields = ["name"]
+            if transport == "json2":
+                modules = json2.search_read(
+                    client,
+                    base_url,
+                    database,
+                    secret,
+                    model="ir.module.module",
+                    domain=module_domain,
+                    fields=module_fields,
+                    offset=0,
+                    limit=1,
+                    order=None,
+                )
+            else:
+                modules = legacy_xmlrpc.search_read(
+                    client,
+                    base_url,
+                    database,
+                    login,
+                    secret,
+                    model="ir.module.module",
+                    domain=module_domain,
+                    fields=module_fields,
+                    offset=0,
+                    limit=1,
+                    order=None,
+                )
+            if not isinstance(modules, list):
+                raise ConnectorError("unsupported_response", "invalid module check")
+            if not modules:
+                raise ResourceUnavailableError("required Odoo module is not installed")
         if transport == "json2":
             raw = json2.search_read(
                 client,

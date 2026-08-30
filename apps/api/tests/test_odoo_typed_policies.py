@@ -56,6 +56,12 @@ def test_registry_contains_exactly_approved_resources():
         "customers",
         "invoices",
         "installed_modules",
+        "companies",
+        "employees_summary",
+        "departments_summary",
+        "vendor_bills",
+        "payments_summary",
+        "journals_summary",
     }
 
 
@@ -502,10 +508,72 @@ def test_only_approved_resources_are_registered():
         "customers",
         "invoices",
         "installed_modules",
+        "companies",
+        "employees_summary",
+        "departments_summary",
+        "vendor_bills",
+        "payments_summary",
+        "journals_summary",
     ]
     policy = READ_POLICIES["countries"]
     assert policy.odoo_model == "res.country"
     assert set(policy.fields) == {"id", "name", "code"}
+
+
+def test_operational_resources_require_expected_modules_and_company_scope():
+    expected = {
+        "employees_summary": "hr",
+        "departments_summary": "hr",
+        "vendor_bills": "account",
+        "payments_summary": "account",
+        "journals_summary": "account",
+    }
+    for resource, module in expected.items():
+        policy = READ_POLICIES[resource]
+        assert policy.required_module == module
+        assert policy.requires_company_scope is True
+
+
+def test_company_scope_required_before_network(fake_odoo):
+    with pytest.raises(ReadPolicyError, match="company_id is required"):
+        _read(resource="employees_summary")
+    assert fake_odoo.xmlrpc_calls == []
+
+
+def test_employee_preview_checks_module_and_enforces_company_domain(fake_odoo):
+    fake_odoo.records = [
+        {
+            "id": 7,
+            "name": "موظف تجريبي",
+            "job_title": "محاسب",
+            "department_id": [3, "المالية"],
+            "company_id": [15, "جمعية الاختبار"],
+            "active": True,
+        }
+    ]
+    page = _read(resource="employees_summary", company_id=15)
+    assert page["records"][0]["company_id"] == [15, "جمعية الاختبار"]
+    execs = [params for method, params in fake_odoo.xmlrpc_calls if method == "execute_kw"]
+    assert len(execs) == 2
+    assert execs[0][3] == "ir.module.module"
+    assert execs[0][5] == [[["name", "=", "hr"], ["state", "=", "installed"]]]
+    assert execs[1][3] == "hr.employee"
+    assert ["company_id", "=", 15] in execs[1][5][0]
+
+
+def test_missing_required_module_rejected_safely(fake_odoo, monkeypatch):
+    from app.integrations.odoo.reader import ResourceUnavailableError
+
+    original = legacy_xmlrpc.search_read
+
+    def missing_module(*args, model, **kwargs):
+        if model == "ir.module.module":
+            return []
+        return original(*args, model=model, **kwargs)
+
+    monkeypatch.setattr(legacy_xmlrpc, "search_read", missing_module)
+    with pytest.raises(ResourceUnavailableError, match="not installed"):
+        _read(resource="vendor_bills", company_id=9)
 
 
 def test_no_write_operations_exist_2e():

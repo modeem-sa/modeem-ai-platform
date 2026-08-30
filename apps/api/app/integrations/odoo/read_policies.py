@@ -65,6 +65,8 @@ class ReadPolicy:
     allowed_order_fields: frozenset[str]
     base_domain: tuple[tuple[Any, ...], ...] = ()
     max_page_size: int = field(default=ABSOLUTE_MAX_PAGE_SIZE)
+    required_module: str | None = None
+    requires_company_scope: bool = False
 
     @property
     def allowed_fields(self) -> frozenset[str]:
@@ -238,6 +240,7 @@ _INVOICES = ReadPolicy(
         ReadFieldPolicy(name="invoice_date_due", value_type="date", nullable=True),
         ReadFieldPolicy(name="partner_id", value_type="many2one", nullable=False),
         ReadFieldPolicy(name="currency_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="company_id", value_type="many2one", nullable=False),
         ReadFieldPolicy(name="amount_total", value_type="number", nullable=False),
         ReadFieldPolicy(name="amount_residual", value_type="number", nullable=False),
         ReadFieldPolicy(
@@ -256,6 +259,7 @@ _INVOICES = ReadPolicy(
         "invoice_date_due",
         "partner_id",
         "currency_id",
+        "company_id",
         "amount_total",
         "amount_residual",
         "payment_state",
@@ -267,6 +271,8 @@ _INVOICES = ReadPolicy(
     allowed_order_fields=frozenset({"id", "name", "invoice_date", "amount_total"}),
     base_domain=(("move_type", "in", ("out_invoice", "out_refund")),),
     max_page_size=ABSOLUTE_MAX_PAGE_SIZE,
+    required_module="account",
+    requires_company_scope=True,
 )
 
 # Technical module inventory used to compare the live Odoo database with the
@@ -314,12 +320,153 @@ _INSTALLED_MODULES = ReadPolicy(
     max_page_size=ABSOLUTE_MAX_PAGE_SIZE,
 )
 
+_COMPANIES = ReadPolicy(
+    resource_key="companies",
+    odoo_model="res.company",
+    fields=_fields(
+        ReadFieldPolicy(name="id", value_type="integer", nullable=False),
+        ReadFieldPolicy(name="name", value_type="string", nullable=False, max_length=255),
+        ReadFieldPolicy(name="currency_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="country_id", value_type="many2one", nullable=True),
+    ),
+    default_fields=("id", "name", "currency_id", "country_id"),
+    allowed_filter_fields=frozenset({"id", "name"}),
+    allowed_filter_operators=SAFE_OPERATORS,
+    allowed_order_fields=frozenset({"id", "name"}),
+)
+
+_EMPLOYEES_SUMMARY = ReadPolicy(
+    resource_key="employees_summary",
+    odoo_model="hr.employee",
+    fields=_fields(
+        ReadFieldPolicy(name="id", value_type="integer", nullable=False),
+        ReadFieldPolicy(name="name", value_type="string", nullable=False, max_length=255),
+        ReadFieldPolicy(name="job_title", value_type="string", nullable=True, max_length=255),
+        ReadFieldPolicy(name="department_id", value_type="many2one", nullable=True),
+        ReadFieldPolicy(name="company_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="active", value_type="boolean", nullable=False),
+    ),
+    default_fields=("id", "name", "job_title", "department_id", "company_id", "active"),
+    allowed_filter_fields=frozenset({"id", "name", "active"}),
+    allowed_filter_operators=SAFE_OPERATORS,
+    allowed_order_fields=frozenset({"id", "name"}),
+    base_domain=(("active", "=", True),),
+    required_module="hr",
+    requires_company_scope=True,
+)
+
+_DEPARTMENTS_SUMMARY = ReadPolicy(
+    resource_key="departments_summary",
+    odoo_model="hr.department",
+    fields=_fields(
+        ReadFieldPolicy(name="id", value_type="integer", nullable=False),
+        ReadFieldPolicy(name="name", value_type="string", nullable=False, max_length=255),
+        ReadFieldPolicy(name="manager_id", value_type="many2one", nullable=True),
+        ReadFieldPolicy(name="company_id", value_type="many2one", nullable=True),
+        ReadFieldPolicy(name="active", value_type="boolean", nullable=False),
+    ),
+    default_fields=("id", "name", "manager_id", "company_id", "active"),
+    allowed_filter_fields=frozenset({"id", "name", "active"}),
+    allowed_filter_operators=SAFE_OPERATORS,
+    allowed_order_fields=frozenset({"id", "name"}),
+    base_domain=(("active", "=", True),),
+    required_module="hr",
+    requires_company_scope=True,
+)
+
+_VENDOR_BILLS = ReadPolicy(
+    resource_key="vendor_bills",
+    odoo_model="account.move",
+    fields=_fields(
+        ReadFieldPolicy(name="id", value_type="integer", nullable=False),
+        ReadFieldPolicy(name="name", value_type="string", nullable=False, max_length=255),
+        ReadFieldPolicy(name="move_type", value_type="string", nullable=False, max_length=32),
+        ReadFieldPolicy(name="state", value_type="string", nullable=False, max_length=16),
+        ReadFieldPolicy(name="invoice_date", value_type="date", nullable=True),
+        ReadFieldPolicy(name="invoice_date_due", value_type="date", nullable=True),
+        ReadFieldPolicy(name="partner_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="currency_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="company_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="amount_total", value_type="number", nullable=False),
+        ReadFieldPolicy(name="amount_residual", value_type="number", nullable=False),
+        ReadFieldPolicy(name="payment_state", value_type="string", nullable=True, max_length=32),
+    ),
+    default_fields=(
+        "id", "name", "move_type", "state", "invoice_date", "invoice_date_due",
+        "partner_id", "currency_id", "company_id", "amount_total", "amount_residual",
+        "payment_state",
+    ),
+    allowed_filter_fields=frozenset(
+        {"id", "name", "state", "invoice_date", "payment_state"}
+    ),
+    allowed_filter_operators=SAFE_OPERATORS,
+    allowed_order_fields=frozenset({"id", "name", "invoice_date", "amount_total"}),
+    base_domain=(("move_type", "in", ("in_invoice", "in_refund")),),
+    required_module="account",
+    requires_company_scope=True,
+)
+
+_PAYMENTS_SUMMARY = ReadPolicy(
+    resource_key="payments_summary",
+    odoo_model="account.payment",
+    fields=_fields(
+        ReadFieldPolicy(name="id", value_type="integer", nullable=False),
+        ReadFieldPolicy(name="name", value_type="string", nullable=False, max_length=255),
+        ReadFieldPolicy(name="date", value_type="date", nullable=False),
+        ReadFieldPolicy(name="amount", value_type="number", nullable=False),
+        ReadFieldPolicy(name="payment_type", value_type="string", nullable=False, max_length=16),
+        ReadFieldPolicy(name="partner_type", value_type="string", nullable=False, max_length=16),
+        ReadFieldPolicy(name="partner_id", value_type="many2one", nullable=True),
+        ReadFieldPolicy(name="currency_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="company_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="state", value_type="string", nullable=False, max_length=32),
+    ),
+    default_fields=(
+        "id", "name", "date", "amount", "payment_type", "partner_type",
+        "partner_id", "currency_id", "company_id", "state",
+    ),
+    allowed_filter_fields=frozenset(
+        {"id", "name", "date", "payment_type", "partner_type", "state"}
+    ),
+    allowed_filter_operators=SAFE_OPERATORS,
+    allowed_order_fields=frozenset({"id", "name", "date", "amount"}),
+    required_module="account",
+    requires_company_scope=True,
+)
+
+_JOURNALS_SUMMARY = ReadPolicy(
+    resource_key="journals_summary",
+    odoo_model="account.journal",
+    fields=_fields(
+        ReadFieldPolicy(name="id", value_type="integer", nullable=False),
+        ReadFieldPolicy(name="name", value_type="string", nullable=False, max_length=255),
+        ReadFieldPolicy(name="code", value_type="string", nullable=False, max_length=16),
+        ReadFieldPolicy(name="type", value_type="string", nullable=False, max_length=32),
+        ReadFieldPolicy(name="currency_id", value_type="many2one", nullable=True),
+        ReadFieldPolicy(name="company_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="active", value_type="boolean", nullable=False),
+    ),
+    default_fields=("id", "name", "code", "type", "currency_id", "company_id", "active"),
+    allowed_filter_fields=frozenset({"id", "name", "code", "type", "active"}),
+    allowed_filter_operators=SAFE_OPERATORS,
+    allowed_order_fields=frozenset({"id", "name", "code"}),
+    base_domain=(("active", "=", True),),
+    required_module="account",
+    requires_company_scope=True,
+)
+
 READ_POLICIES: dict[str, ReadPolicy] = {
     _COUNTRIES.resource_key: _COUNTRIES,
     _BENEFICIARIES_SUMMARY.resource_key: _BENEFICIARIES_SUMMARY,
     _CUSTOMERS.resource_key: _CUSTOMERS,
     _INVOICES.resource_key: _INVOICES,
     _INSTALLED_MODULES.resource_key: _INSTALLED_MODULES,
+    _COMPANIES.resource_key: _COMPANIES,
+    _EMPLOYEES_SUMMARY.resource_key: _EMPLOYEES_SUMMARY,
+    _DEPARTMENTS_SUMMARY.resource_key: _DEPARTMENTS_SUMMARY,
+    _VENDOR_BILLS.resource_key: _VENDOR_BILLS,
+    _PAYMENTS_SUMMARY.resource_key: _PAYMENTS_SUMMARY,
+    _JOURNALS_SUMMARY.resource_key: _JOURNALS_SUMMARY,
 }
 
 

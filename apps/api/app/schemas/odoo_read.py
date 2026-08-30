@@ -42,6 +42,7 @@ class ReadPreviewRequest(BaseModel):
     offset: int = Field(default=0, ge=0, le=MAX_PREVIEW_OFFSET)
     order_by: str | None = Field(default=None, max_length=64)
     order_direction: Literal["asc", "desc"] = "asc"
+    company_id: int | None = Field(default=None, ge=1)
 
 
 class ReadPreviewResponse(BaseModel):
