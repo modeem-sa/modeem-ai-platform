@@ -22,6 +22,23 @@ export class ApiError extends Error {
   }
 }
 
+function apiErrorDetail(detail: unknown): string | null {
+  if (typeof detail === "string") return detail;
+  if (!Array.isArray(detail)) return null;
+
+  const messages = detail.flatMap((issue) => {
+    if (!issue || typeof issue !== "object") return [];
+    const item = issue as { loc?: unknown; msg?: unknown };
+    if (typeof item.msg !== "string") return [];
+    const location = Array.isArray(item.loc)
+      ? item.loc.filter((part) => part !== "body").join(".")
+      : "";
+    return [location ? `${location}: ${item.msg}` : item.msg];
+  });
+
+  return messages.length ? messages.join("; ") : null;
+}
+
 function csrfHeader(): Record<string, string> {
   if (typeof document === "undefined") return {};
   const match = document.cookie.match(/(?:^|;\s*)modeem_csrf=([^;]+)/);
@@ -48,7 +65,7 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}): Promise
     let detail = res.statusText || "Request failed";
     try {
       const payload = (await res.json()) as { detail?: unknown };
-      if (typeof payload.detail === "string") detail = payload.detail;
+      detail = apiErrorDetail(payload.detail) || detail;
     } catch {
       // Keep the safe status text when the upstream did not return JSON.
     }

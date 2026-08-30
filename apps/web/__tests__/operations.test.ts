@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert';
-import { buildOperationsUrl } from '../lib/operations.ts';
+import { buildOperationsUrl, toTaskDueAt } from '../lib/operations.ts';
 
 describe('Operations API Utilities', () => {
   it('should build operations URL without filters', () => {
@@ -29,5 +29,16 @@ describe('Operations API Utilities', () => {
     });
     assert.ok(url.includes('category=financial'));
     assert.ok(!url.includes('status='));
+  });
+
+  it('normalizes valid task due dates without shifting the calendar day', () => {
+    assert.strictEqual(toTaskDueAt('2026-08-31'), '2026-08-31T12:00:00.000Z');
+    assert.strictEqual(toTaskDueAt(''), undefined);
+  });
+
+  it('rejects malformed, impossible, and expanded-year due dates', () => {
+    for (const date of ['202601-01-01', '2026-02-31', '2026/01/01', '0999-01-01']) {
+      assert.throws(() => toTaskDueAt(date), /INVALID_DUE_DATE/);
+    }
   });
 });

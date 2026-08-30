@@ -18,7 +18,9 @@ import {
   OpCategory,
   OpPriority,
   OpAction,
+  toTaskDueAt,
 } from "@/lib/operations";
+import { ApiError } from "@/lib/api";
 
 const STATUS_COLORS: Record<string, string> = {
   pending: "bg-slate-500/15 text-slate-300 border-slate-500/30",
@@ -346,13 +348,24 @@ function CreateTaskModal({ bootstrap, onClose, onSuccess }: { bootstrap: Operati
     try {
       await createTask({
         ...form,
-        due_at: form.due_at ? new Date(form.due_at).toISOString() : undefined,
+        due_at: toTaskDueAt(form.due_at),
         assigned_user_id: form.assigned_user_id || undefined,
         description: form.description?.trim() || undefined,
       });
       onSuccess();
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : t("cmError"));
+      if (err instanceof Error && err.message === "INVALID_DUE_DATE") {
+        setError(t("opInvalidDueDate"));
+      } else if (
+        err instanceof ApiError
+        && err.message.includes("Assigned user must have an active membership")
+      ) {
+        setError(t("opInvalidAssignee"));
+      } else if (err instanceof ApiError && err.status === 422) {
+        setError(`${t("opInvalidTaskData")} ${err.message}`);
+      } else {
+        setError(err instanceof Error ? err.message : t("cmError"));
+      }
     } finally {
       setSaving(false);
     }
@@ -443,6 +456,8 @@ function CreateTaskModal({ bootstrap, onClose, onSuccess }: { bootstrap: Operati
               {t("opDueDate")}
               <input
                 type="date"
+                min="2000-01-01"
+                max="2100-12-31"
                 value={form.due_at}
                 onChange={(e) => setForm({ ...form, due_at: e.target.value })}
                 className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-white outline-none focus:border-emerald-500"

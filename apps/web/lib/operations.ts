@@ -55,6 +55,22 @@ export interface CreateTaskPayload {
   assigned_user_id?: string;
 }
 
+export function toTaskDueAt(date: string | undefined): string | undefined {
+  if (!date) return undefined;
+  if (!/^(?:20\d{2}|2100)-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/.test(date)) {
+    throw new Error("INVALID_DUE_DATE");
+  }
+
+  const parsed = new Date(`${date}T12:00:00.000Z`);
+  if (
+    Number.isNaN(parsed.getTime())
+    || parsed.toISOString().slice(0, 10) !== date
+  ) {
+    throw new Error("INVALID_DUE_DATE");
+  }
+  return parsed.toISOString();
+}
+
 export function buildOperationsUrl(filters: TaskFilters, limit = 200, offset = 0): string {
   const params = new URLSearchParams({
     limit: limit.toString(),
