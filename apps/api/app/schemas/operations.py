@@ -28,6 +28,33 @@ class OperationTaskAction(BaseModel):
     note: str | None = Field(default=None, max_length=2000)
 
 
+class OperationActionRequest(BaseModel):
+    expected_version: int = Field(ge=1)
+    expected_action_version: int | None = Field(default=None, ge=1)
+    expected_proposal_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class OperationActionExactRequest(BaseModel):
+    expected_version: int = Field(ge=1)
+    expected_action_version: int = Field(ge=1)
+    expected_proposal_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class OperationActionOut(BaseModel):
+    id: uuid.UUID
+    status: str
+    version: int
+    proposal: dict
+    proposal_hash: str
+    approved_hash: str | None
+    approved_by_user_id: uuid.UUID | None
+    approved_at: datetime | None
+    attempt_count: int
+    error: str | None
+    external_activity_id: int | None
+    verified_at: datetime | None
+
+
 class OperationTaskOut(BaseModel):
     id: uuid.UUID
     tenant_id: uuid.UUID
@@ -49,6 +76,15 @@ class OperationTaskOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     available_actions: list[str]
+    source_type: str
+    source_connection_id: uuid.UUID | None
+    source_record_id: int | None
+    source_signal: str | None
+    source_reference: str | None
+    source_snapshot: dict | None
+    source_sync_state: str | None
+    source_synced_at: datetime | None
+    action: OperationActionOut | None = None
 
 
 class OperationTaskListOut(BaseModel):

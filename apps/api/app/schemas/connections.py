@@ -106,6 +106,7 @@ class ConnectionCreate(BaseModel):
     # connections (needed by XML-RPC auth and JSON-2 legacy fallback).
     username: str = Field(min_length=1, max_length=200)
     auth_mode: Literal["auto", "password", "api_key"] = "auto"
+    odoo_company_id: int | None = Field(default=None, gt=0)
     credentials: OdooCredentials
 
     @field_validator("name")
@@ -154,6 +155,7 @@ class ConnectionUpdate(BaseModel):
 
     status: Literal["configured", "disabled"] | None = None
     auth_mode: Literal["auto", "password", "api_key"] | None = None
+    odoo_company_id: int | None = Field(default=None, gt=0)
     # If supplied: encrypt and replace. If omitted: keep existing secret.
     credentials: OdooCredentials | None = None
 
@@ -167,6 +169,7 @@ class ConnectionOut(BaseModel):
     base_url: str
     database_name: str | None
     username: str | None
+    odoo_company_id: int | None
     status: str
     is_active: bool
     has_credentials: bool

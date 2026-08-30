@@ -13,6 +13,7 @@ type ConnectionOut = {
   base_url: string;
   database_name: string | null;
   username: string | null;
+  odoo_company_id: number | null;
   status: string;
   is_active: boolean;
   has_credentials: boolean;
@@ -112,6 +113,7 @@ type FormState = {
   username: string;
   auth_mode: string;
   secret: string;
+  odoo_company_id: string;
 };
 
 const emptyForm: FormState = {
@@ -121,6 +123,7 @@ const emptyForm: FormState = {
   username: "",
   auth_mode: "auto",
   secret: "",
+  odoo_company_id: "",
 };
 
 export default function ConnectionsPage() {
@@ -141,6 +144,8 @@ export default function ConnectionsPage() {
     form.username.trim() !== (editing.username ?? "").trim() ||
     form.auth_mode !== (editing.auth_mode ?? "auto");
   const [testingId, setTestingId] = useState<string | null>(null);
+  const [syncingId, setSyncingId] = useState<string | null>(null);
+  const [syncResult, setSyncResult] = useState<{ id: string, created: number } | null>(null);
   const [previewConn, setPreviewConn] = useState<ConnectionOut | null>(null);
   const [previewResource, setPreviewResource] = useState<PreviewResource>("countries");
   const [previewPage, setPreviewPage] = useState<PreviewPage | null>(null);
@@ -187,6 +192,7 @@ export default function ConnectionsPage() {
       username: c.username ?? "",
       auth_mode: c.auth_mode ?? "auto",
       secret: "", // never pre-fill an existing secret
+      odoo_company_id: c.odoo_company_id ? String(c.odoo_company_id) : "",
     });
     setFormError(null);
     setShowForm(true);
@@ -208,6 +214,7 @@ export default function ConnectionsPage() {
           base_url: form.base_url,
           database_name: form.database_name || null,
           auth_mode: form.auth_mode,
+          odoo_company_id: form.odoo_company_id ? parseInt(form.odoo_company_id, 10) : null,
         };
         // Canonical login: Connection.username only. Never send it as null
         // (it cannot be cleared); omit to preserve.
@@ -235,6 +242,7 @@ export default function ConnectionsPage() {
             database_name: form.database_name || null,
             username: form.username.trim(),
             auth_mode: form.auth_mode,
+            odoo_company_id: form.odoo_company_id ? parseInt(form.odoo_company_id, 10) : null,
             credentials: { password_or_api_key: form.secret },
           }),
         });
@@ -270,6 +278,29 @@ export default function ConnectionsPage() {
       await load();
     } finally {
       setTestingId(null);
+    }
+  };
+
+  const syncInvoices = async (c: ConnectionOut) => {
+    setSyncingId(c.id);
+    setSyncResult(null);
+    try {
+      const res = await fetch(`/backend/api/v1/connections/${c.id}/sync-overdue-invoices`, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: csrfHeaders(),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setSyncResult({ id: c.id, created: data.created });
+      } else {
+        const data = await res.json().catch(() => null);
+        alert(data?.detail || "Sync failed");
+      }
+    } catch {
+      alert("Sync failed");
+    } finally {
+      setSyncingId(null);
     }
   };
 
@@ -428,6 +459,15 @@ export default function ConnectionsPage() {
           </p>
         )}
 
+        {syncResult && (
+          <div className="mb-4 flex items-center justify-between rounded-md border border-emerald-800 bg-emerald-950/40 p-3 text-sm text-emerald-300">
+            <span>{t("connSyncSuccess").replace("{count}", String(syncResult.created))}</span>
+            <a href="/operations" className="underline hover:text-emerald-200">
+              {t("operations")}
+            </a>
+          </div>
+        )}
+
         {rows === null ? (
           <p className="text-slate-400">{t("loading")}</p>
         ) : rows.length === 0 && !loadError ? (
@@ -532,6 +572,15 @@ export default function ConnectionsPage() {
                               className="text-violet-400 hover:text-violet-300"
                             >
                               {t("connPreview")}
+                            </button>
+                          )}
+                          {c.status !== "disabled" && c.last_test_status === "success" && c.odoo_company_id != null && (
+                            <button
+                              onClick={() => void syncInvoices(c)}
+                              disabled={syncingId === c.id}
+                              className="text-amber-400 hover:text-amber-300 disabled:opacity-60"
+                            >
+                              {syncingId === c.id ? t("connSyncing") : t("connSyncInvoices")}
                             </button>
                           )}
                           <button
@@ -957,6 +1006,16 @@ export default function ConnectionsPage() {
                     dir="ltr"
                     value={form.database_name}
                     onChange={(e) => setForm({ ...form, database_name: e.target.value })}
+                    className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-white outline-none focus:border-emerald-500"
+                  />
+                </label>
+                <label className="text-sm text-slate-300">
+                  {t("connOdooCompanyId")} <span className="text-slate-500 font-normal text-xs">(Optional)</span>
+                  <input
+                    type="number"
+                    min="1"
+                    value={form.odoo_company_id}
+                    onChange={(e) => setForm({ ...form, odoo_company_id: e.target.value })}
                     className="mt-1 w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-2 text-white outline-none focus:border-emerald-500"
                   />
                 </label>

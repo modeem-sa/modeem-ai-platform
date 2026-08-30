@@ -570,9 +570,15 @@ def test_countries_policy_unchanged():
 def test_no_write_methods_in_odoo_integration():
     pkg = pathlib.Path(reader.__file__).parent
     for py in pkg.glob("*.py"):
+        if py.name == "activity_writer.py":
+            continue
         source = py.read_text()
         for forbidden in ('"create"', "'create'", '"write"', "'write'", '"unlink"', "'unlink'"):
             assert forbidden not in source, f"{py.name} references {forbidden}"
+    writer_source = (pkg / "activity_writer.py").read_text()
+    assert '"create"' in writer_source
+    for forbidden in ('"write"', "'write'", '"unlink"', "'unlink'"):
+        assert forbidden not in writer_source
 
 
 def test_no_local_bms_persistence_model():

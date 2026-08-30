@@ -103,8 +103,8 @@ def seed() -> None:
         db.commit()
 
     print("\nSeed complete.")
-    print(f"  Tenant 1 — admin@acme.com / {DEV_PASSWORD}")
-    print(f"  Tenant 2 — admin@beta.com / {DEV_PASSWORD}")
+    print("  Development tenants and users are ready.")
+    print("  Use the configured development credentials; passwords are never logged.")
 
 
 if __name__ == "__main__":

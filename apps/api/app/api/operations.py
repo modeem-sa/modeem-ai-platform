@@ -1,23 +1,45 @@
 """Cookie-authenticated, membership-scoped operations task lifecycle API."""
 
+import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.api.csrf import require_csrf
 from app.api.deps import get_current_user, get_db
-from app.models import OperationTask, OperationTaskHistory, Tenant, TenantMembership, User
+from app.content_manager.provider import (
+    OpenAICompatibleProvider,
+    ProviderFailureError,
+    ProviderUnavailableError,
+)
+from app.models import (
+    OperationAction,
+    OperationActionHistory,
+    OperationTask,
+    OperationTaskHistory,
+    RecurringTaskTemplate,
+    Tenant,
+    TenantMembership,
+    User,
+)
 from app.models.operation_task import TASK_CATEGORIES, TASK_PRIORITIES, TASK_STATUSES
+from app.operations.ai_proposal import canonical_proposal, executable_invoice_activity_proposal
+from app.operations.proposals import OperationsProposalService, OverdueInvoiceSummary
 from app.schemas.operations import (
+    OperationActionExactRequest,
+    OperationActionOut,
+    OperationActionRequest,
+    OperationBootstrapOut,
+    OperationMemberOut,
     OperationTaskAction,
     OperationTaskCreate,
     OperationTaskListOut,
     OperationTaskOut,
-    OperationBootstrapOut,
-    OperationMemberOut,
     OperationTenantBootstrapOut,
 )
 from app.services.audit import record_audit
@@ -43,6 +65,21 @@ _AUDIT_ACTIONS = {
     "reject": "rejected",
     "reopened": "reopened",
 }
+
+
+class RecurringTemplateRequest(BaseModel):
+    tenant_id: uuid.UUID
+    title: str = Field(min_length=1, max_length=255)
+    description: str | None = Field(default=None, max_length=10000)
+    category: str = "administrative"
+    priority: str = "medium"
+    frequency: str
+    timezone: str = "UTC"
+
+
+class RecurringTemplateOut(RecurringTemplateRequest):
+    id: uuid.UUID
+    enabled: bool
 
 
 def _active_tenant_ids(db: Session, user: User) -> list[uuid.UUID]:
@@ -123,6 +160,17 @@ def _to_out(db: Session, task: OperationTask, user: User) -> OperationTaskOut:
     tenant = db.get(Tenant, task.tenant_id)
     assignee = db.get(User, task.assigned_user_id) if task.assigned_user_id else None
     role = _role_in_tenant(db, user, task.tenant_id)
+    action = db.query(OperationAction).filter(
+        OperationAction.task_id == task.id, OperationAction.tenant_id == task.tenant_id
+    ).one_or_none()
+    source_snapshot = None
+    if task.source_snapshot_json:
+        try:
+            parsed_snapshot = json.loads(task.source_snapshot_json)
+            if isinstance(parsed_snapshot, dict):
+                source_snapshot = parsed_snapshot
+        except json.JSONDecodeError:
+            source_snapshot = None
     return OperationTaskOut(
         id=task.id,
         tenant_id=task.tenant_id,
@@ -144,6 +192,24 @@ def _to_out(db: Session, task: OperationTask, user: User) -> OperationTaskOut:
         created_at=task.created_at,
         updated_at=task.updated_at,
         available_actions=_available_actions(task, user, role),
+        source_type=task.source_type or "manual",
+        source_connection_id=task.source_connection_id,
+        source_record_id=task.source_record_id,
+        source_signal=task.source_signal,
+        source_reference=task.source_reference,
+        source_snapshot=source_snapshot,
+        source_sync_state=task.source_sync_state,
+        source_synced_at=task.source_synced_at,
+        action=(
+            OperationActionOut(
+                id=action.id, status=action.status, version=action.version,
+                proposal=json.loads(action.proposal_json), proposal_hash=action.proposal_hash,
+                approved_hash=action.approved_hash, approved_by_user_id=action.approved_by_user_id,
+                approved_at=action.approved_at, attempt_count=action.attempt_count,
+                error=action.error, external_activity_id=action.external_activity_id,
+                verified_at=action.verified_at,
+            ) if action else None
+        ),
     )
 
 
@@ -273,6 +339,7 @@ def list_tasks(
     task_status: str | None = Query(default=None, alias="status"),
     category: str | None = None,
     priority: str | None = None,
+    source_type: str | None = None,
     offset: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=200),
     user: User = Depends(get_current_user),
@@ -284,6 +351,8 @@ def list_tasks(
         raise HTTPException(status_code=422, detail="Invalid task category")
     if priority is not None and priority not in TASK_PRIORITIES:
         raise HTTPException(status_code=422, detail="Invalid task priority")
+    if source_type is not None and source_type not in ("manual", "odoo", "recurring"):
+        raise HTTPException(status_code=422, detail="Invalid task source")
     tenant_ids = _active_tenant_ids(db, user)
     if tenant_id is not None:
         tenant_ids = [tenant_id] if tenant_id in tenant_ids else []
@@ -294,6 +363,8 @@ def list_tasks(
         query = query.filter(OperationTask.category == category)
     if priority:
         query = query.filter(OperationTask.priority == priority)
+    if source_type:
+        query = query.filter(OperationTask.source_type == source_type)
     total = query.count()
     grouped = query.with_entities(OperationTask.status, func.count(OperationTask.id)).group_by(
         OperationTask.status
@@ -427,3 +498,275 @@ def approve_task(task_id: uuid.UUID, body: OperationTaskAction, user: User = Dep
 @router.post("/tasks/{task_id}/reject", response_model=OperationTaskOut, dependencies=[Depends(require_csrf)])
 def reject_task(task_id: uuid.UUID, body: OperationTaskAction, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> OperationTaskOut:
     return _transition(task_id, body, "reject", user, db)
+
+
+def _manager_task(db: Session, user: User, task_id: uuid.UUID) -> OperationTask:
+    task = _scoped_task(db, user, task_id, lock=True)
+    if not _is_manager(_role_in_tenant(db, user, task.tenant_id)):
+        raise HTTPException(status_code=403, detail="Insufficient role")
+    return task
+
+
+def _single_invoice_summary(
+    *, tenant_id: uuid.UUID, snapshot: object, as_of_date: date
+) -> tuple[OverdueInvoiceSummary, int, int]:
+    """Derive an AI-safe aggregate from the server-sanitized Odoo snapshot."""
+    if not isinstance(snapshot, dict):
+        raise TypeError("invalid snapshot")
+    company_id = snapshot.get("company_id")
+    activity_type_id = snapshot.get("activity_type_id", 1)
+    currency = snapshot.get("currency")
+    due_date = snapshot.get("due_date")
+    residual = snapshot.get("residual")
+    if (
+        isinstance(company_id, bool)
+        or not isinstance(company_id, int)
+        or company_id < 1
+        or isinstance(activity_type_id, bool)
+        or not isinstance(activity_type_id, int)
+        or activity_type_id < 1
+        or not isinstance(currency, str)
+    ):
+        raise ValueError("invalid snapshot")
+    try:
+        due = date.fromisoformat(str(due_date))
+        amount = Decimal(str(residual))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("invalid snapshot") from exc
+    overdue_days = (as_of_date - due).days
+    return (
+        OverdueInvoiceSummary(
+            tenant_id=tenant_id,
+            as_of_date=as_of_date,
+            currency=currency,
+            invoice_count=1,
+            customers_affected=1,
+            total_overdue=amount,
+            oldest_days_overdue=overdue_days,
+        ),
+        company_id,
+        activity_type_id,
+    )
+
+
+def _audit_proposal_failure(db: Session, task: OperationTask, user: User, category: str) -> None:
+    """Persist only a static failure category, never prompt or provider content."""
+    record_audit(
+        db,
+        action="operation_action.generation_failed",
+        actor_type="user",
+        actor_id=str(user.id),
+        tenant_id=task.tenant_id,
+        resource_type="operation_task",
+        resource_id=str(task.id),
+        metadata={"status": "failed", "error_category": category},
+    )
+    db.commit()
+
+
+def _record_action_history(
+    db: Session,
+    action: OperationAction,
+    *,
+    event: str,
+    actor_type: str,
+    actor_id: str,
+    detail: str | None = None,
+) -> None:
+    """Persist server-owned lifecycle evidence; detail must be a static category."""
+    db.add(
+        OperationActionHistory(
+            action_id=action.id,
+            task_id=action.task_id,
+            tenant_id=action.tenant_id,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            event=event,
+            version=action.version,
+            status=action.status,
+            proposal_hash=action.proposal_hash,
+            detail=detail,
+        )
+    )
+
+
+@router.post("/tasks/{task_id}/action/generate", response_model=OperationTaskOut,
+             dependencies=[Depends(require_csrf)])
+def generate_action(task_id: uuid.UUID, body: OperationActionRequest,
+                    user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> OperationTaskOut:
+    """Generate/re-generate only the server-owned invoice activity proposal."""
+    task = _manager_task(db, user, task_id)
+    if task.version != body.expected_version:
+        raise HTTPException(status_code=409, detail="Task has been modified")
+    action = (
+        db.query(OperationAction)
+        .filter_by(task_id=task.id, tenant_id=task.tenant_id)
+        .with_for_update()
+        .one_or_none()
+    )
+    if action is not None and action.status != "proposed":
+        raise HTTPException(status_code=409, detail="Action can no longer be regenerated")
+    if task.source_type != "odoo" or task.source_record_id is None or not task.source_snapshot_json:
+        raise HTTPException(status_code=409, detail="Task has no supported Odoo invoice source")
+    try:
+        snapshot = json.loads(task.source_snapshot_json)
+        summary, company_id, activity_type_id = _single_invoice_summary(
+            tenant_id=task.tenant_id, snapshot=snapshot, as_of_date=datetime.now(UTC).date()
+        )
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=409, detail="Task source cannot generate an action") from exc
+    try:
+        provider = OpenAICompatibleProvider.from_environment()
+        draft = OperationsProposalService(provider).propose(
+            tenant_id=task.tenant_id, summary=summary
+        )
+        executable = executable_invoice_activity_proposal(
+            draft,
+            company_id=company_id,
+            invoice_id=task.source_record_id,
+            activity_type_id=activity_type_id,
+        )
+        payload, digest = canonical_proposal(executable)
+    except ProviderUnavailableError:
+        _audit_proposal_failure(db, task, user, "provider_unavailable")
+        raise HTTPException(status_code=503, detail="Operations proposal service is temporarily unavailable")
+    except ProviderFailureError:
+        _audit_proposal_failure(db, task, user, "provider_failure")
+        raise HTTPException(status_code=502, detail="Operations proposal provider failed")
+    regenerated = action is not None
+    if action is None:
+        action = OperationAction(tenant_id=task.tenant_id, task_id=task.id, proposal_json=payload,
+                                 proposal_hash=digest, idempotency_marker=uuid.uuid4().hex)
+        db.add(action)
+    else:
+        action.proposal_json, action.proposal_hash, action.status = payload, digest, "proposed"
+        action.approved_hash = action.approved_by_user_id = action.approved_at = None
+        action.external_activity_id = action.verified_at = None
+        action.error = None; action.version += 1
+    db.flush()
+    event = "regenerated" if regenerated else "generated"
+    _record_action_history(
+        db, action, event=event, actor_type="user", actor_id=str(user.id)
+    )
+    record_audit(db, action=f"operation_action.{event}", actor_type="user", actor_id=str(user.id),
+                 tenant_id=task.tenant_id, resource_type="operation_task", resource_id=str(task.id), metadata={"proposal_hash": digest})
+    return _to_out(db, task, user)
+
+
+@router.post("/tasks/{task_id}/action/submit", response_model=OperationTaskOut, dependencies=[Depends(require_csrf)])
+def submit_action(task_id: uuid.UUID, body: OperationActionRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> OperationTaskOut:
+    task = _manager_task(db, user, task_id)
+    action = db.query(OperationAction).filter_by(task_id=task.id, tenant_id=task.tenant_id).with_for_update().one_or_none()
+    if task.version != body.expected_version or action is None or action.status != "proposed":
+        raise HTTPException(status_code=409, detail="Action is not ready for approval")
+    action.status = "awaiting_approval"; action.version += 1
+    _record_action_history(
+        db, action, event="submitted", actor_type="user", actor_id=str(user.id)
+    )
+    record_audit(db, action="operation_action.submitted", actor_type="user", actor_id=str(user.id), tenant_id=task.tenant_id, resource_type="operation_action", resource_id=str(action.id), metadata={})
+    return _to_out(db, task, user)
+
+
+@router.post("/tasks/{task_id}/action/approve", response_model=OperationTaskOut, dependencies=[Depends(require_csrf)])
+def approve_action(task_id: uuid.UUID, body: OperationActionRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> OperationTaskOut:
+    task = _manager_task(db, user, task_id)
+    action = db.query(OperationAction).filter_by(task_id=task.id, tenant_id=task.tenant_id).with_for_update().one_or_none()
+    if (task.version != body.expected_version or action is None or action.status != "awaiting_approval"
+            or body.expected_action_version != action.version or body.expected_proposal_hash != action.proposal_hash):
+        raise HTTPException(status_code=409, detail="Action has been modified")
+    action.status, action.approved_hash, action.approved_by_user_id, action.approved_at = "queued", action.proposal_hash, user.id, datetime.now(UTC)
+    action.version += 1
+    _record_action_history(
+        db, action, event="approved", actor_type="user", actor_id=str(user.id)
+    )
+    record_audit(db, action="operation_action.approved", actor_type="user", actor_id=str(user.id), tenant_id=task.tenant_id, resource_type="operation_action", resource_id=str(action.id), metadata={"proposal_hash": action.proposal_hash})
+    return _to_out(db, task, user)
+
+
+@router.post("/tasks/{task_id}/action/reject", response_model=OperationTaskOut, dependencies=[Depends(require_csrf)])
+def reject_action(task_id: uuid.UUID, body: OperationActionRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> OperationTaskOut:
+    task = _manager_task(db, user, task_id)
+    action = db.query(OperationAction).filter_by(task_id=task.id, tenant_id=task.tenant_id).with_for_update().one_or_none()
+    if (task.version != body.expected_version or action is None
+            or action.status != "awaiting_approval"
+            or body.expected_action_version != action.version
+            or body.expected_proposal_hash != action.proposal_hash):
+        raise HTTPException(status_code=409, detail="Action has been modified")
+    action.status = "proposed"; action.approved_hash = action.approved_by_user_id = action.approved_at = None; action.version += 1
+    _record_action_history(
+        db, action, event="rejected", actor_type="user", actor_id=str(user.id)
+    )
+    record_audit(db, action="operation_action.rejected", actor_type="user", actor_id=str(user.id), tenant_id=task.tenant_id, resource_type="operation_action", resource_id=str(action.id), metadata={})
+    return _to_out(db, task, user)
+
+
+@router.post(
+    "/tasks/{task_id}/action/retry",
+    response_model=OperationTaskOut,
+    dependencies=[Depends(require_csrf)],
+)
+def retry_action(
+    task_id: uuid.UUID,
+    body: OperationActionExactRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> OperationTaskOut:
+    """Requeue the exact previously approved proposal without mutating its identity."""
+    task = _manager_task(db, user, task_id)
+    action = (
+        db.query(OperationAction)
+        .filter_by(task_id=task.id, tenant_id=task.tenant_id)
+        .with_for_update()
+        .one_or_none()
+    )
+    if (
+        task.version != body.expected_version
+        or action is None
+        or action.status != "failed"
+        or body.expected_action_version != action.version
+        or body.expected_proposal_hash != action.proposal_hash
+        or action.approved_hash != action.proposal_hash
+    ):
+        raise HTTPException(status_code=409, detail="Action has been modified")
+    action.status = "queued"
+    action.error = None
+    action.version += 1
+    _record_action_history(
+        db, action, event="retry_queued", actor_type="user", actor_id=str(user.id)
+    )
+    record_audit(
+        db,
+        action="operation_action.retry_queued",
+        actor_type="user",
+        actor_id=str(user.id),
+        tenant_id=task.tenant_id,
+        resource_type="operation_action",
+        resource_id=str(action.id),
+        metadata={"proposal_hash": action.proposal_hash},
+    )
+    return _to_out(db, task, user)
+
+@router.get("/recurring-templates", response_model=list[RecurringTemplateOut])
+def list_recurring_templates(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    ids = _active_tenant_ids(db, user)
+    return [RecurringTemplateOut(id=t.id, tenant_id=t.tenant_id, title=t.title, description=t.description, category=t.category, priority=t.priority, frequency=t.frequency, timezone=t.timezone, enabled=t.enabled) for t in db.query(RecurringTaskTemplate).filter(RecurringTaskTemplate.tenant_id.in_(ids)).all()]
+
+@router.post("/recurring-templates", response_model=RecurringTemplateOut, dependencies=[Depends(require_csrf)])
+def create_recurring_template(body: RecurringTemplateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if body.frequency not in ("daily", "weekly", "monthly") or body.category not in TASK_CATEGORIES or body.priority not in TASK_PRIORITIES:
+        raise HTTPException(status_code=422, detail="Invalid recurring template")
+    if not _is_manager(_role_in_tenant(db, user, body.tenant_id)): raise HTTPException(status_code=403, detail="Insufficient role")
+    from zoneinfo import ZoneInfo
+    try: ZoneInfo(body.timezone)
+    except Exception as exc: raise HTTPException(status_code=422, detail="Invalid timezone") from exc
+    t = RecurringTaskTemplate(**body.model_dump(), created_by_user_id=user.id); db.add(t); db.flush()
+    record_audit(db, action="recurring_template.created", actor_type="user", actor_id=str(user.id), tenant_id=t.tenant_id, resource_type="recurring_template", resource_id=str(t.id), metadata={})
+    return RecurringTemplateOut(id=t.id, enabled=t.enabled, **body.model_dump())
+
+@router.post("/recurring-templates/{template_id}/enable", response_model=RecurringTemplateOut, dependencies=[Depends(require_csrf)])
+def set_recurring_template(template_id: uuid.UUID, enabled: bool, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    t = db.query(RecurringTaskTemplate).filter(RecurringTaskTemplate.id == template_id, RecurringTaskTemplate.tenant_id.in_(_active_tenant_ids(db, user))).one_or_none()
+    if t is None: raise HTTPException(status_code=404, detail="Template not found")
+    if not _is_manager(_role_in_tenant(db, user, t.tenant_id)): raise HTTPException(status_code=403, detail="Insufficient role")
+    t.enabled = enabled
+    return RecurringTemplateOut(id=t.id, tenant_id=t.tenant_id, title=t.title, description=t.description, category=t.category, priority=t.priority, frequency=t.frequency, timezone=t.timezone, enabled=t.enabled)

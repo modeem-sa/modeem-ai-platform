@@ -674,13 +674,17 @@ def test_endpoint_disabled_connection_rejected(roles_seed, monkeypatch):
 # --- 33: no business-data endpoints ------------------------------------------------
 
 
-def test_no_business_data_endpoints_exist():
-    """No connection-level business-data synchronization endpoint exists."""
+def test_only_explicit_overdue_invoice_sync_endpoint_exists():
+    """Only the fixed, tenant-scoped overdue-invoice signal sync is exposed."""
     from app.api.connections import router
 
     paths = [r.path for r in router.routes]
     assert paths  # sanity
+    allowed = "/api/v1/connections/{connection_id}/sync-overdue-invoices"
+    assert allowed in paths
     for path in paths:
+        if path == allowed:
+            continue
         for banned in ("partner", "invoice", "employee", "sync", "sale", "stock", "record"):
             assert banned not in path.lower(), path
 

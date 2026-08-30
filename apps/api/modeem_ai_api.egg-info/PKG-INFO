@@ -1,0 +1,21 @@
+Metadata-Version: 2.4
+Name: modeem-ai-api
+Version: 0.1.0
+Summary: Modeem AI Platform API — foundation phase
+Requires-Python: >=3.12
+Requires-Dist: fastapi
+Requires-Dist: uvicorn
+Requires-Dist: pydantic>=2
+Requires-Dist: pydantic-settings
+Requires-Dist: sqlalchemy>=2
+Requires-Dist: alembic
+Requires-Dist: psycopg2-binary
+Requires-Dist: argon2-cffi
+Requires-Dist: PyJWT
+Requires-Dist: email-validator
+Requires-Dist: cryptography
+Requires-Dist: httpx
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: httpx; extra == "dev"
+Requires-Dist: ruff; extra == "dev"

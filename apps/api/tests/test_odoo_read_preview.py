@@ -659,7 +659,7 @@ def test_oversized_read_response_stopped_by_streaming_cap(allow_outbound, monkey
 # --- No writes / no persistence (53-54) --------------------------------------------------
 
 
-def test_no_write_operations_exist():
+def test_no_generic_write_operations_exist():
     import inspect
 
     for module in (reader, legacy_xmlrpc, json2):
@@ -668,7 +668,10 @@ def test_no_write_operations_exist():
             assert banned not in source, (module.__name__, banned)
     from app.api.connections import router
 
+    allowed_sync = "/api/v1/connections/{connection_id}/sync-overdue-invoices"
     for route in router.routes:
+        if route.path == allowed_sync:
+            continue
         for banned in ("create-record", "write", "unlink", "sync"):
             assert banned not in route.path.lower()
 

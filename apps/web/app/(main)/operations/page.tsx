@@ -18,25 +18,13 @@ import {
   OpCategory,
   OpPriority,
   OpAction,
+  OpSourceType,
   toTaskDueAt,
 } from "@/lib/operations";
 import { ApiError } from "@/lib/api";
-
-const STATUS_COLORS: Record<string, string> = {
-  pending: "bg-slate-500/15 text-slate-300 border-slate-500/30",
-  in_progress: "bg-sky-500/15 text-sky-300 border-sky-500/30",
-  completed: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
-  submitted_for_approval: "bg-amber-500/15 text-amber-300 border-amber-500/30",
-  approved: "bg-emerald-500/15 text-emerald-300 border-emerald-500/30",
-  rejected: "bg-rose-500/15 text-rose-300 border-rose-500/30",
-};
-
-const PRIORITY_COLORS: Record<string, string> = {
-  low: "text-slate-400",
-  medium: "text-sky-400",
-  high: "text-amber-400",
-  urgent: "text-rose-400 font-bold",
-};
+import { OdooTaskCard } from "./odoo-task-card";
+import { ManualTaskCard } from "./manual-task-card";
+import { RecurringTemplates } from "./recurring-templates";
 
 export default function OperationsPage() {
   const { t } = useLocale();
@@ -47,6 +35,9 @@ export default function OperationsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
+  const [activeTab, setActiveTab] = useState<"tasks" | "templates">("tasks");
+  const [sourceFilter, setSourceFilter] = useState<OpSourceType | "">("");
+
   const [filters, setFilters] = useState<TaskFilters>({
     tenant_id: "",
     status: "",
@@ -54,21 +45,25 @@ export default function OperationsPage() {
     priority: "",
   });
 
+  const activeFilters = useMemo(() => ({
+    ...filters,
+    source_type: sourceFilter
+  }), [filters, sourceFilter]);
+
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      // First time we load the page, we need to fetch the bootstrap data too
       if (!bootstrap) {
         const [tasksRes, bootstrapRes] = await Promise.all([
-          fetchTasks(filters),
+          fetchTasks(activeFilters),
           fetchOperationsBootstrap()
         ]);
         setTasks(tasksRes.items);
         setSummary(tasksRes.summary);
         setBootstrap(bootstrapRes);
       } else {
-        const res = await fetchTasks(filters);
+        const res = await fetchTasks(activeFilters);
         setTasks(res.items);
         setSummary(res.summary);
       }
@@ -77,15 +72,30 @@ export default function OperationsPage() {
     } finally {
       setLoading(false);
     }
-  }, [filters, t, bootstrap]);
+  }, [activeFilters, t, bootstrap]);
 
   useEffect(() => {
-    void load();
-  }, [load]);
+    if (activeTab === "tasks") {
+      void load();
+    }
+  }, [load, activeTab]);
 
-  // Authorization for Create
+  useEffect(() => {
+    const executionInProgress = tasks?.some((task) =>
+      ["queued", "executing", "verifying"].includes(task.action?.status ?? "")
+    );
+    if (activeTab !== "tasks" || !executionInProgress) return;
+
+    const timer = window.setInterval(() => {
+      void fetchTasks(activeFilters).then((response) => {
+        setTasks(response.items);
+        setSummary(response.summary);
+      });
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [activeFilters, activeTab, tasks]);
+
   const canCreate = bootstrap?.tenants.some(t => t.can_create) ?? false;
-
   const [showCreate, setShowCreate] = useState(false);
   const [actionTask, setActionTask] = useState<{ task: OperationTask; action: OpAction } | null>(null);
 
@@ -99,7 +109,6 @@ export default function OperationsPage() {
     void load();
   }, [load]);
 
-  // Stats cards
   const stats = [
     { key: "pending", label: t("opStatusPending"), count: summary["pending"] || 0 },
     { key: "in_progress", label: t("opStatusInProgress"), count: summary["in_progress"] || 0 },
@@ -109,101 +118,120 @@ export default function OperationsPage() {
   return (
     <div className="flex min-w-0 flex-1 flex-col">
       <Header titleKey="operations" />
-      <main className="min-w-0 flex-1 p-6 flex flex-col gap-6">
+      <main className="min-w-0 flex-1 p-4 md:p-6 flex flex-col gap-6">
 
-        {/* Summary Row */}
-        <div className="grid grid-cols-3 gap-4">
-          {stats.map((stat) => (
-            <div key={stat.key} className="rounded-xl border border-slate-800 bg-slate-900 p-4">
-              <div className="text-sm font-medium text-slate-400">{stat.label}</div>
-              <div className="mt-2 text-3xl font-bold text-slate-100">{stat.count}</div>
-            </div>
-          ))}
+        {/* Top Tabs */}
+        <div className="flex gap-4 border-b border-slate-800 pb-2 overflow-x-auto whitespace-nowrap hide-scrollbar">
+          <button
+            onClick={() => setActiveTab("tasks")}
+            className={`px-4 py-2 text-sm font-semibold transition-colors ${activeTab === "tasks" ? "text-indigo-400 border-b-2 border-indigo-400" : "text-slate-500 hover:text-slate-300"}`}
+          >
+            {t("opActiveTasks")}
+          </button>
+          <button
+            onClick={() => setActiveTab("templates")}
+            className={`px-4 py-2 text-sm font-semibold transition-colors ${activeTab === "templates" ? "text-indigo-400 border-b-2 border-indigo-400" : "text-slate-500 hover:text-slate-300"}`}
+          >
+            {t("opTemplatesTitle")}
+          </button>
         </div>
 
-        {/* Filters & Actions */}
-        <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-800 bg-slate-900/50 p-4">
-          <div className="flex flex-wrap items-center gap-3">
-            <select
-              value={filters.tenant_id}
-              onChange={(e) => setFilters(f => ({ ...f, tenant_id: e.target.value }))}
-              className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-emerald-500"
-            >
-              <option value="">{t("opSelectTenant")}</option>
-              {bootstrap?.tenants.map((m) => (
-                <option key={m.id} value={m.id}>{m.name}</option>
-              ))}
-            </select>
-
-            <select
-              value={filters.status}
-              onChange={(e) => setFilters(f => ({ ...f, status: e.target.value as OpStatus | "" }))}
-              className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-emerald-500"
-            >
-              <option value="">{t("status")}</option>
-              {["pending", "in_progress", "completed", "submitted_for_approval", "approved", "rejected"].map((s) => {
-                const sKey = `opStatus${s.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('')}`;
-                return <option key={s} value={s}>{t(sKey)}</option>;
-              })}
-            </select>
-
-            <select
-              value={filters.category}
-              onChange={(e) => setFilters(f => ({ ...f, category: e.target.value as OpCategory | "" }))}
-              className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-emerald-500"
-            >
-              <option value="">{t("opCategory")}</option>
-              <option value="administrative">{t("opCatAdministrative")}</option>
-              <option value="financial">{t("opCatFinancial")}</option>
-            </select>
-
-            <select
-              value={filters.priority}
-              onChange={(e) => setFilters(f => ({ ...f, priority: e.target.value as OpPriority | "" }))}
-              className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-emerald-500"
-            >
-              <option value="">{t("opPriority")}</option>
-              <option value="low">{t("opPrioLow")}</option>
-              <option value="medium">{t("opPrioMedium")}</option>
-              <option value="high">{t("opPrioHigh")}</option>
-              <option value="urgent">{t("opPrioUrgent")}</option>
-            </select>
-          </div>
-
-          {canCreate && (
-            <button
-              onClick={() => setShowCreate(true)}
-              className="rounded-lg bg-emerald-500 px-4 py-2 text-sm font-medium text-slate-950 transition-colors hover:bg-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 focus:ring-offset-slate-950"
-            >
-              {t("opNewTask")}
-            </button>
-          )}
-        </div>
-
-        {/* Task Grid */}
-        {error && (
-          <div className="rounded-xl border border-rose-800 bg-rose-950/40 p-4 text-sm text-rose-300">
-            {error}
-          </div>
-        )}
-
-        {loading ? (
-          <div className="py-12 text-center text-slate-400">{t("loading")}</div>
-        ) : !tasks || tasks.length === 0 ? (
-          <div className="rounded-xl border border-dashed border-slate-700 bg-slate-900/40 p-12 text-center">
-            <p className="text-slate-300">{t("opEmpty")}</p>
-            <p className="mt-2 text-sm text-slate-500">{t("opEmptyHint")}</p>
-          </div>
+        {activeTab === "templates" && bootstrap ? (
+          <RecurringTemplates bootstrap={bootstrap} />
         ) : (
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
-            {tasks.map((task) => (
-              <TaskCard
-                key={task.id}
-                task={task}
-                onAction={(action) => setActionTask({ task, action })}
-              />
-            ))}
-          </div>
+          <>
+            {/* Summary Row */}
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              {stats.map((stat) => (
+                <div key={stat.key} className="rounded-xl border border-slate-800 bg-slate-900 p-4">
+                  <div className="text-sm font-medium text-slate-400">{stat.label}</div>
+                  <div className="mt-2 text-3xl font-bold text-slate-100">{stat.count}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Filters & Actions */}
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 rounded-xl border border-slate-800 bg-slate-900/50 p-4">
+              <div className="flex flex-col md:flex-row md:flex-wrap md:items-center gap-3 w-full md:w-auto">
+                <select
+                  value={sourceFilter}
+                  onChange={(e) => setSourceFilter(e.target.value as OpSourceType | "")}
+                  className="w-full md:w-auto rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-indigo-500"
+                >
+                  <option value="">{t("opAllSources")}</option>
+                  <option value="odoo">{t("opOdooOperations")}</option>
+                  <option value="manual">{t("opManualTasks")}</option>
+                  <option value="recurring">{t("opRecurringTasks")}</option>
+                </select>
+
+                <select
+                  value={filters.tenant_id}
+                  onChange={(e) => setFilters(f => ({ ...f, tenant_id: e.target.value }))}
+                  className="w-full md:w-auto rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-indigo-500"
+                >
+                  <option value="">{t("opSelectTenant")}</option>
+                  {bootstrap?.tenants.map((m) => (
+                    <option key={m.id} value={m.id}>{m.name}</option>
+                  ))}
+                </select>
+
+                <select
+                  value={filters.status}
+                  onChange={(e) => setFilters(f => ({ ...f, status: e.target.value as OpStatus | "" }))}
+                  className="w-full md:w-auto rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-sm text-slate-200 outline-none focus:border-indigo-500"
+                >
+                  <option value="">{t("status")}</option>
+                  {["pending", "in_progress", "completed", "submitted_for_approval", "approved", "rejected"].map((s) => {
+                    const sKey = `opStatus${s.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('')}`;
+                    return <option key={s} value={s}>{t(sKey)}</option>;
+                  })}
+                </select>
+              </div>
+
+              {canCreate && (
+                <button
+                  onClick={() => setShowCreate(true)}
+                  className="w-full md:w-auto rounded-lg bg-emerald-500 px-4 py-2 text-sm font-medium text-slate-950 transition-colors hover:bg-emerald-400 focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 focus:ring-offset-slate-950"
+                >
+                  {t("opNewTask")}
+                </button>
+              )}
+            </div>
+
+            {/* Task Grid */}
+            {error && (
+              <div className="rounded-xl border border-rose-800 bg-rose-950/40 p-4 text-sm text-rose-300">
+                {error}
+              </div>
+            )}
+
+            {loading ? (
+              <div className="py-12 text-center text-slate-400">{t("loading")}</div>
+            ) : !tasks || tasks.length === 0 ? (
+              <div className="rounded-xl border border-dashed border-slate-700 bg-slate-900/40 p-12 text-center">
+                <p className="text-slate-300">{t("opEmpty")}</p>
+                <p className="mt-2 text-sm text-slate-500">{t("opEmptyHint")}</p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+                {tasks.map((task) => (
+                  task.source_type === 'odoo' ? (
+                    <OdooTaskCard
+                      key={task.id}
+                      task={task}
+                      onRefresh={load}
+                    />
+                  ) : (
+                    <ManualTaskCard
+                      key={task.id}
+                      task={task}
+                      onAction={(action) => setActionTask({ task, action })}
+                    />
+                  )
+                ))}
+              </div>
+            )}
+          </>
         )}
       </main>
 
@@ -223,76 +251,6 @@ export default function OperationsPage() {
           onSuccess={handleActionComplete}
         />
       )}
-    </div>
-  );
-}
-
-function TaskCard({ task, onAction }: { task: OperationTask, onAction: (action: OpAction) => void }) {
-  const { t, locale } = useLocale();
-  const dateFmt = new Intl.DateTimeFormat(locale === "ar" ? "ar" : "en", { dateStyle: "medium" });
-
-  const statusKey = `opStatus${task.status.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('')}`;
-
-  return (
-    <div className="flex flex-col rounded-xl border border-slate-800 bg-slate-900 p-5 shadow-sm transition-shadow hover:border-slate-700">
-      <div className="mb-3 flex items-start justify-between gap-4">
-        <div className="flex flex-col gap-1.5">
-          <span className="text-xs font-medium text-slate-500">{task.tenant_name}</span>
-          <h3 className="text-base font-semibold text-slate-100">{task.title}</h3>
-        </div>
-        <span className={`shrink-0 rounded-full border px-2.5 py-0.5 text-xs font-medium ${STATUS_COLORS[task.status] || STATUS_COLORS.pending}`}>
-          {t(statusKey) || task.status}
-        </span>
-      </div>
-
-      {task.description && (
-        <p className="mb-4 line-clamp-2 text-sm text-slate-400">{task.description}</p>
-      )}
-
-      <div className="mt-auto flex flex-col gap-3">
-        <div className="grid grid-cols-2 gap-2 text-xs text-slate-400">
-          <div>
-            <span className="block text-[10px] uppercase tracking-wider text-slate-500">{t("opCategory")}</span>
-            {task.category === "administrative" ? t("opCatAdministrative") : t("opCatFinancial")}
-          </div>
-          <div>
-            <span className="block text-[10px] uppercase tracking-wider text-slate-500">{t("opPriority")}</span>
-            <span className={PRIORITY_COLORS[task.priority]}>
-              {t(`opPrio${task.priority.charAt(0).toUpperCase() + task.priority.slice(1)}`)}
-            </span>
-          </div>
-          <div>
-            <span className="block text-[10px] uppercase tracking-wider text-slate-500">{t("opAssignee")}</span>
-            {task.assignee_name || <span className="text-slate-500 italic">{t("opUnassigned")}</span>}
-          </div>
-          <div>
-            <span className="block text-[10px] uppercase tracking-wider text-slate-500">{t("opDueDate")}</span>
-            {task.due_at ? dateFmt.format(new Date(task.due_at)) : "—"}
-          </div>
-        </div>
-
-        {task.available_actions && task.available_actions.length > 0 && (
-          <div className="mt-2 flex flex-wrap gap-2 border-t border-slate-800 pt-3">
-            {task.available_actions.map((action) => {
-              const actionKey = `opAction${action.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('')}`;
-              const isReject = action === 'reject';
-              return (
-                <button
-                  key={action}
-                  onClick={() => onAction(action)}
-                  className={`flex-1 rounded-lg px-3 py-1.5 text-xs font-medium transition-colors ${
-                    isReject
-                      ? "bg-rose-500/10 text-rose-400 hover:bg-rose-500/20"
-                      : "bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-white"
-                  }`}
-                >
-                  {t(actionKey) || action}
-                </button>
-              );
-            })}
-          </div>
-        )}
-      </div>
     </div>
   );
 }
@@ -332,7 +290,6 @@ function CreateTaskModal({ bootstrap, onClose, onSuccess }: { bootstrap: Operati
   }, [eligibleTenants, form.tenant_id]);
 
   useEffect(() => {
-    // When tenant changes (or loads initially), reset assigned user gracefully
     if (selectedTenant && user) {
       const isMember = selectedTenant.members.some(m => m.id === user.id);
       setForm(f => ({ ...f, assigned_user_id: isMember ? user.id : "" }));
@@ -423,7 +380,7 @@ function CreateTaskModal({ bootstrap, onClose, onSuccess }: { bootstrap: Operati
             />
           </label>
 
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <label className="flex flex-col gap-1.5 text-sm text-slate-300">
               {t("opCategory")}
               <select
@@ -451,7 +408,7 @@ function CreateTaskModal({ bootstrap, onClose, onSuccess }: { bootstrap: Operati
             </label>
           </div>
 
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <label className="flex flex-col gap-1.5 text-sm text-slate-300">
               {t("opDueDate")}
               <input

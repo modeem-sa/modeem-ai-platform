@@ -21,7 +21,14 @@ from app.api.deps import (
     require_role,
 )
 from app.core.config import get_settings
-from app.models import Connection, User
+from app.models import (
+    Connection,
+    OperationAction,
+    OperationActionHistory,
+    OperationTask,
+    User,
+)
+from app.operations.odoo_sync import scan_overdue_invoices
 from app.schemas.connections import (
     ConnectionCreate,
     ConnectionOut,
@@ -52,6 +59,7 @@ def _to_out(conn: Connection) -> ConnectionOut:
         base_url=conn.base_url,
         database_name=conn.database_name,
         username=conn.username,
+        odoo_company_id=conn.odoo_company_id,
         status=conn.status,
         is_active=conn.is_active,
         has_credentials=conn.encrypted_credentials is not None,
@@ -68,12 +76,16 @@ def _to_out(conn: Connection) -> ConnectionOut:
     )
 
 
-def _scoped_get(db: Session, ctx: TenantContext, connection_id: uuid.UUID) -> Connection:
-    conn = (
+def _scoped_get(
+    db: Session, ctx: TenantContext, connection_id: uuid.UUID, *, lock: bool = False
+) -> Connection:
+    query = (
         db.query(Connection)
         .filter(Connection.id == connection_id, Connection.tenant_id == ctx.tenant.id)
-        .first()
     )
+    if lock:
+        query = query.with_for_update()
+    conn = query.first()
     if conn is None:
         # 404 (not 403) so existence in another tenant is not leaked.
         raise HTTPException(
@@ -184,6 +196,7 @@ def create_connection(
         database_name=body.database_name,
         username=body.username,
         auth_mode=body.auth_mode,
+        odoo_company_id=body.odoo_company_id,
         encrypted_credentials=blob,
         encryption_version=version,
         status="configured",
@@ -217,9 +230,10 @@ def update_connection(
     actor: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ConnectionOut:
-    conn = _scoped_get(db, ctx, connection_id)
+    conn = _scoped_get(db, ctx, connection_id, lock=True)
     provided = body.model_fields_set
     connectivity_changed = False
+    company_scope_changed = False
 
     if body.name is not None and body.name != conn.name:
         new_name = body.name
@@ -266,6 +280,9 @@ def update_connection(
         if body.auth_mode != conn.auth_mode:
             connectivity_changed = True
         conn.auth_mode = body.auth_mode
+    if "odoo_company_id" in provided:
+        company_scope_changed = body.odoo_company_id != conn.odoo_company_id
+        conn.odoo_company_id = body.odoo_company_id
 
     credentials_changed = False
     if body.credentials is not None:
@@ -285,6 +302,56 @@ def update_connection(
         # changed endpoint / database / auth mode / credential set.
         _invalidate_test_metadata(conn)
 
+    invalidated_count = 0
+    if company_scope_changed:
+        queued_actions = (
+            db.query(OperationAction)
+            .join(
+                OperationTask,
+                (OperationTask.id == OperationAction.task_id)
+                & (OperationTask.tenant_id == OperationAction.tenant_id),
+            )
+            .filter(
+                OperationTask.source_connection_id == conn.id,
+                OperationAction.tenant_id == ctx.tenant.id,
+                OperationAction.status == "queued",
+            )
+            .with_for_update(of=OperationAction)
+            .all()
+        )
+        for action in queued_actions:
+            action.status = "failed"
+            action.error = "company_scope_changed"
+            action.version += 1
+            db.add(
+                OperationActionHistory(
+                    action_id=action.id,
+                    task_id=action.task_id,
+                    tenant_id=action.tenant_id,
+                    actor_type="system",
+                    actor_id="connection-scope-change",
+                    event="failed",
+                    version=action.version,
+                    status=action.status,
+                    proposal_hash=action.proposal_hash,
+                    detail="company_scope_changed",
+                )
+            )
+        invalidated_count = len(queued_actions)
+        record_audit(
+            db,
+            action="connection.queued_actions_invalidated",
+            actor_type="user",
+            actor_id=str(actor.id),
+            tenant_id=ctx.tenant.id,
+            resource_type="connection",
+            resource_id=str(conn.id),
+            metadata={
+                "reason": "company_scope_changed",
+                "invalidated_count": invalidated_count,
+            },
+        )
+
     conn.updated_by_user_id = actor.id
     record_audit(
         db,
@@ -300,6 +367,8 @@ def update_connection(
             "provider": conn.provider,
             "name": conn.name,
             "credentials_changed": credentials_changed,
+            "company_scope_changed": company_scope_changed,
+            "invalidated_count": invalidated_count,
         },
     )
     db.flush()
@@ -561,6 +630,24 @@ def read_preview(
     _audit(success=True, returned_count=page["returned_count"], error_code=None)
     db.flush()
     return ReadPreviewResponse(**page)
+
+
+@router.post("/connections/{connection_id}/sync-overdue-invoices", dependencies=[Depends(require_csrf)])
+def sync_overdue_invoices(
+    connection_id: uuid.UUID,
+    ctx: TenantContext = Depends(require_role("owner", "admin", "manager")),
+    actor: User = Depends(get_current_user), db: Session = Depends(get_db),
+) -> dict[str, int]:
+    """Manager-triggered scan of a fixed customer-invoice signal only."""
+    conn = _scoped_get(db, ctx, connection_id)
+    try:
+        if conn.odoo_company_id is None:
+            raise ValueError("Connection has no approved Odoo company scope")
+        created = scan_overdue_invoices(db, connection=conn, company_id=conn.odoo_company_id, actor=actor)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    record_audit(db, action="connection.overdue_invoice_sync", actor_type="user", actor_id=str(actor.id), tenant_id=ctx.tenant.id, resource_type="connection", resource_id=str(conn.id), metadata={"company_id": conn.odoo_company_id, "created": created})
+    return {"created": created}
 
 
 @router.delete(

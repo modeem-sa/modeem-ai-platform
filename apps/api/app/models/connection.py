@@ -57,6 +57,8 @@ class Connection(Base):
     base_url: Mapped[str] = mapped_column(String(500), nullable=False)
     database_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
     username: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    # Explicitly approved Odoo company boundary for automated invoice scans.
+    odoo_company_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Secret payload: nonce || AES-256-GCM ciphertext. Never returned by APIs.
     encrypted_credentials: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
