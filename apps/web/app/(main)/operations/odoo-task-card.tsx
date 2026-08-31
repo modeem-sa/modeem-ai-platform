@@ -1,28 +1,33 @@
 import { useState } from "react";
 import { useLocale } from "@/components/locale-provider";
-import { OperationTask, generateAction, submitAction, approveAction, rejectAction, retryAction } from "@/lib/operations";
+import {
+  OperationTask,
+  approveCollectionMessage,
+  generateCollectionMessage,
+  getCollectionDeliveryPresentation,
+  rejectCollectionMessage,
+  retryCollectionMessage,
+  submitCollectionMessage,
+} from "@/lib/operations";
 
-export function OdooTaskCard({ task, onRefresh }: { task: OperationTask, onRefresh: () => void }) {
+export function OdooTaskCard({ task, onRefresh }: { task: OperationTask, onRefresh: () => void | Promise<void> }) {
   const { locale, t } = useLocale();
   const dateFmt = new Intl.DateTimeFormat(locale === "ar" ? "ar" : "en", { dateStyle: "medium" });
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const [showRejectReason, setShowRejectReason] = useState(false);
-  const [rejectReason, setRejectReason] = useState("");
-
   const snapshot = (task.source_snapshot as Record<string, string | number | null | undefined>) || {};
   const amount = Number(snapshot.residual ?? snapshot.total ?? 0);
   const currency = String(snapshot.currency ?? "");
   
-  const action = task.action;
+  const message = task.collection_message;
   
   const handleGenerate = async () => {
     setLoading(true); setError(null);
     try {
-      await generateAction(task.id, task.version);
-      onRefresh();
+      await generateCollectionMessage(task.id, task.version);
+      await onRefresh();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : t("opFailedGenerate"));
     } finally {
@@ -31,10 +36,11 @@ export function OdooTaskCard({ task, onRefresh }: { task: OperationTask, onRefre
   };
 
   const handleSubmit = async () => {
+    if (!message) return;
     setLoading(true); setError(null);
     try {
-      await submitAction(task.id, task.version);
-      onRefresh();
+      await submitCollectionMessage(task.id, task.version, message);
+      await onRefresh();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : t("opFailedSubmit"));
     } finally {
@@ -43,11 +49,11 @@ export function OdooTaskCard({ task, onRefresh }: { task: OperationTask, onRefre
   };
 
   const handleApprove = async () => {
-    if (!action) return;
+    if (!message) return;
     setLoading(true); setError(null);
     try {
-      await approveAction(task.id, task.version, action.version, action.proposal_hash);
-      onRefresh();
+      await approveCollectionMessage(task.id, task.version, message);
+      await onRefresh();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : t("opFailedApprove"));
     } finally {
@@ -56,11 +62,11 @@ export function OdooTaskCard({ task, onRefresh }: { task: OperationTask, onRefre
   };
 
   const handleRetry = async () => {
-    if (!action) return;
+    if (!message) return;
     setLoading(true); setError(null);
     try {
-      await retryAction(task.id, task.version, action.version, action.proposal_hash);
-      onRefresh();
+      await retryCollectionMessage(task.id, task.version, message);
+      await onRefresh();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : t("opFailedRetry"));
     } finally {
@@ -68,21 +74,20 @@ export function OdooTaskCard({ task, onRefresh }: { task: OperationTask, onRefre
     }
   };
 
-  const handleReject = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!action || !rejectReason.trim()) return;
+  const handleReject = async () => {
+    if (!message) return;
     setLoading(true); setError(null);
     try {
-      await rejectAction(task.id, task.version, action.version, action.proposal_hash);
-      setShowRejectReason(false);
-      setRejectReason("");
-      onRefresh();
+      await rejectCollectionMessage(task.id, task.version, message);
+      await onRefresh();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : t("opFailedReject"));
     } finally {
       setLoading(false);
     }
   };
+
+  const delivery = message ? getCollectionDeliveryPresentation(message) : null;
 
   return (
     <div className="flex flex-col rounded-xl border border-sky-800/40 bg-slate-900/80 p-5 shadow-sm transition-shadow">
@@ -123,36 +128,52 @@ export function OdooTaskCard({ task, onRefresh }: { task: OperationTask, onRefre
         </div>
       </div>
 
-      {/* AI Draft Area */}
-      {action && action.proposal && (
-        <div className="mb-4 rounded-lg bg-indigo-950/20 p-4 border border-indigo-900/30">
-          <div className="mb-2 flex items-center justify-between">
-            <span className="text-xs font-bold text-indigo-400 flex items-center gap-1.5">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/></svg>
-              {t("opAiDraftProposal")}
-            </span>
-            <span className="text-[10px] text-indigo-500/70">
-              {t("opModel")}: {String((action.proposal.metadata as Record<string, unknown> | undefined)?.model || t("opUnknown"))} ({t("opConf")}: {String(action.proposal.confidence || t("opNA"))})
-            </span>
-          </div>
-          
-          <h4 className="font-medium text-slate-200 mb-1">{String(action.proposal.title || action.proposal.summary || t("opActionProposed"))}</h4>
-          {typeof action.proposal.note === "string" && action.proposal.note && (
-            <p className="text-sm text-slate-400 mb-2 italic">&quot;{action.proposal.note}&quot;</p>
+      {/* Arabic AI draft and the separately identified, hash-bound approved snapshot. */}
+      {message && (
+        <div className="mb-4 flex flex-col gap-3">
+          <MessageCopy
+            content={message.draft_content}
+            label={t("opAiDraftProposal")}
+            hash={message.draft_hash}
+            version={message.draft_version}
+            variant="draft"
+          />
+          {message.approved_content && message.approved_hash && (
+            <MessageCopy
+              content={message.approved_content}
+              label={t("opApprovedImmutableCopy")}
+              hash={message.approved_hash}
+              version={message.approved_draft_version || message.draft_version}
+              variant="approved"
+            />
           )}
-          {typeof action.proposal.priority_reason === "string" && action.proposal.priority_reason && (
-            <p className="text-xs text-indigo-300/80">{t("opReasoning")}: {action.proposal.priority_reason}</p>
+          {delivery && (
+            <div className="rounded-lg border border-slate-700/70 bg-slate-950/50 p-3 text-xs">
+              <div className="flex items-center justify-between gap-3">
+                <span className="font-semibold text-slate-300">{t("opDelivery")}</span>
+                <span className={
+                  delivery.tone === "success" ? "text-emerald-400"
+                    : delivery.tone === "error" ? "text-rose-400"
+                    : delivery.tone === "in_flight" ? "text-amber-400"
+                    : "text-slate-500"
+                }>
+                  {t(delivery.labelKey)}
+                </span>
+              </div>
+              {message.receipt_message_id !== null && (
+                <div className="mt-2 break-all text-emerald-300" dir="ltr">
+                  <span className="text-slate-500">{t("opDeliveryReceipt")}: </span>
+                  {message.receipt_message_id}
+                </div>
+              )}
+              {message.delivery_error && (
+                <div className="mt-2 break-words text-rose-400">
+                  <span className="text-slate-500">{t("opDeliveryError")}: </span>
+                  {message.delivery_error}
+                </div>
+              )}
+            </div>
           )}
-
-          <div className="mt-3 flex items-center justify-between border-t border-indigo-900/30 pt-3 text-xs">
-            <span className="text-slate-500">{t("status")}: {action.status}</span>
-            {action.status === 'succeeded' && action.external_activity_id && (
-              <span className="text-emerald-400">{t("opVerifiedActivity")}: {action.external_activity_id}</span>
-            )}
-            {action.status === 'failed' && (
-              <span className="text-rose-400">{t("opError")}: {action.error || t("opFailedVerifyExecution")}</span>
-            )}
-          </div>
         </div>
       )}
 
@@ -164,36 +185,20 @@ export function OdooTaskCard({ task, onRefresh }: { task: OperationTask, onRefre
 
       {/* Execution Controls */}
       <div className="mt-auto pt-2">
-        {showRejectReason ? (
-          <form onSubmit={handleReject} className="flex flex-col gap-2">
-            <input 
-              type="text" 
-              required
-              placeholder={t("opRejectReasonPlaceholder")}
-              value={rejectReason}
-              onChange={(e) => setRejectReason(e.target.value)}
-              className="rounded border border-slate-700 bg-slate-950 px-3 py-1.5 text-sm text-white outline-none focus:border-rose-500"
-            />
-            <div className="flex gap-2">
-              <button type="submit" disabled={loading} className="flex-1 bg-rose-500 text-white rounded py-1.5 text-xs font-medium hover:bg-rose-400 disabled:opacity-50">
-                {t("opConfirmReject")}
-              </button>
-              <button type="button" onClick={() => setShowRejectReason(false)} disabled={loading} className="px-3 text-xs text-slate-400 hover:text-white">
-                {t("opCancel")}
-              </button>
-            </div>
-          </form>
-        ) : (
-          <div className="flex gap-2">
-            {!action ? (
+        <div className="flex gap-2">
+            {!message ? (
               <button onClick={handleGenerate} disabled={loading} className="flex-1 bg-indigo-600 text-white rounded-lg py-2 text-sm font-medium hover:bg-indigo-500 disabled:opacity-50 transition-colors">
-                {loading ? t("opGenerating") : t("opGenerateAI")}
+                {loading ? t("opGenerating") : t("opGenerateCollectionMessage")}
               </button>
-            ) : action.status === 'failed' ? (
-              <button onClick={handleRetry} disabled={loading} className="flex-1 bg-amber-600 text-white rounded-lg py-2 text-sm font-medium hover:bg-amber-500 disabled:opacity-50 transition-colors">
-                {loading ? t("opRetrying") : t("opRetryExact")}
+            ) : message.status === 'failed' ? (
+              <button onClick={handleRetry} disabled={loading || message.attempt_count >= 3} className="flex-1 bg-amber-600 text-white rounded-lg py-2 text-sm font-medium hover:bg-amber-500 disabled:opacity-50 transition-colors">
+                {loading
+                  ? t("opRetrying")
+                  : message.attempt_count >= 3
+                    ? t("opRetryLimitReached")
+                    : t("opRetryApprovedMessage")}
               </button>
-            ) : action.status === 'proposed' ? (
+            ) : message.status === 'draft' ? (
               <>
                 <button onClick={handleSubmit} disabled={loading} className="flex-1 bg-sky-600 text-white rounded-lg py-2 text-sm font-medium hover:bg-sky-500 disabled:opacity-50 transition-colors">
                   {loading ? t("opSubmitting") : t("opSubmitApproval")}
@@ -202,27 +207,63 @@ export function OdooTaskCard({ task, onRefresh }: { task: OperationTask, onRefre
                   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.59-9.21l5.67-5.67"/></svg>
                 </button>
               </>
-            ) : action.status === 'awaiting_approval' ? (
+            ) : message.status === 'awaiting_approval' ? (
               <>
                 <button onClick={handleApprove} disabled={loading} className="flex-1 bg-emerald-600 text-white rounded-lg py-2 text-sm font-medium hover:bg-emerald-500 disabled:opacity-50 transition-colors">
                   {loading ? t("opApproving") : t("opApproveHash")}
                 </button>
-                <button onClick={() => setShowRejectReason(true)} disabled={loading} className="flex-1 bg-rose-900/50 text-rose-400 rounded-lg py-2 text-sm font-medium hover:bg-rose-800 hover:text-rose-200 disabled:opacity-50 transition-colors">
+                <button onClick={handleReject} disabled={loading} className="flex-1 bg-rose-900/50 text-rose-400 rounded-lg py-2 text-sm font-medium hover:bg-rose-800 hover:text-rose-200 disabled:opacity-50 transition-colors">
                   {t("opReject")}
                 </button>
               </>
-            ) : action.status === 'queued' || action.status === 'executing' || action.status === 'verifying' ? (
+            ) : message.status === 'queued' || message.status === 'sending' || message.status === 'verifying' ? (
               <div className="flex-1 text-center py-2 text-sm font-medium text-amber-400 bg-amber-950/20 rounded-lg border border-amber-900/30">
-                {t("opExecuting")}
+                {t("opDeliveringMessage")}
               </div>
-            ) : action.status === 'succeeded' ? (
+            ) : message.status === 'succeeded' ? (
               <div className="flex-1 text-center py-2 text-sm font-medium text-emerald-400 bg-emerald-950/20 rounded-lg border border-emerald-900/30">
-                {t("opVerified")}
+                {t("opDeliveryVerified")}
               </div>
             ) : null}
-          </div>
-        )}
+        </div>
       </div>
+    </div>
+  );
+}
+
+function MessageCopy({
+  content,
+  label,
+  hash,
+  version,
+  variant,
+}: {
+  content: string;
+  label: string;
+  hash: string;
+  version: number;
+  variant: "draft" | "approved";
+}) {
+  const approved = variant === "approved";
+  return (
+    <div className={`rounded-lg border p-4 ${
+      approved
+        ? "border-emerald-900/40 bg-emerald-950/20"
+        : "border-indigo-900/30 bg-indigo-950/20"
+    }`}>
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <span className={`flex items-center gap-1.5 text-xs font-bold ${
+          approved ? "text-emerald-400" : "text-indigo-400"
+        }`}>
+          {label}
+        </span>
+        <span className="text-[10px] text-slate-500" dir="ltr" title={hash}>
+          v{version} · SHA-256: {hash.slice(0, 12)}…
+        </span>
+      </div>
+      <p dir="rtl" lang="ar" className="whitespace-pre-wrap text-right text-sm leading-7 text-slate-200">
+        {content}
+      </p>
     </div>
   );
 }

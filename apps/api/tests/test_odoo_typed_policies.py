@@ -607,6 +607,63 @@ def test_migration_chain_is_linear():
     assert len(script.get_heads()) == 1
 
 
+@pytest.mark.parametrize(
+    ("existing_tables", "expected_upgrade"),
+    [
+        ({"operation_tasks", "operation_task_history"}, False),
+        (set(), True),
+    ],
+)
+def test_legacy_0007_operation_schema_is_converged(
+    monkeypatch, existing_tables, expected_upgrade
+):
+    import pathlib
+
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    api_dir = pathlib.Path(__file__).resolve().parents[1]
+    cfg = Config(str(api_dir / "alembic.ini"))
+    cfg.set_main_option("script_location", str(api_dir / "alembic"))
+    migration = ScriptDirectory.from_config(cfg).get_revision("0007").module
+    calls = []
+    monkeypatch.setattr(migration, "_table_names", lambda: existing_tables)
+    monkeypatch.setattr(
+        migration, "_upgrade_operation_schema", lambda: calls.append("singular")
+    )
+
+    migration.upgrade()
+
+    assert ("singular" in calls) is expected_upgrade
+
+
+def test_0008_ensures_singular_execution_schema_before_source_fields(monkeypatch):
+    import pathlib
+    from types import SimpleNamespace
+
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    api_dir = pathlib.Path(__file__).resolve().parents[1]
+    cfg = Config(str(api_dir / "alembic.ini"))
+    cfg.set_main_option("script_location", str(api_dir / "alembic"))
+    migration = ScriptDirectory.from_config(cfg).get_revision("0008").module
+    calls = []
+    spec = SimpleNamespace(
+        loader=SimpleNamespace(
+            exec_module=lambda loaded: setattr(
+                loaded, "upgrade", lambda: calls.append("singular")
+            )
+        )
+    )
+    monkeypatch.setattr(migration, "spec_from_file_location", lambda *_args: spec)
+    monkeypatch.setattr(migration, "module_from_spec", lambda _spec: SimpleNamespace())
+
+    migration._ensure_operation_schema()
+
+    assert calls == ["singular"]
+
+
 def test_capabilities_json_shape_unchanged(roles_seed):
     # Sanity: stored capabilities remain valid JSON after Phase 2E edits.
     client = _client()

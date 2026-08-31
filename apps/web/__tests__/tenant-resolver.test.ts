@@ -15,6 +15,7 @@ import {
   SESSION_COOKIE_NAME,
   getCookieValue,
   resolveTenantFromRequest,
+  resolveSessionFromRequest,
   verifySessionToken,
 } from "../lib/tenant-resolver.ts";
 
@@ -140,7 +141,7 @@ describe("resolveTenantFromRequest", () => {
     try {
       delete (process.env as Record<string, string | undefined>).AUTH_SECRET;
       process.env.SESSION_SECRET = SECRET;
-      const token = makeToken({ tid: TENANT_ID, exp: futureExp() });
+      const token = makeToken({ sub: "u1", tid: TENANT_ID, exp: futureExp() });
       assert.equal(
         resolveTenantFromRequest(reqWithCookie(`${SESSION_COOKIE_NAME}=${token}`)),
         TENANT_ID,
@@ -149,5 +150,24 @@ describe("resolveTenantFromRequest", () => {
       process.env.AUTH_SECRET = prevAuth;
       process.env.SESSION_SECRET = prevSession;
     }
+  });
+});
+
+describe("resolveSessionFromRequest", () => {
+  it("accepts an authenticated multi-membership session without a tenant", () => {
+    const token = makeToken({ sub: "u1", exp: futureExp() });
+    const session = resolveSessionFromRequest(
+      reqWithCookie(`${SESSION_COOKIE_NAME}=${token}`),
+    );
+    assert.equal(session?.sub, "u1");
+    assert.equal(session?.tid, undefined);
+  });
+
+  it("rejects a signed token without a user identity", () => {
+    const token = makeToken({ exp: futureExp() });
+    assert.equal(
+      resolveSessionFromRequest(reqWithCookie(`${SESSION_COOKIE_NAME}=${token}`)),
+      null,
+    );
   });
 });

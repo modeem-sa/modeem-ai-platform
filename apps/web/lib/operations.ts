@@ -7,11 +7,30 @@ export type OpAction = 'start' | 'complete' | 'submit_for_approval' | 'approve' 
 
 export type OpSourceType = 'manual' | 'odoo' | 'recurring';
 
+export type OperationActionStatus =
+  | 'proposed'
+  | 'awaiting_approval'
+  | 'approved'
+  | 'queued'
+  | 'executing'
+  | 'verifying'
+  | 'succeeded'
+  | 'failed';
+
+export interface OperationProposal extends Record<string, unknown> {
+  title?: string;
+  summary?: string;
+  note?: string;
+  priority_reason?: string;
+  confidence?: number;
+  metadata?: Record<string, unknown>;
+}
+
 export interface TaskAction {
   id: string;
-  status: string;
+  status: OperationActionStatus;
   version: number;
-  proposal: Record<string, unknown>;
+  proposal: OperationProposal;
   proposal_hash: string;
   approved_hash: string | null;
   approved_by_user_id: string | null;
@@ -20,6 +39,116 @@ export interface TaskAction {
   error: string | null;
   external_activity_id: number | null;
   verified_at: string | null;
+}
+
+export type CollectionMessageStatus =
+  | 'draft'
+  | 'awaiting_approval'
+  | 'queued'
+  | 'sending'
+  | 'verifying'
+  | 'succeeded'
+  | 'failed';
+
+export interface CollectionMessage {
+  id: string;
+  channel: 'odoo_customer_invoice_chatter';
+  status: CollectionMessageStatus;
+  version: number;
+  draft_content: string;
+  draft_version: number;
+  draft_hash: string;
+  /** Server-derived source snapshot identity; never synthesized by the browser. */
+  source_hash: string;
+  source_version: number;
+  approved_content: string | null;
+  approved_draft_version: number | null;
+  approved_hash: string | null;
+  approved_source_hash: string | null;
+  approved_source_version: number | null;
+  approved_by_user_id: string | null;
+  approved_at: string | null;
+  attempt_count: number;
+  delivery_error: string | null;
+  receipt_message_id: number | null;
+  verified_at: string | null;
+}
+
+export interface ExactCollectionMessagePayload {
+  expected_version: number;
+  expected_message_version: number;
+  expected_draft_version: number;
+  expected_draft_hash: string;
+  expected_source_hash: string;
+  expected_source_version: number;
+}
+
+export interface ExactActionPayload {
+  expected_version: number;
+  expected_action_version: number;
+  expected_proposal_hash: string;
+}
+
+export type DeliveryTone = 'neutral' | 'in_flight' | 'success' | 'error';
+
+export interface DeliveryPresentation {
+  state: string;
+  labelKey: string;
+  tone: DeliveryTone;
+}
+
+export function buildExactActionPayload(
+  expectedVersion: number,
+  expectedActionVersion: number,
+  expectedProposalHash: string
+): ExactActionPayload {
+  return {
+    expected_version: expectedVersion,
+    expected_action_version: expectedActionVersion,
+    expected_proposal_hash: expectedProposalHash
+  };
+}
+
+export function buildExactCollectionMessagePayload(
+  expectedVersion: number,
+  message: Pick<
+    CollectionMessage,
+    'version' | 'draft_version' | 'draft_hash' | 'source_hash' | 'source_version'
+  >
+): ExactCollectionMessagePayload {
+  return {
+    expected_version: expectedVersion,
+    expected_message_version: message.version,
+    expected_draft_version: message.draft_version,
+    expected_draft_hash: message.draft_hash,
+    expected_source_hash: message.source_hash,
+    expected_source_version: message.source_version
+  };
+}
+
+export function isActionDeliveryInFlight(action: TaskAction | null): boolean {
+  return action ? ['queued', 'executing', 'verifying'].includes(action.status) : false;
+}
+
+export function getCollectionDeliveryPresentation(
+  message: CollectionMessage
+): DeliveryPresentation {
+  if (message.status === 'queued') {
+    return { state: message.status, labelKey: 'opDeliveryQueued', tone: 'in_flight' };
+  }
+  if (message.status === 'sending') {
+    return { state: message.status, labelKey: 'opDeliverySending', tone: 'in_flight' };
+  }
+  if (message.status === 'verifying') {
+    return { state: message.status, labelKey: 'opDeliveryVerifying', tone: 'in_flight' };
+  }
+  if (message.status === 'succeeded') {
+    return { state: message.status, labelKey: 'opDeliverySucceeded', tone: 'success' };
+  }
+  if (message.status === 'failed') {
+    return { state: message.status, labelKey: 'opDeliveryFailed', tone: 'error' };
+  }
+  return { state: message.status, labelKey: 'opDeliveryNotStarted', tone: 'neutral' };
 }
 
 export interface OperationTask {
@@ -53,6 +182,7 @@ export interface OperationTask {
   source_sync_state: string | null;
   source_synced_at: string | null;
   action: TaskAction | null;
+  collection_message?: CollectionMessage | null;
 }
 
 export interface TasksSummary {
@@ -111,7 +241,7 @@ export function buildOperationsUrl(filters: TaskFilters, limit = 200, offset = 0
   if (filters.priority) params.append("priority", filters.priority);
   if (filters.source_type) params.append("source_type", filters.source_type);
 
-  return `/api/v1/operations/tasks?${params.toString()}`;
+  return `/api/v1/operations/board?${params.toString()}`;
 }
 
 export interface BootstrapMember {
@@ -171,10 +301,19 @@ export async function generateAction(id: string, expectedVersion: number): Promi
   });
 }
 
-export async function submitAction(id: string, expectedVersion: number): Promise<OperationTask> {
+export async function submitAction(
+  id: string,
+  expectedVersion: number,
+  expectedActionVersion: number,
+  expectedProposalHash: string
+): Promise<OperationTask> {
   return apiFetch<OperationTask>(`/api/v1/operations/tasks/${id}/action/submit`, {
     method: "POST",
-    body: JSON.stringify({ expected_version: expectedVersion })
+    body: JSON.stringify(buildExactActionPayload(
+      expectedVersion,
+      expectedActionVersion,
+      expectedProposalHash
+    ))
   });
 }
 
@@ -186,11 +325,11 @@ export async function approveAction(
 ): Promise<OperationTask> {
   return apiFetch<OperationTask>(`/api/v1/operations/tasks/${id}/action/approve`, {
     method: "POST",
-    body: JSON.stringify({
-      expected_version: expectedVersion,
-      expected_action_version: expectedActionVersion,
-      expected_proposal_hash: expectedProposalHash
-    })
+    body: JSON.stringify(buildExactActionPayload(
+      expectedVersion,
+      expectedActionVersion,
+      expectedProposalHash
+    ))
   });
 }
 
@@ -202,11 +341,11 @@ export async function rejectAction(
 ): Promise<OperationTask> {
   return apiFetch<OperationTask>(`/api/v1/operations/tasks/${id}/action/reject`, {
     method: "POST",
-    body: JSON.stringify({
-      expected_version: expectedVersion,
-      expected_action_version: expectedActionVersion,
-      expected_proposal_hash: expectedProposalHash
-    })
+    body: JSON.stringify(buildExactActionPayload(
+      expectedVersion,
+      expectedActionVersion,
+      expectedProposalHash
+    ))
   });
 }
 
@@ -218,12 +357,66 @@ export async function retryAction(
 ): Promise<OperationTask> {
   return apiFetch<OperationTask>(`/api/v1/operations/tasks/${id}/action/retry`, {
     method: "POST",
-    body: JSON.stringify({
-      expected_version: expectedVersion,
-      expected_action_version: expectedActionVersion,
-      expected_proposal_hash: expectedProposalHash
-    })
+    body: JSON.stringify(buildExactActionPayload(
+      expectedVersion,
+      expectedActionVersion,
+      expectedProposalHash
+    ))
   });
+}
+
+export async function generateCollectionMessage(
+  id: string,
+  expectedVersion: number
+): Promise<OperationTask> {
+  return apiFetch<OperationTask>(`/api/v1/operations/tasks/${id}/collection-message/generate`, {
+    method: "POST",
+    body: JSON.stringify({ expected_version: expectedVersion })
+  });
+}
+
+async function performExactCollectionMessageAction(
+  id: string,
+  endpoint: 'submit' | 'approve' | 'reject' | 'retry',
+  expectedVersion: number,
+  message: CollectionMessage
+): Promise<OperationTask> {
+  return apiFetch<OperationTask>(`/api/v1/operations/tasks/${id}/collection-message/${endpoint}`, {
+    method: "POST",
+    body: JSON.stringify(buildExactCollectionMessagePayload(expectedVersion, message))
+  });
+}
+
+export function submitCollectionMessage(
+  id: string,
+  expectedVersion: number,
+  message: CollectionMessage
+): Promise<OperationTask> {
+  return performExactCollectionMessageAction(id, 'submit', expectedVersion, message);
+}
+
+export function approveCollectionMessage(
+  id: string,
+  expectedVersion: number,
+  message: CollectionMessage
+): Promise<OperationTask> {
+  return performExactCollectionMessageAction(id, 'approve', expectedVersion, message);
+}
+
+export function rejectCollectionMessage(
+  id: string,
+  expectedVersion: number,
+  message: CollectionMessage
+): Promise<OperationTask> {
+  return performExactCollectionMessageAction(id, 'reject', expectedVersion, message);
+}
+
+export function retryCollectionMessage(
+  id: string,
+  expectedVersion: number,
+  message: CollectionMessage
+): Promise<OperationTask> {
+  return performExactCollectionMessageAction(id, 'retry', expectedVersion, message);
 }
 
 export interface RecurringTemplate {

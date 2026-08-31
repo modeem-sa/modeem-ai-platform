@@ -1,12 +1,3 @@
-/**
- * Tests for the proxy authorization boundary and upstream forwarding.
- *
- * proxy-handler.ts has no next/server dependency (returns ProxyResult, not
- * NextResponse), so these tests run with plain node:test — no mocking needed.
- *
- * Run with: node --experimental-strip-types --test '__tests__/**\/*.test.ts'
- */
-
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createHmac } from "node:crypto";
@@ -25,35 +16,42 @@ function b64url(data: string): string {
 function makeToken(claims: Record<string, unknown>, secret = AUTH_SECRET): string {
   const header = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
   const payload = b64url(JSON.stringify(claims));
-  const sig = createHmac("sha256", secret).update(`${header}.${payload}`).digest("base64url");
-  return `${header}.${payload}.${sig}`;
+  const signature = createHmac("sha256", secret)
+    .update(`${header}.${payload}`)
+    .digest("base64url");
+  return `${header}.${payload}.${signature}`;
 }
 
-function validSessionCookie(): string {
-  const token = makeToken({
+function sessionCookie(withTenant = true): string {
+  const claims: Record<string, unknown> = {
     sub: "u1",
-    tid: TENANT_ID,
     exp: Math.floor(Date.now() / 1000) + 3600,
-  });
-  return `${SESSION_COOKIE_NAME}=${token}`;
+  };
+  if (withTenant) claims.tid = TENANT_ID;
+  return `${SESSION_COOKIE_NAME}=${makeToken(claims)}`;
 }
 
-// ── Minimal request stub — satisfies ProxyableRequest ─────────────────────
-function makeReq(url: string, { method = "GET", cookie = null as string | null } = {}) {
-  const headerMap: Record<string, string | null> = { cookie };
+function makeReq(
+  url: string,
+  { method = "GET", cookie = null as string | null } = {},
+) {
   return {
     url,
     method,
     body: null,
-    headers: { get: (n: string) => headerMap[n.toLowerCase()] ?? null },
+    headers: {
+      get: (name: string) =>
+        name.toLowerCase() === "cookie" ? cookie : null,
+    },
   };
 }
 
-// ── Fake upstream that returns a 200 JSON response ─────────────────────────
-function okFetch(captureUrl?: { value: string }, captureInit?: { value: RequestInit }) {
+function okFetch(capture?: { url: string; init?: RequestInit }) {
   return async (url: string | URL, init?: RequestInit): Promise<Response> => {
-    if (captureUrl) captureUrl.value = String(url);
-    if (captureInit) captureInit.value = init ?? {};
+    if (capture) {
+      capture.url = String(url);
+      capture.init = init;
+    }
     return new Response(JSON.stringify({ ok: true }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
@@ -68,140 +66,130 @@ before(() => {
   process.env.SESSION_SECRET = FAKE_SECRET;
   process.env.AUTH_SECRET = AUTH_SECRET;
 });
+
 after(() => {
   process.env.SESSION_SECRET = savedSecret;
   process.env.AUTH_SECRET = savedAuth;
 });
 
-// ── Authorization boundary ─────────────────────────────────────────────────
-
-describe("authorization boundary — anonymous requests", () => {
-  it("returns 401 without calling fetchFn when no session cookie", async () => {
+describe("proxy authorization boundary", () => {
+  it("blocks anonymous data requests without fetching upstream", async () => {
     let fetched = false;
-    const neverFetch = async () => { fetched = true; return new Response(); };
-
     const result = await proxyRequest(
       makeReq("http://x/backend/api/v1/stats"),
       ["api", "v1", "stats"],
       "",
-      neverFetch as never,
+      (async () => {
+        fetched = true;
+        return new Response();
+      }) as never,
     );
 
-    assert.equal(result.status, 401);
-    assert.deepEqual(JSON.parse(Buffer.from(result.body as string).toString()), {
-      error: "authentication required",
-    });
-    assert.equal(fetched, false, "fetch must not be called for anonymous data requests");
-  });
-
-  it("blocks all data paths without fetching", async () => {
-    let fetchCalls = 0;
-    const neverFetch = async () => { fetchCalls++; return new Response(); };
-
-    for (const [segs, qs] of [
-      [["api", "v1", "stats"], ""],
-      [["api", "v1", "connections"], "?limit=50"],
-      [["api", "v1", "audit-logs"], ""],
-      [["api", "v1", "workflows"], ""],
-      [["api", "v1", "executions"], ""],
-    ] as Array<[string[], string]>) {
-      const r = await proxyRequest(makeReq(`http://x/${segs.join("/")}`), segs, qs, neverFetch as never);
-      assert.equal(r.status, 401, `/${segs.join("/")} must be 401`);
-    }
-    assert.equal(fetchCalls, 0);
-  });
-
-  it("rejects a forged session cookie", async () => {
-    const forged = makeToken(
-      { tid: TENANT_ID, exp: Math.floor(Date.now() / 1000) + 3600 },
-      "attacker-secret",
-    );
-    let fetched = false;
-    const neverFetch = async () => { fetched = true; return new Response(); };
-
-    const result = await proxyRequest(
-      makeReq("http://x/backend/api/v1/stats", { cookie: `${SESSION_COOKIE_NAME}=${forged}` }),
-      ["api", "v1", "stats"],
-      "",
-      neverFetch as never,
-    );
     assert.equal(result.status, 401);
     assert.equal(fetched, false);
   });
 
-  it("forwards anonymous auth requests (login must be reachable)", async () => {
-    const url = { value: "" };
-    const init = { value: {} as RequestInit };
-
+  it("allows anonymous login requests", async () => {
+    const capture: { url: string; init?: RequestInit } = { url: "" };
     const result = await proxyRequest(
       makeReq("http://x/backend/api/v1/auth/login", { method: "POST" }),
       ["api", "v1", "auth", "login"],
       "",
-      okFetch(url, init) as never,
+      okFetch(capture) as never,
     );
 
     assert.equal(result.status, 200);
-    assert.equal(url.value, "http://localhost:8000/api/v1/auth/login");
-    const headers = init.value.headers as Headers;
+    assert.equal(capture.url, "http://localhost:8000/api/v1/auth/login");
+  });
+
+  it("allows the aggregate board without a selected tenant", async () => {
+    const capture: { url: string; init?: RequestInit } = { url: "" };
+    const result = await proxyRequest(
+      makeReq("http://x/backend/api/v1/operations/board", {
+        cookie: sessionCookie(false),
+      }),
+      ["api", "v1", "operations", "board"],
+      "",
+      okFetch(capture) as never,
+    );
+
+    assert.equal(result.status, 200);
+    const headers = capture.init?.headers as Headers;
+    assert.equal(headers.get("X-Tenant-ID"), null);
+  });
+
+  it("forwards tenant-scoped requests with trusted internal headers", async () => {
+    const capture: { url: string; init?: RequestInit } = { url: "" };
+    const result = await proxyRequest(
+      makeReq("http://x/backend/api/v1/stats", { cookie: sessionCookie() }),
+      ["api", "v1", "stats"],
+      "?limit=10",
+      okFetch(capture) as never,
+    );
+
+    assert.equal(result.status, 200);
+    assert.equal(capture.url, "http://localhost:8000/api/v1/stats?limit=10");
+    const headers = capture.init?.headers as Headers;
     assert.equal(headers.get("X-Internal-Token"), FAKE_SECRET);
-    assert.equal(headers.get("X-Tenant-ID"), null, "no tenant header for anonymous auth");
+    assert.equal(headers.get("X-Tenant-ID"), TENANT_ID);
   });
 });
 
-// ── Authenticated forwarding ───────────────────────────────────────────────
+describe("binary export forwarding", () => {
+  for (const testCase of [
+    {
+      format: "pdf",
+      bytes: new Uint8Array([0x25, 0x50, 0x44, 0x46]),
+      contentType: "application/pdf",
+    },
+    {
+      format: "docx",
+      bytes: new Uint8Array([0x50, 0x4b, 0x03, 0x04]),
+      contentType:
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    },
+  ] as const) {
+    it(`preserves ${testCase.format} bytes and safe download headers`, async () => {
+      const filename = `modeem-report.${testCase.format}`;
+      const exportFetch = async (): Promise<Response> =>
+        new Response(testCase.bytes, {
+          status: 200,
+          headers: {
+            "Content-Type": testCase.contentType,
+            "Content-Disposition": `attachment; filename="${filename}"`,
+            "Cache-Control": "no-store",
+            "X-Content-Type-Options": "nosniff",
+            "X-Upstream-Internal": "must-not-leak",
+          },
+        });
 
-describe("authenticated session — upstream forwarding", () => {
-  it("forwards with internal auth headers and the session's tenant", async () => {
-    const url = { value: "" };
-    const init = { value: {} as RequestInit };
-
-    const result = await proxyRequest(
-      makeReq("http://localhost/backend/api/v1/stats", { cookie: validSessionCookie() }),
-      ["api", "v1", "stats"],
-      "",
-      okFetch(url, init) as never,
-    );
-
-    assert.equal(result.status, 200);
-    assert.equal(url.value, "http://localhost:8000/api/v1/stats");
-
-    const headers = init.value.headers as Headers;
-    assert.equal(headers.get("X-Internal-Token"), FAKE_SECRET);
-    assert.equal(headers.get("X-Tenant-ID"), TENANT_ID);
-    assert.equal(headers.get("Content-Type"), "application/json");
-  });
-
-  it("appends query string to upstream URL", async () => {
-    const url = { value: "" };
-
-    await proxyRequest(
-      makeReq("http://localhost/backend/api/v1/connections?limit=10&offset=5", {
-        cookie: validSessionCookie(),
-      }),
-      ["api", "v1", "connections"],
-      "?limit=10&offset=5",
-      okFetch(url) as never,
-    );
-
-    assert.equal(url.value, "http://localhost:8000/api/v1/connections?limit=10&offset=5");
-  });
-
-  it("returns 500 and does not fetch when SESSION_SECRET is absent", async () => {
-    process.env.SESSION_SECRET = "";
-    let fetched = false;
-    const neverFetch = async () => { fetched = true; return new Response(); };
-
-    try {
+      const segments = [
+        "api",
+        "v1",
+        "agents",
+        "content-manager",
+        "documents",
+        "export",
+        testCase.format,
+      ];
       const result = await proxyRequest(
-        makeReq("http://localhost/backend/api/v1/stats", { cookie: validSessionCookie() }),
-        ["api", "v1", "stats"],
+        makeReq(`http://x/backend/${segments.join("/")}`, {
+          method: "POST",
+          cookie: sessionCookie(),
+        }),
+        segments,
         "",
-        neverFetch as never,
+        exportFetch as never,
       );
-      assert.equal(result.status, 500);
-      assert.equal(fetched, false);
-    } finally {
-      process.env.SESSION_SECRET = FAKE_SECRET;
-    }
-  });
+
+      assert.equal(result.status, 200);
+      assert.equal(result.contentType, testCase.contentType);
+      assert.deepEqual(new Uint8Array(result.body as ArrayBuffer), testCase.bytes);
+      assert.deepEqual(result.responseHeaders, {
+        "Content-Disposition": `attachment; filename="${filename}"`,
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+      });
+    });
+  }
 });

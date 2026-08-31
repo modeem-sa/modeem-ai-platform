@@ -9,16 +9,25 @@
  * global fetch.
  */
 
-import { resolveTenantFromRequest } from "./tenant-resolver.ts";
+import {
+  resolveSessionFromRequest,
+  resolveTenantFromRequest,
+} from "./tenant-resolver.ts";
 
 const API_ORIGIN = "http://localhost:8000";
 
+const SAFE_UPSTREAM_RESPONSE_HEADERS = [
+  "Content-Disposition",
+  "Cache-Control",
+  "X-Content-Type-Options",
+] as const;
 /** Plain return value — no Next.js types. */
 export interface ProxyResult {
   status: number;
   body: ArrayBuffer | string;
   contentType: string;
   setCookie?: string | null;
+  responseHeaders?: Record<string, string>;
 }
 
 /** Minimal request shape needed by the proxy — satisfied by NextRequest. */
@@ -45,6 +54,10 @@ function isPublicPath(segments: string[]): boolean {
   );
 }
 
+function supportsTenantlessSession(segments: string[]): boolean {
+  return segments.join("/") === "api/v1/operations/board";
+}
+
 /**
  * Resolve the tenant from the authenticated session cookie, guard
  * non-public paths, then forward to FastAPI.
@@ -62,7 +75,9 @@ export async function proxyRequest(
   // ── Authorization boundary ─────────────────────────────────────────────
   // Tenant comes from the verified session JWT — never from client headers.
   const tenantId = resolveTenantFromRequest(req);
-  if (!tenantId && !isPublicPath(segments)) {
+  const session = resolveSessionFromRequest(req);
+  const mayUseTenantlessSession = supportsTenantlessSession(segments) && session;
+  if (!tenantId && !mayUseTenantlessSession && !isPublicPath(segments)) {
     return {
       status: 401,
       body: JSON.stringify({ error: "authentication required" }),
@@ -105,10 +120,17 @@ export async function proxyRequest(
     ...(req.method !== "GET" && req.method !== "HEAD" ? { duplex: "half" as const } : {}),
   } as RequestInit);
 
+  const responseHeaders: Record<string, string> = {};
+  for (const headerName of SAFE_UPSTREAM_RESPONSE_HEADERS) {
+    const value = upstreamRes.headers.get(headerName);
+    if (value) responseHeaders[headerName] = value;
+  }
+
   return {
     status: upstreamRes.status,
     body: await upstreamRes.arrayBuffer(),
     contentType: upstreamRes.headers.get("Content-Type") ?? "application/json",
     setCookie: upstreamRes.headers.get("set-cookie"),
+    responseHeaders,
   };
 }

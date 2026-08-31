@@ -32,6 +32,7 @@ test("content-manager-utils", async (t) => {
   await t.test("buildDocumentRequest - revision", () => {
     const messages: Message[] = [{ role: "user", content: "Initial request" }];
     const payload = buildDocumentRequest({
+      documentId: "7f60d3fc-d6d6-4695-9ddd-3f0d9c5e40f0",
       requestText: "Make it shorter",
       originalRequest: "Draft an internal memo",
       currentDocument: "Document content...",
@@ -42,6 +43,7 @@ test("content-manager-utils", async (t) => {
     });
     
     assert.deepStrictEqual(payload, {
+      document_id: "7f60d3fc-d6d6-4695-9ddd-3f0d9c5e40f0",
       original_request: "Draft an internal memo",
       current_document: "Document content...",
       active_document_type: "memo",

@@ -60,7 +60,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   }
 
   // Multiple tenants and none selected yet: force an explicit choice.
-  if (!user.current_tenant && user.memberships.length > 0) {
+  if (!user.current_tenant && user.memberships.length > 0 && pathname !== "/") {
     return <TenantSelection />;
   }
 

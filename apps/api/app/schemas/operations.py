@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 TaskCategory = Literal["administrative", "financial"]
 TaskPriority = Literal["low", "medium", "high", "urgent"]
@@ -55,6 +55,46 @@ class OperationActionOut(BaseModel):
     verified_at: datetime | None
 
 
+class CollectionMessageGenerateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_version: int = Field(ge=1)
+
+
+class CollectionMessageExactRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_version: int = Field(ge=1)
+    expected_message_version: int = Field(ge=1)
+    expected_draft_version: int = Field(ge=1)
+    expected_draft_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_source_version: int = Field(ge=1)
+    expected_source_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class CollectionMessageOut(BaseModel):
+    id: uuid.UUID
+    channel: Literal["odoo_customer_invoice_chatter"]
+    status: str
+    version: int
+    draft_content: str
+    draft_version: int
+    draft_hash: str
+    source_hash: str
+    source_version: int
+    approved_content: str | None
+    approved_draft_version: int | None
+    approved_hash: str | None
+    approved_source_hash: str | None
+    approved_source_version: int | None
+    approved_by_user_id: uuid.UUID | None
+    approved_at: datetime | None
+    attempt_count: int
+    delivery_error: str | None
+    receipt_message_id: int | None
+    verified_at: datetime | None
+
+
 class OperationTaskOut(BaseModel):
     id: uuid.UUID
     tenant_id: uuid.UUID
@@ -85,6 +125,7 @@ class OperationTaskOut(BaseModel):
     source_sync_state: str | None
     source_synced_at: datetime | None
     action: OperationActionOut | None = None
+    collection_message: CollectionMessageOut | None = None
 
 
 class OperationTaskListOut(BaseModel):

@@ -11,8 +11,25 @@ from app.core.config import get_settings
 from app.db.base import get_session_factory
 from app.integrations.odoo.activity_writer import create_invoice_activity
 from app.integrations.odoo.errors import ConnectorError
-from app.models import Connection, OperationAction, OperationActionHistory, OperationTask, User
+from app.integrations.odoo.invoice_chatter_collection import (
+    CollectionMessagePolicyError,
+    deliver_invoice_collection_message,
+    read_invoice_collection_target,
+)
+from app.models import (
+    CollectionMessage,
+    CollectionMessageEvent,
+    Connection,
+    OperationAction,
+    OperationActionHistory,
+    OperationTask,
+    User,
+)
 from app.operations.ai_proposal import InvoiceActivityProposal, canonical_proposal
+from app.operations.collection_message import (
+    canonical_collection_message,
+    canonical_collection_source_identity,
+)
 from app.operations.odoo_sync import scan_overdue_invoices
 from app.operations.recurring import generate_occurrences
 from app.services.audit import record_audit
@@ -201,6 +218,209 @@ def _fail_action(session, action: OperationAction, detail: str) -> None:
     _record_worker_history(session, action, "failed", detail=detail)
 
 
+def run_queued_collection_messages_once() -> int:
+    """Process only the dedicated fixed invoice-chatter delivery queue."""
+    session = get_session_factory()()
+    delivered = 0
+    try:
+        if (
+            session.bind
+            and session.bind.dialect.name == "postgresql"
+            and not session.execute(text("SELECT pg_try_advisory_xact_lock(810041)")).scalar()
+        ):
+            return 0
+        message_ids = [
+            row[0]
+            for row in session.query(CollectionMessage.id)
+            .filter_by(status="queued")
+            .limit(20)
+            .all()
+        ]
+        for message_id in message_ids:
+            message = session.query(CollectionMessage).filter_by(
+                id=message_id, status="queued"
+            ).with_for_update().one_or_none()
+            if message is None:
+                continue
+            message.status = "sending"
+            message.attempt_count += 1
+            message.version += 1
+            _record_message_worker_event(session, message, "sending")
+            session.flush()
+            task = session.query(OperationTask).filter_by(
+                id=message.task_id, tenant_id=message.tenant_id
+            ).with_for_update().one_or_none()
+            if task is None or task.source_connection_id is None or task.source_record_id is None:
+                _fail_message(session, message, "source_validation_failed")
+                continue
+            connection = session.query(Connection).filter_by(
+                id=task.source_connection_id, tenant_id=message.tenant_id
+            ).with_for_update().one_or_none()
+            if (
+                connection is None
+                or not connection.is_active
+                or connection.last_test_status != "success"
+                or connection.selected_transport not in ("xmlrpc", "json2")
+                or connection.odoo_company_id is None
+            ):
+                _fail_message(session, message, "connection_unavailable")
+                continue
+            try:
+                snapshot = json.loads(task.source_snapshot_json or "")
+                snapshot_company_id = snapshot.get("company_id") if isinstance(snapshot, dict) else None
+                approved_content, approved_digest = canonical_collection_message(
+                    message.approved_content or "", message.approved_draft_version or 0
+                )
+                if (
+                    approved_digest != message.approved_hash
+                    or message.approved_hash != message.draft_hash
+                    or message.approved_draft_version != message.draft_version
+                    or message.approved_source_hash != message.source_hash
+                    or message.approved_source_version != message.source_version
+                    or snapshot_company_id != connection.odoo_company_id
+                ):
+                    _fail_message(session, message, "approval_validation_failed")
+                    continue
+                credentials = decrypt_credentials(
+                    connection.encrypted_credentials,
+                    tenant_id=connection.tenant_id,
+                    connection_id=connection.id,
+                    encryption_version=connection.encryption_version,
+                )
+                auth = resolve_auth_material(connection.username, credentials)
+                partner_id = read_invoice_collection_target(
+                    base_url=connection.base_url,
+                    database=connection.database_name,
+                    transport=connection.selected_transport,
+                    login=auth.login,
+                    secret=auth.secret,
+                    environment=get_settings().environment,
+                    company_id=connection.odoo_company_id,
+                    invoice_id=task.source_record_id,
+                    as_of_date=datetime.now(UTC).date(),
+                    now=datetime.now(UTC),
+                )
+                _record_message_worker_event(
+                    session, message, "policy_checked", detail="allowed"
+                )
+                source_hash = canonical_collection_source_identity(
+                    connection_id=str(connection.id),
+                    company_id=connection.odoo_company_id,
+                    invoice_id=task.source_record_id,
+                    partner_id=partner_id,
+                    source_version=message.approved_source_version or 0,
+                    source_snapshot=snapshot,
+                )
+                if (
+                    source_hash != message.approved_source_hash
+                    or partner_id != message.approved_partner_id
+                ):
+                    _fail_message(session, message, "source_identity_changed")
+                    continue
+                receipt = deliver_invoice_collection_message(
+                    base_url=connection.base_url,
+                    database=connection.database_name,
+                    transport=connection.selected_transport,
+                    login=auth.login,
+                    secret=auth.secret,
+                    environment=get_settings().environment,
+                    company_id=connection.odoo_company_id,
+                    invoice_id=task.source_record_id,
+                    content=approved_content,
+                    idempotency_marker=message.idempotency_marker,
+                    expected_partner_id=message.approved_partner_id,
+                    as_of_date=datetime.now(UTC).date(),
+                    now=datetime.now(UTC),
+                )
+                message.status = "verifying"
+                message.external_message_id = receipt["message_id"]
+                message.version += 1
+                _record_message_worker_event(session, message, "sent")
+                _record_message_worker_event(session, message, "verifying")
+                if receipt.get("verified") is not True:
+                    raise ConnectorError("unsupported_response", "message not verified")
+                message.verified_at = datetime.now(UTC)
+                message.status = "succeeded"
+                message.error = None
+                message.version += 1
+                _record_message_worker_event(session, message, "verified")
+                _record_message_worker_event(session, message, "succeeded")
+                delivered += 1
+            except CollectionMessagePolicyError as exc:
+                if isinstance(exc.code, str) and exc.code:
+                    message.version += 1
+                    message.status = "failed"
+                    message.error = exc.code
+                    _record_message_worker_event(
+                        session, message, "policy_checked", detail=exc.code
+                    )
+                    _record_message_worker_event(
+                        session, message, "failed", detail=exc.code
+                    )
+                else:
+                    _record_delivery_failure(session, message)
+            except (
+                ConnectorError,
+                CredentialDecryptionError,
+                EncryptionConfigError,
+                AuthMaterialError,
+                ValidationError,
+                ValueError,
+                KeyError,
+                TypeError,
+                json.JSONDecodeError,
+            ):
+                _record_delivery_failure(session, message)
+        session.commit()
+        return delivered
+    finally:
+        session.close()
+
+
+def _record_message_worker_event(
+    session,
+    message: CollectionMessage,
+    event: str,
+    detail: str | None = None,
+) -> None:
+    session.add(
+        CollectionMessageEvent(
+            message_id=message.id,
+            task_id=message.task_id,
+            tenant_id=message.tenant_id,
+            actor_type="worker",
+            actor_id="collection-message-worker",
+            event=event,
+            version=message.version,
+            status=message.status,
+            content_hash=message.approved_hash or message.draft_hash,
+            detail=detail,
+        )
+    )
+
+
+def _record_delivery_failure(session, message: CollectionMessage) -> None:
+    message.version += 1
+    message.error = "delivery_failed"
+    if message.attempt_count < 3:
+        message.status = "queued"
+        _record_message_worker_event(
+            session, message, "retry_queued", detail="delivery_failed"
+        )
+    else:
+        message.status = "failed"
+        _record_message_worker_event(
+            session, message, "failed", detail="delivery_failed"
+        )
+
+
+def _fail_message(session, message: CollectionMessage, detail: str) -> None:
+    message.status = "failed"
+    message.error = detail
+    message.version += 1
+    _record_message_worker_event(session, message, "failed", detail=detail)
+
+
 def scan_connections_once() -> int:
     """Scan each explicitly company-scoped connection independently."""
     session = get_session_factory()()
@@ -243,6 +463,7 @@ def scan_connections_once() -> int:
 def main() -> None:
     while True:
         run_queued_actions_once()
+        run_queued_collection_messages_once()
         scan_connections_once()
         session = get_session_factory()()
         try:

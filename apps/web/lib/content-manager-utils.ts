@@ -25,6 +25,7 @@ export type UIForm = {
 };
 
 export type CMResponse = {
+  document_id?: string | null;
   status: "complete" | "needs_information" | "out_of_scope";
   document?: string | null;
   ui?: UIForm | null;
@@ -38,6 +39,7 @@ export function isRevisionRequest(currentDocument: string | null): boolean {
 }
 
 export function buildDocumentRequest(params: {
+  documentId?: string | null;
   requestText: string;
   originalRequest?: string;
   currentDocument: string | null;
@@ -47,6 +49,7 @@ export function buildDocumentRequest(params: {
   messages: Message[];
 }) {
   return {
+    ...(params.documentId ? { document_id: params.documentId } : {}),
     original_request:
       params.isRevision && params.originalRequest
         ? params.originalRequest
@@ -59,6 +62,7 @@ export function buildDocumentRequest(params: {
 }
 
 export function buildFormSubmitRequest(params: {
+  documentId?: string | null;
   originalRequest: string;
   formData: Record<string, string>;
   currentDocument: string | null;
@@ -67,6 +71,7 @@ export function buildFormSubmitRequest(params: {
   messages: Message[];
 }) {
   return {
+    ...(params.documentId ? { document_id: params.documentId } : {}),
     original_request: params.originalRequest,
     provided_fields: params.formData,
     current_document: params.currentDocument,

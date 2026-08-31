@@ -15,6 +15,10 @@ Requires-Dist: PyJWT
 Requires-Dist: email-validator
 Requires-Dist: cryptography
 Requires-Dist: httpx
+Requires-Dist: arabic-reshaper>=3.0.1
+Requires-Dist: python-bidi>=0.6.11
+Requires-Dist: python-docx>=1.2.0
+Requires-Dist: reportlab>=5.0.1
 Provides-Extra: dev
 Requires-Dist: pytest; extra == "dev"
 Requires-Dist: httpx; extra == "dev"

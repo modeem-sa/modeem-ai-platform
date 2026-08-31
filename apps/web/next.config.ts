@@ -2,14 +2,22 @@ import type { NextConfig } from "next";
 import path from "node:path";
 
 const nextConfig: NextConfig = {
+  // Emit the minimal production server and traced runtime dependencies so the
+  // Docker runtime image does not need the build toolchain or full node_modules.
+  output: "standalone",
   // Replit preview is served through a proxied iframe on a different origin.
-  allowedDevOrigins: [
-    "*.replit.dev",
-    "*.repl.co",
-    "127.0.0.1",
-    "localhost",
-    ...(process.env.REPLIT_DEV_DOMAIN ? [process.env.REPLIT_DEV_DOMAIN] : []),
-  ],
+  // Keep these values out of the serialized production server configuration.
+  ...(process.env.NODE_ENV === "development"
+    ? {
+        allowedDevOrigins: [
+          "*.replit.dev",
+          "*.repl.co",
+          "127.0.0.1",
+          "localhost",
+          ...(process.env.REPLIT_DEV_DOMAIN ? [process.env.REPLIT_DEV_DOMAIN] : []),
+        ],
+      }
+    : {}),
   outputFileTracingRoot: path.join(__dirname),
   // /backend/* is handled exclusively by the route handler at
   // app/backend/[...path]/route.ts, which verifies the session cookie,

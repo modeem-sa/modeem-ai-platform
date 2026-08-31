@@ -10,6 +10,10 @@ PyJWT
 email-validator
 cryptography
 httpx
+arabic-reshaper>=3.0.1
+python-bidi>=0.6.11
+python-docx>=1.2.0
+reportlab>=5.0.1
 
 [dev]
 pytest

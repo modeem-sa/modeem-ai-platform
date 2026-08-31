@@ -17,7 +17,16 @@ from app.content_manager.provider import (
     ProviderFailureError,
     ProviderUnavailableError,
 )
+from app.core.config import get_settings
+from app.integrations.odoo.errors import ConnectorError
+from app.integrations.odoo.invoice_chatter_collection import (
+    CollectionMessagePolicyError,
+    read_invoice_collection_target,
+)
 from app.models import (
+    CollectionMessage,
+    CollectionMessageEvent,
+    Connection,
     OperationAction,
     OperationActionHistory,
     OperationTask,
@@ -29,8 +38,16 @@ from app.models import (
 )
 from app.models.operation_task import TASK_CATEGORIES, TASK_PRIORITIES, TASK_STATUSES
 from app.operations.ai_proposal import canonical_proposal, executable_invoice_activity_proposal
+from app.operations.collection_message import (
+    CollectionMessageProposalService,
+    canonical_collection_message,
+    canonical_collection_source_identity,
+)
 from app.operations.proposals import OperationsProposalService, OverdueInvoiceSummary
 from app.schemas.operations import (
+    CollectionMessageExactRequest,
+    CollectionMessageGenerateRequest,
+    CollectionMessageOut,
     OperationActionExactRequest,
     OperationActionOut,
     OperationActionRequest,
@@ -43,6 +60,12 @@ from app.schemas.operations import (
     OperationTenantBootstrapOut,
 )
 from app.services.audit import record_audit
+from app.services.connection_auth import AuthMaterialError, resolve_auth_material
+from app.services.credential_crypto import (
+    CredentialDecryptionError,
+    EncryptionConfigError,
+    decrypt_credentials,
+)
 
 router = APIRouter(prefix="/api/v1/operations", tags=["operations"])
 
@@ -163,6 +186,10 @@ def _to_out(db: Session, task: OperationTask, user: User) -> OperationTaskOut:
     action = db.query(OperationAction).filter(
         OperationAction.task_id == task.id, OperationAction.tenant_id == task.tenant_id
     ).one_or_none()
+    collection_message = db.query(CollectionMessage).filter(
+        CollectionMessage.task_id == task.id,
+        CollectionMessage.tenant_id == task.tenant_id,
+    ).one_or_none()
     source_snapshot = None
     if task.source_snapshot_json:
         try:
@@ -209,6 +236,31 @@ def _to_out(db: Session, task: OperationTask, user: User) -> OperationTaskOut:
                 error=action.error, external_activity_id=action.external_activity_id,
                 verified_at=action.verified_at,
             ) if action else None
+        ),
+        collection_message=(
+            CollectionMessageOut(
+                id=collection_message.id,
+                channel="odoo_customer_invoice_chatter",
+                status=collection_message.status,
+                version=collection_message.version,
+                draft_content=collection_message.draft_content,
+                draft_version=collection_message.draft_version,
+                draft_hash=collection_message.draft_hash,
+                source_hash=collection_message.source_hash,
+                source_version=collection_message.source_version,
+                approved_content=collection_message.approved_content,
+                approved_draft_version=collection_message.approved_draft_version,
+                approved_hash=collection_message.approved_hash,
+                approved_source_hash=collection_message.approved_source_hash,
+                approved_source_version=collection_message.approved_source_version,
+                approved_by_user_id=collection_message.approved_by_user_id,
+                approved_at=collection_message.approved_at,
+                attempt_count=collection_message.attempt_count,
+                delivery_error=collection_message.error,
+                receipt_message_id=collection_message.external_message_id,
+                verified_at=collection_message.verified_at,
+            )
+            if collection_message else None
         ),
     )
 
@@ -588,6 +640,405 @@ def _record_action_history(
             detail=detail,
         )
     )
+
+
+def _record_collection_message_event(
+    db: Session,
+    message: CollectionMessage,
+    *,
+    event: str,
+    actor_type: str,
+    actor_id: str,
+    detail: str | None = None,
+) -> None:
+    db.add(
+        CollectionMessageEvent(
+            message_id=message.id,
+            task_id=message.task_id,
+            tenant_id=message.tenant_id,
+            actor_type=actor_type,
+            actor_id=actor_id,
+            event=event,
+            version=message.version,
+            status=message.status,
+            content_hash=message.approved_hash or message.draft_hash,
+            detail=detail,
+        )
+    )
+
+
+def _collection_policy_code(error: CollectionMessagePolicyError) -> str:
+    code = getattr(error, "code", None)
+    return code if isinstance(code, str) and code else "policy_unavailable"
+
+
+def _record_collection_policy_check(
+    db: Session,
+    task: OperationTask,
+    user: User,
+    *,
+    message: CollectionMessage | None,
+    result: str,
+    persist: bool = False,
+) -> None:
+    """Record only a static policy outcome; never store customer data."""
+    if message is not None:
+        _record_collection_message_event(
+            db,
+            message,
+            event="policy_checked",
+            actor_type="user",
+            actor_id=str(user.id),
+            detail=result,
+        )
+    record_audit(
+        db,
+        action="invoice_collection_message.policy_checked",
+        actor_type="user",
+        actor_id=str(user.id),
+        tenant_id=task.tenant_id,
+        resource_type="invoice_collection_message",
+        resource_id=str(message.id) if message is not None else str(task.id),
+        metadata={"result": result},
+    )
+    if persist:
+        db.commit()
+
+
+def _policy_http_error(
+    db: Session,
+    task: OperationTask,
+    user: User,
+    message: CollectionMessage | None,
+    error: CollectionMessagePolicyError,
+) -> HTTPException:
+    code = _collection_policy_code(error)
+    _record_collection_policy_check(
+        db, task, user, message=message, result=code, persist=True
+    )
+    return HTTPException(
+        status_code=409,
+        detail=f"Collection communication policy blocked: {code}",
+    )
+
+
+def _collection_message(
+    db: Session, task: OperationTask, *, lock: bool = True
+) -> CollectionMessage | None:
+    query = db.query(CollectionMessage).filter_by(
+        task_id=task.id, tenant_id=task.tenant_id
+    )
+    return (query.with_for_update() if lock else query).one_or_none()
+
+
+def _require_collection_source(task: OperationTask) -> dict:
+    if (
+        task.category != "financial"
+        or task.source_type != "odoo"
+        or task.source_signal != "overdue_customer_invoice"
+        or task.source_connection_id is None
+        or task.source_record_id is None
+        or not task.source_snapshot_json
+    ):
+        raise HTTPException(status_code=409, detail="Task has no supported Odoo invoice source")
+    try:
+        snapshot = json.loads(task.source_snapshot_json)
+        if not isinstance(snapshot, dict):
+            raise TypeError
+        return snapshot
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=409, detail="Task source cannot generate a message") from exc
+
+
+def _collection_source_identity(
+    db: Session, task: OperationTask, source_version: int
+) -> tuple[str, int]:
+    """Preflight the fixed invoice recipient without exposing it to AI or clients."""
+    snapshot = _require_collection_source(task)
+    company_id = snapshot.get("company_id")
+    if isinstance(company_id, bool) or not isinstance(company_id, int) or company_id < 1:
+        raise HTTPException(status_code=409, detail="Collection message source is unavailable")
+    connection = (
+        db.query(Connection)
+        .filter_by(id=task.source_connection_id, tenant_id=task.tenant_id)
+        .with_for_update()
+        .one_or_none()
+    )
+    if (
+        connection is None
+        or connection.odoo_company_id != company_id
+        or not connection.is_active
+        or connection.last_test_status != "success"
+        or connection.selected_transport not in ("xmlrpc", "json2")
+    ):
+        raise HTTPException(status_code=409, detail="Collection message source is unavailable")
+    try:
+        credentials = decrypt_credentials(
+            connection.encrypted_credentials,
+            tenant_id=connection.tenant_id,
+            connection_id=connection.id,
+            encryption_version=connection.encryption_version,
+        )
+        auth = resolve_auth_material(connection.username, credentials)
+        partner_id = read_invoice_collection_target(
+            base_url=connection.base_url,
+            database=connection.database_name,
+            transport=connection.selected_transport,
+            login=auth.login,
+            secret=auth.secret,
+            environment=get_settings().environment,
+            company_id=company_id,
+            invoice_id=task.source_record_id,
+            as_of_date=datetime.now(UTC).date(),
+        )
+        return (
+            canonical_collection_source_identity(
+                connection_id=str(connection.id),
+                company_id=company_id,
+                invoice_id=task.source_record_id,
+                partner_id=partner_id,
+                source_version=source_version,
+                source_snapshot=snapshot,
+            ),
+            partner_id,
+        )
+    except CollectionMessagePolicyError as exc:
+        if exc.code:
+            raise
+        raise HTTPException(
+            status_code=409, detail="Collection message source is unavailable"
+        ) from exc
+    except (
+        ConnectorError,
+        CredentialDecryptionError,
+        EncryptionConfigError,
+        AuthMaterialError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise HTTPException(status_code=409, detail="Collection message source is unavailable") from exc
+
+
+@router.post(
+    "/tasks/{task_id}/collection-message/generate",
+    response_model=OperationTaskOut,
+    dependencies=[Depends(require_csrf)],
+)
+def generate_collection_message(
+    task_id: uuid.UUID,
+    body: CollectionMessageGenerateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> OperationTaskOut:
+    """Generate text only; the provider receives no target, recipient, or connector data."""
+    task = _manager_task(db, user, task_id)
+    if task.version != body.expected_version:
+        raise HTTPException(status_code=409, detail="Task has been modified")
+    message = _collection_message(db, task)
+    if message is not None and message.status != "draft":
+        raise HTTPException(status_code=409, detail="Message can no longer be regenerated")
+    snapshot = _require_collection_source(task)
+    try:
+        next_source_version = 1 if message is None else message.source_version + 1
+        source_hash, partner_id = _collection_source_identity(db, task, next_source_version)
+        summary, _company_id, _activity_type_id = _single_invoice_summary(
+            tenant_id=task.tenant_id,
+            snapshot=snapshot,
+            as_of_date=datetime.now(UTC).date(),
+        )
+        provider = OpenAICompatibleProvider.from_environment()
+        draft = CollectionMessageProposalService(provider).propose(summary)
+        next_draft_version = 1 if message is None else message.draft_version + 1
+        content, digest = canonical_collection_message(draft.content, next_draft_version)
+    except CollectionMessagePolicyError as exc:
+        raise _policy_http_error(db, task, user, message, exc) from exc
+    except ProviderUnavailableError:
+        _audit_proposal_failure(db, task, user, "provider_unavailable")
+        raise HTTPException(status_code=503, detail="Collection message service is unavailable")
+    except ProviderFailureError:
+        _audit_proposal_failure(db, task, user, "provider_failure")
+        raise HTTPException(status_code=502, detail="Collection message provider failed")
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=409, detail="Task source cannot generate a message") from exc
+    regenerated = message is not None
+    if message is None:
+        message = CollectionMessage(
+            tenant_id=task.tenant_id,
+            task_id=task.id,
+            draft_content=content,
+            draft_hash=digest,
+            draft_version=next_draft_version,
+            source_hash=source_hash,
+            source_version=next_source_version,
+            source_partner_id=partner_id,
+            idempotency_marker=uuid.uuid4().hex,
+        )
+        db.add(message)
+    else:
+        message.draft_content = content
+        message.draft_hash = digest
+        message.draft_version = next_draft_version
+        message.source_hash = source_hash
+        message.source_version = next_source_version
+        message.source_partner_id = partner_id
+        message.version += 1
+    db.flush()
+    _record_collection_policy_check(
+        db, task, user, message=message, result="allowed"
+    )
+    event = "regenerated" if regenerated else "generated"
+    _record_collection_message_event(
+        db, message, event=event, actor_type="user", actor_id=str(user.id)
+    )
+    record_audit(
+        db,
+        action=f"invoice_collection_message.{event}",
+        actor_type="user",
+        actor_id=str(user.id),
+        tenant_id=task.tenant_id,
+        resource_type="invoice_collection_message",
+        resource_id=str(message.id),
+        metadata={"content_hash": digest, "draft_version": next_draft_version, "source_hash": source_hash},
+    )
+    return _to_out(db, task, user)
+
+
+def _exact_message_transition(
+    task_id: uuid.UUID,
+    body: CollectionMessageExactRequest,
+    user: User,
+    db: Session,
+    *,
+    source_status: str,
+    target_status: str,
+    event: str,
+) -> OperationTaskOut:
+    task = _manager_task(db, user, task_id)
+    message = _collection_message(db, task)
+    if (
+        task.version != body.expected_version
+        or message is None
+        or message.status != source_status
+        or message.version != body.expected_message_version
+        or message.draft_version != body.expected_draft_version
+        or message.draft_hash != body.expected_draft_hash
+        or message.source_version != body.expected_source_version
+        or message.source_hash != body.expected_source_hash
+    ):
+        raise HTTPException(status_code=409, detail="Collection message has been modified")
+    try:
+        current_source_hash, _partner_id = _collection_source_identity(
+            db, task, message.source_version
+        )
+    except CollectionMessagePolicyError as exc:
+        raise _policy_http_error(db, task, user, message, exc) from exc
+    if current_source_hash != message.source_hash:
+        raise HTTPException(status_code=409, detail="Collection message source has changed")
+    _record_collection_policy_check(
+        db, task, user, message=message, result="allowed"
+    )
+    message.status = target_status
+    message.version += 1
+    if event == "approved":
+        content, digest = canonical_collection_message(
+            message.draft_content, message.draft_version
+        )
+        if digest != message.draft_hash:
+            raise HTTPException(status_code=409, detail="Collection message has been modified")
+        message.approved_content = content
+        message.approved_hash = digest
+        message.approved_draft_version = message.draft_version
+        message.approved_source_hash = message.source_hash
+        message.approved_source_version = message.source_version
+        message.approved_partner_id = message.source_partner_id
+        message.approved_by_user_id = user.id
+        message.approved_at = datetime.now(UTC)
+    _record_collection_message_event(
+        db, message, event=event, actor_type="user", actor_id=str(user.id)
+    )
+    record_audit(
+        db,
+        action=f"invoice_collection_message.{event}",
+        actor_type="user",
+        actor_id=str(user.id),
+        tenant_id=task.tenant_id,
+        resource_type="invoice_collection_message",
+        resource_id=str(message.id),
+        metadata={"content_hash": message.draft_hash, "draft_version": message.draft_version},
+    )
+    return _to_out(db, task, user)
+
+
+@router.post("/tasks/{task_id}/collection-message/submit", response_model=OperationTaskOut,
+             dependencies=[Depends(require_csrf)])
+def submit_collection_message(task_id: uuid.UUID, body: CollectionMessageExactRequest,
+                              user: User = Depends(get_current_user),
+                              db: Session = Depends(get_db)) -> OperationTaskOut:
+    return _exact_message_transition(task_id, body, user, db, source_status="draft",
+                                     target_status="awaiting_approval", event="submitted")
+
+
+@router.post("/tasks/{task_id}/collection-message/approve", response_model=OperationTaskOut,
+             dependencies=[Depends(require_csrf)])
+def approve_collection_message(task_id: uuid.UUID, body: CollectionMessageExactRequest,
+                               user: User = Depends(get_current_user),
+                               db: Session = Depends(get_db)) -> OperationTaskOut:
+    return _exact_message_transition(task_id, body, user, db,
+                                     source_status="awaiting_approval",
+                                     target_status="queued", event="approved")
+
+
+@router.post("/tasks/{task_id}/collection-message/reject", response_model=OperationTaskOut,
+             dependencies=[Depends(require_csrf)])
+def reject_collection_message(task_id: uuid.UUID, body: CollectionMessageExactRequest,
+                              user: User = Depends(get_current_user),
+                              db: Session = Depends(get_db)) -> OperationTaskOut:
+    return _exact_message_transition(task_id, body, user, db,
+                                     source_status="awaiting_approval",
+                                     target_status="draft", event="rejected")
+
+
+@router.post("/tasks/{task_id}/collection-message/retry", response_model=OperationTaskOut,
+             dependencies=[Depends(require_csrf)])
+def retry_collection_message(task_id: uuid.UUID, body: CollectionMessageExactRequest,
+                             user: User = Depends(get_current_user),
+                             db: Session = Depends(get_db)) -> OperationTaskOut:
+    task = _manager_task(db, user, task_id)
+    message = _collection_message(db, task)
+    if (
+        task.version != body.expected_version
+        or message is None
+        or message.status != "failed"
+        or message.attempt_count >= 3
+        or message.version != body.expected_message_version
+        or message.draft_version != body.expected_draft_version
+        or message.draft_hash != body.expected_draft_hash
+        or message.source_version != body.expected_source_version
+        or message.source_hash != body.expected_source_hash
+        or message.approved_hash != message.draft_hash
+        or message.approved_draft_version != message.draft_version
+        or message.approved_source_hash != message.source_hash
+        or message.approved_source_version != message.source_version
+    ):
+        raise HTTPException(status_code=409, detail="Collection message has been modified")
+    try:
+        current_source_hash, _partner_id = _collection_source_identity(
+            db, task, message.source_version
+        )
+    except CollectionMessagePolicyError as exc:
+        raise _policy_http_error(db, task, user, message, exc) from exc
+    if current_source_hash != message.source_hash:
+        raise HTTPException(status_code=409, detail="Collection message source has changed")
+    _record_collection_policy_check(
+        db, task, user, message=message, result="allowed"
+    )
+    message.status = "queued"
+    message.error = None
+    message.version += 1
+    _record_collection_message_event(
+        db, message, event="retry_queued", actor_type="user", actor_id=str(user.id)
+    )
+    return _to_out(db, task, user)
 
 
 @router.post("/tasks/{task_id}/action/generate", response_model=OperationTaskOut,

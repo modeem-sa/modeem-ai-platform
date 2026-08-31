@@ -252,6 +252,181 @@ def _action_history_cannot_delete(*_args) -> None:
     raise ValueError("Operation action history is immutable")
 
 
+class CollectionMessage(Base):
+    """A fixed-channel customer collection message with an immutable approval."""
+
+    __tablename__ = "invoice_collection_messages"
+    __table_args__ = (
+        UniqueConstraint("task_id", name="uq_invoice_collection_messages_task"),
+        UniqueConstraint("idempotency_marker", name="uq_invoice_collection_messages_marker"),
+        CheckConstraint(
+            "status IN ('draft', 'awaiting_approval', 'queued', 'sending', "
+            "'verifying', 'succeeded', 'failed')",
+            name="ck_invoice_collection_messages_status",
+        ),
+        CheckConstraint("draft_version >= 1", name="ck_invoice_collection_messages_draft_version"),
+        CheckConstraint("source_version >= 1", name="ck_invoice_collection_messages_source_version"),
+        CheckConstraint("version >= 1", name="ck_invoice_collection_messages_version"),
+        CheckConstraint("attempt_count >= 0 AND attempt_count <= 3", name="ck_invoice_collection_messages_attempts"),
+        CheckConstraint(
+            "length(draft_content) BETWEEN 1 AND 1000",
+            name="ck_invoice_collection_messages_draft_length",
+        ),
+        CheckConstraint(
+            "length(draft_hash) = 64 AND "
+            "length(source_hash) = 64 AND "
+            "(approved_hash IS NULL OR length(approved_hash) = 64) AND "
+            "(approved_source_hash IS NULL OR length(approved_source_hash) = 64)",
+            name="ck_invoice_collection_messages_hash_lengths",
+        ),
+        CheckConstraint(
+            "approved_draft_version IS NULL OR approved_draft_version >= 1",
+            name="ck_invoice_collection_messages_approved_version",
+        ),
+        CheckConstraint(
+            "approved_source_version IS NULL OR approved_source_version >= 1",
+            name="ck_invoice_collection_messages_approved_source_version",
+        ),
+        CheckConstraint(
+            "external_message_id IS NULL OR external_message_id > 0",
+            name="ck_invoice_collection_messages_receipt",
+        ),
+        CheckConstraint(
+            "source_partner_id > 0 AND (approved_partner_id IS NULL OR approved_partner_id > 0)",
+            name="ck_invoice_collection_messages_partner_ids",
+        ),
+        CheckConstraint(
+            "(approved_content IS NULL AND approved_hash IS NULL AND approved_draft_version IS NULL "
+            "AND approved_source_hash IS NULL AND approved_source_version IS NULL "
+            "AND approved_partner_id IS NULL "
+            "AND approved_by_user_id IS NULL AND approved_at IS NULL) OR "
+            "(approved_content IS NOT NULL AND approved_hash IS NOT NULL "
+            "AND approved_draft_version IS NOT NULL AND approved_source_hash IS NOT NULL "
+            "AND approved_source_version IS NOT NULL AND approved_partner_id IS NOT NULL "
+            "AND approved_by_user_id IS NOT NULL "
+            "AND approved_at IS NOT NULL)",
+            name="ck_invoice_collection_messages_approval_complete",
+        ),
+        Index(
+            "ix_invoice_collection_messages_tenant_status",
+            "tenant_id",
+            "status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("operation_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    draft_content: Mapped[str] = mapped_column(Text, nullable=False)
+    draft_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    draft_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    source_partner_id: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="draft")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    approved_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approved_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    approved_draft_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    approved_source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    approved_source_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    approved_partner_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    idempotency_marker: Mapped[str] = mapped_column(String(64), nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    external_message_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+_APPROVED_MESSAGE_FIELDS = (
+    "approved_content",
+    "approved_hash",
+    "approved_draft_version",
+    "approved_source_hash",
+    "approved_source_version",
+    "approved_partner_id",
+    "approved_by_user_id",
+    "approved_at",
+)
+
+
+@event.listens_for(CollectionMessage, "before_update")
+def _approved_message_cannot_change(_mapper, _connection, target) -> None:
+    from sqlalchemy import inspect
+
+    state = inspect(target)
+    for name in _APPROVED_MESSAGE_FIELDS:
+        history = state.attrs[name].history
+        if history.deleted and history.deleted[0] is not None:
+            raise ValueError("Approved collection message is immutable")
+
+
+class CollectionMessageEvent(Base):
+    """Append-only evidence for generation, review, approval, and delivery."""
+
+    __tablename__ = "invoice_collection_message_events"
+    __table_args__ = (
+        CheckConstraint("version >= 1", name="ck_invoice_collection_message_events_version"),
+        CheckConstraint(
+            "length(content_hash) = 64",
+            name="ck_invoice_collection_message_events_hash_length",
+        ),
+        CheckConstraint(
+            "actor_type IN ('user', 'worker', 'system')",
+            name="ck_invoice_collection_message_events_actor_type",
+        ),
+        CheckConstraint(
+            "event IN ('generated', 'regenerated', 'submitted', 'rejected', "
+            "'approved', 'policy_checked', 'policy_blocked', 'retry_queued', 'sending', "
+            "'sent', 'verifying', 'verified', 'succeeded', 'failed')",
+            name="ck_invoice_collection_message_events_event",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("invoice_collection_messages.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    task_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("operation_tasks.id", ondelete="RESTRICT"), nullable=False
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("tenants.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    actor_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    actor_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    event: Mapped[str] = mapped_column(String(32), nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    detail: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=_utcnow
+    )
+
+
+@event.listens_for(CollectionMessageEvent, "before_update")
+@event.listens_for(CollectionMessageEvent, "before_delete")
+def _message_event_cannot_change(*_args) -> None:
+    raise ValueError("Collection message events are immutable")
+
+
 class RecurringTaskTemplate(Base):
     __tablename__ = "recurring_task_templates"
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)

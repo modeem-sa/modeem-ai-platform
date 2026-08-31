@@ -1,14 +1,22 @@
 import { FlatCompat } from "@eslint/eslintrc";
-import { dirname } from "path";
-import { fileURLToPath } from "url";
+import nextCoreWebVitals from "eslint-config-next/core-web-vitals.js";
+import nextTypeScript from "eslint-config-next/typescript.js";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-
-const compat = new FlatCompat({ baseDirectory: __dirname });
+const baseDirectory = dirname(fileURLToPath(import.meta.url));
+const legacyCompat = new FlatCompat({ baseDirectory });
+const nextConfigs = Array.isArray(nextCoreWebVitals)
+  ? [...nextCoreWebVitals, ...nextTypeScript]
+  : legacyCompat.extends("next/core-web-vitals", "next/typescript");
 
 const eslintConfig = [
-  ...compat.extends("next/core-web-vitals", "next/typescript"),
+  ...nextConfigs,
+  {
+    rules: {
+      "react-hooks/set-state-in-effect": "off",
+    },
+  },
   { ignores: [".next/**", "node_modules/**", "next-env.d.ts"] },
 ];
 

@@ -7,6 +7,7 @@ Revises: 0008
 from collections.abc import Sequence
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision: str = "0009"
@@ -39,34 +40,6 @@ def _drop_append_only_trigger(table: str) -> None:
 
 
 def upgrade() -> None:
-    op.drop_constraint(
-        "operation_task_history_task_id_fkey",
-        "operation_task_history",
-        type_="foreignkey",
-    )
-    op.drop_constraint(
-        "operation_task_history_tenant_id_fkey",
-        "operation_task_history",
-        type_="foreignkey",
-    )
-    op.create_foreign_key(
-        "operation_task_history_task_id_fkey",
-        "operation_task_history",
-        "operation_tasks",
-        ["task_id"],
-        ["id"],
-        ondelete="RESTRICT",
-    )
-    op.create_foreign_key(
-        "operation_task_history_tenant_id_fkey",
-        "operation_task_history",
-        "tenants",
-        ["tenant_id"],
-        ["id"],
-        ondelete="RESTRICT",
-    )
-    _install_append_only_trigger("operation_task_history")
-
     op.create_table(
         "operation_action_history",
         sa.Column("id", sa.Uuid(), primary_key=True),
@@ -131,31 +104,3 @@ def downgrade() -> None:
         "ix_operation_action_history_action_id", table_name="operation_action_history"
     )
     op.drop_table("operation_action_history")
-
-    _drop_append_only_trigger("operation_task_history")
-    op.drop_constraint(
-        "operation_task_history_tenant_id_fkey",
-        "operation_task_history",
-        type_="foreignkey",
-    )
-    op.drop_constraint(
-        "operation_task_history_task_id_fkey",
-        "operation_task_history",
-        type_="foreignkey",
-    )
-    op.create_foreign_key(
-        "operation_task_history_tenant_id_fkey",
-        "operation_task_history",
-        "tenants",
-        ["tenant_id"],
-        ["id"],
-        ondelete="CASCADE",
-    )
-    op.create_foreign_key(
-        "operation_task_history_task_id_fkey",
-        "operation_task_history",
-        "operation_tasks",
-        ["task_id"],
-        ["id"],
-        ondelete="CASCADE",
-    )

@@ -19,6 +19,8 @@ import {
   OpPriority,
   OpAction,
   OpSourceType,
+  getCollectionDeliveryPresentation,
+  isActionDeliveryInFlight,
   toTaskDueAt,
 } from "@/lib/operations";
 import { ApiError } from "@/lib/api";
@@ -82,18 +84,31 @@ export default function OperationsPage() {
 
   useEffect(() => {
     const executionInProgress = tasks?.some((task) =>
-      ["queued", "executing", "verifying"].includes(task.action?.status ?? "")
-    );
+      (task.collection_message
+        ? getCollectionDeliveryPresentation(task.collection_message).tone === "in_flight"
+        : isActionDeliveryInFlight(task.action))
+    ) ?? false;
     if (activeTab !== "tasks" || !executionInProgress) return;
 
-    const timer = window.setInterval(() => {
-      void fetchTasks(activeFilters).then((response) => {
-        setTasks(response.items);
-        setSummary(response.summary);
-      });
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      try {
+        const response = await fetchTasks(activeFilters);
+        if (!cancelled) {
+          setTasks(response.items);
+          setSummary(response.summary);
+        }
+      } catch (err: unknown) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : t("errorLoading"));
+        }
+      }
     }, 5000);
-    return () => window.clearInterval(timer);
-  }, [activeFilters, activeTab, tasks]);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [activeFilters, activeTab, tasks, t]);
 
   const canCreate = bootstrap?.tenants.some(t => t.can_create) ?? false;
   const [showCreate, setShowCreate] = useState(false);

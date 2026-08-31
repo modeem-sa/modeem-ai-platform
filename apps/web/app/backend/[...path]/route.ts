@@ -19,7 +19,8 @@ type Ctx = { params: Promise<{ path: string[] }> };
 async function handle(req: NextRequest, { params }: Ctx): Promise<NextResponse> {
   const { path } = await params;
   const result = await proxyRequest(req, path, req.nextUrl.search);
-  const headers = new Headers({ "Content-Type": result.contentType });
+  const headers = new Headers(result.responseHeaders);
+  headers.set("Content-Type", result.contentType);
   if (result.setCookie) headers.set("Set-Cookie", result.setCookie);
   return new NextResponse(result.body, { status: result.status, headers });
 }

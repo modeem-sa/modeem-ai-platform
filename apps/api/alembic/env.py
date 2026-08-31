@@ -8,6 +8,8 @@ from app.db.base import Base
 from app.models import (  # noqa: F401 — register models
     AuditLog,
     Connection,
+    ContentDocument,
+    ContentDocumentRevision,
     Execution,
     Tenant,
     Workflow,

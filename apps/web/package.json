@@ -5,13 +5,16 @@
   "private": true,
   "scripts": {
     "dev": "next dev -p 3000",
+    "check:production-links": "node ../../scripts/check-production-links.mjs",
+    "prebuild": "npm run check:production-links",
     "build": "next build",
+    "postbuild": "node ../../scripts/check-production-links.mjs --build-output apps/web/.next",
     "start": "next start -p 3000",
     "lint": "eslint .",
     "test": "node --experimental-strip-types --test '__tests__/**/*.test.ts'"
   },
   "dependencies": {
-    "next": "^15.3.0",
+    "next": "16.3.3",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
@@ -22,8 +25,12 @@
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "eslint": "^9.0.0",
-    "eslint-config-next": "^15.3.0",
+    "eslint-config-next": "16.3.3",
     "tailwindcss": "^4.1.0",
     "typescript": "^5.8.0"
+  },
+  "overrides": {
+    "nanoid": "3.3.18",
+    "sharp": "0.35.4"
   }
 }

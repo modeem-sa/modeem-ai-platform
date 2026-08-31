@@ -1,9 +1,16 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Header } from "@/components/header";
 import { useLocale } from "@/components/locale-provider";
-import { apiFetch } from "@/lib/api";
+import {
+  apiDownload,
+  apiFetch,
+  type ContentDocumentDetail,
+  type ContentDocumentListItem,
+  type ContentDocumentRevision,
+  type ListResponse,
+} from "@/lib/api";
 import { 
   type Message, type UIForm, type CMResponse,
   buildDocumentRequest, buildFormSubmitRequest, formatFormDataAsMessage,
@@ -25,10 +32,74 @@ export default function ContentManagerPage() {
   const [uiForm, setUiForm] = useState<UIForm | null>(null);
   const [outOfScopeMessage, setOutOfScopeMessage] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [exporting, setExporting] = useState<"pdf" | "docx" | null>(null);
+  const [documentId, setDocumentId] = useState<string | null>(null);
+  const [savedDocuments, setSavedDocuments] = useState<ContentDocumentListItem[]>([]);
+  const [documentsLoading, setDocumentsLoading] = useState(true);
+  const [documentsError, setDocumentsError] = useState(false);
+  const [revisions, setRevisions] = useState<ContentDocumentRevision[]>([]);
+  const [selectedRevisionId, setSelectedRevisionId] = useState<string>("latest");
 
   // Inputs
   const [requestInput, setRequestInput] = useState("");
   const [formData, setFormData] = useState<Record<string, string>>({});
+
+  async function loadDocuments() {
+    setDocumentsLoading(true);
+    setDocumentsError(false);
+    try {
+      const data = await apiFetch<ListResponse<ContentDocumentListItem>>(
+        "/api/v1/agents/content-manager/documents",
+      );
+      setSavedDocuments(data.items);
+    } catch {
+      setDocumentsError(true);
+    } finally {
+      setDocumentsLoading(false);
+    }
+  }
+
+  async function openDocument(id: string) {
+    setLoading(true);
+    setError(null);
+    try {
+      const detail = await apiFetch<ContentDocumentDetail>(
+        `/api/v1/agents/content-manager/documents/${id}`,
+      );
+      setDocumentId(detail.id);
+      setOriginalRequest(detail.original_request);
+      setCurrentDocument(detail.current_document);
+      setActiveDocumentType(detail.document_type);
+      setLatestCorrection(detail.latest_correction);
+      setMessages(detail.conversation_messages);
+      setUiForm(detail.ui);
+      setOutOfScopeMessage(null);
+      setRevisions(detail.revisions);
+      setSelectedRevisionId("latest");
+      setRequestInput("");
+      setFormData({});
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t("cmDraftLoadError"));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function refreshRevisions(id: string) {
+    try {
+      const detail = await apiFetch<ContentDocumentDetail>(
+        `/api/v1/agents/content-manager/documents/${id}`,
+      );
+      setRevisions(detail.revisions);
+      setSelectedRevisionId("latest");
+    } catch {
+      // The current draft remains usable even if revision metadata cannot refresh.
+    }
+  }
+
+  useEffect(() => {
+    void loadDocuments();
+  }, []);
 
   const clearState = () => {
     setMessages([]);
@@ -41,6 +112,27 @@ export default function ContentManagerPage() {
     setRequestInput("");
     setFormData({});
     setError(null);
+    setDocumentId(null);
+    setRevisions([]);
+    setSelectedRevisionId("latest");
+  };
+
+  const selectRevision = (revisionId: string) => {
+    setSelectedRevisionId(revisionId);
+    if (revisionId === "latest") {
+      if (documentId) void openDocument(documentId);
+      return;
+    }
+    const revision = revisions.find((item) => item.id === revisionId);
+    if (!revision) return;
+    setCurrentDocument(revision.document);
+    setActiveDocumentType(revision.document_type);
+    setLatestCorrection(revision.request_text);
+    setMessages(revision.conversation_messages);
+    setUiForm(revision.ui);
+    setOutOfScopeMessage(null);
+    setRequestInput("");
+    setFormData({});
   };
 
   const submitRequest = async (overrideRequest?: string, isRevision: boolean = false) => {
@@ -52,26 +144,29 @@ export default function ContentManagerPage() {
     setOutOfScopeMessage(null);
 
     const newMessages = [...messages, { role: "user" as const, content: reqText }];
+    setMessages(newMessages);
     if (!isRevision) {
       setOriginalRequest(reqText);
-      setMessages(newMessages);
     }
 
     try {
       const payload = buildDocumentRequest({
+        documentId,
         requestText: reqText,
         originalRequest,
         currentDocument,
         activeDocumentType,
         latestCorrection,
         isRevision,
-        messages,
+        messages: newMessages,
       });
 
       const data = await apiFetch<CMResponse>("/api/v1/agents/content-manager/documents", {
         method: "POST",
         body: JSON.stringify(payload),
       });
+      const savedId = data.document_id || documentId;
+      setDocumentId(savedId);
 
       if (data.status === "complete") {
         setCurrentDocument(data.document || null);
@@ -91,6 +186,8 @@ export default function ContentManagerPage() {
         setMessages([...newMessages, { role: "assistant" as const, content: data.redirect_message || t("cmOutOfScope") }]);
       }
       if (!isRevision) setRequestInput("");
+      void loadDocuments();
+      if (savedId) void refreshRevisions(savedId);
     } catch (err) {
       setError(err instanceof Error ? err.message : t("cmError"));
     } finally {
@@ -113,18 +210,21 @@ export default function ContentManagerPage() {
 
     try {
       const payload = buildFormSubmitRequest({
+        documentId,
         originalRequest,
         formData: formattedFields,
         currentDocument,
         activeDocumentType,
         latestCorrection,
-        messages,
+        messages: newMessages,
       });
 
       const data = await apiFetch<CMResponse>("/api/v1/agents/content-manager/documents", {
         method: "POST",
         body: JSON.stringify(payload),
       });
+      const savedId = data.document_id || documentId;
+      setDocumentId(savedId);
 
       if (data.status === "complete") {
         setCurrentDocument(data.document || null);
@@ -139,6 +239,8 @@ export default function ContentManagerPage() {
         setOutOfScopeMessage(data.redirect_message || t("cmOutOfScope"));
         setMessages([...newMessages, { role: "assistant" as const, content: data.redirect_message || t("cmOutOfScope") }]);
       }
+      void loadDocuments();
+      if (savedId) void refreshRevisions(savedId);
     } catch (err) {
       setError(err instanceof Error ? err.message : t("cmError"));
     } finally {
@@ -155,6 +257,37 @@ export default function ContentManagerPage() {
       } catch {
         setError(t("cmCopyFailed"));
       }
+    }
+  };
+
+  const handleExport = async (fileFormat: "pdf" | "docx") => {
+    if (!currentDocument || exporting) return;
+
+    setExporting(fileFormat);
+    setError(null);
+    try {
+      const { blob, filename } = await apiDownload(
+        `/api/v1/agents/content-manager/documents/export/${fileFormat}`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            document: currentDocument,
+            document_type: activeDocumentType,
+          }),
+        },
+      );
+      const objectUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = objectUrl;
+      link.download = filename || `modeem-document.${fileFormat}`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(objectUrl);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : t("cmExportFailed"));
+    } finally {
+      setExporting(null);
     }
   };
 
@@ -181,6 +314,55 @@ export default function ContentManagerPage() {
           <div className="p-6 border-b border-slate-800/60 shrink-0">
             <h2 className="text-lg font-medium text-emerald-400 mb-2">{t("cmTitle")}</h2>
             <p className="text-sm text-slate-400 leading-relaxed">{t("cmDescription")}</p>
+            <div className="mt-5">
+              <div className="mb-2 flex items-center justify-between">
+                <h3 className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                  {t("cmSavedDrafts")}
+                </h3>
+                {savedDocuments.length > 0 && (
+                  <span className="rounded-full bg-slate-800 px-2 py-0.5 text-[10px] text-slate-400">
+                    {savedDocuments.length}
+                  </span>
+                )}
+              </div>
+              <div className="max-h-44 space-y-2 overflow-y-auto pe-1">
+                {documentsLoading ? (
+                  <p className="py-2 text-xs text-slate-500">{t("cmLoadingDrafts")}</p>
+                ) : documentsError ? (
+                  <button
+                    type="button"
+                    onClick={() => void loadDocuments()}
+                    className="text-xs text-rose-400 hover:text-rose-300"
+                  >
+                    {t("cmDraftLoadError")} · {t("retry")}
+                  </button>
+                ) : savedDocuments.length === 0 ? (
+                  <p className="py-2 text-xs text-slate-500">{t("cmNoSavedDrafts")}</p>
+                ) : (
+                  savedDocuments.map((draft) => (
+                    <button
+                      type="button"
+                      key={draft.id}
+                      onClick={() => void openDocument(draft.id)}
+                      disabled={loading}
+                      className={`w-full rounded-lg border p-3 text-start transition-colors ${
+                        documentId === draft.id
+                          ? "border-emerald-700/60 bg-emerald-950/30"
+                          : "border-slate-800 bg-slate-950/40 hover:border-slate-700 hover:bg-slate-900"
+                      }`}
+                    >
+                      <span className="block truncate text-xs font-medium text-slate-200">
+                        {draft.title || t("cmDraftUntitled")}
+                      </span>
+                      <span className="mt-1 flex items-center justify-between text-[10px] text-slate-500">
+                        <span>{draft.document_type || t("cmDraftSaved")}</span>
+                        <span>{t("cmRevision")} {draft.revision_count}</span>
+                      </span>
+                    </button>
+                  ))
+                )}
+              </div>
+            </div>
           </div>
 
           <div className="flex-1 overflow-y-auto p-6 flex flex-col">
@@ -347,6 +529,7 @@ export default function ContentManagerPage() {
                 className="relative"
               >
                 <textarea
+                  id="content-manager-revision-input"
                   value={requestInput}
                   onChange={(e) => setRequestInput(e.target.value)}
                   placeholder={currentDocument ? t("cmRevisePlaceholder") : t("cmInputPlaceholder")}
@@ -378,7 +561,7 @@ export default function ContentManagerPage() {
         <div className="flex-1 bg-slate-950 flex flex-col min-w-0 overflow-hidden relative">
           {currentDocument ? (
             <div className="flex-1 flex flex-col h-full absolute inset-0 animate-in fade-in duration-700">
-              <div className="px-6 py-4 border-b border-slate-800/60 flex items-center justify-between shrink-0 bg-slate-900/20 backdrop-blur-sm z-10">
+              <div className="px-6 py-4 border-b border-slate-800/60 flex flex-wrap items-center justify-between gap-3 shrink-0 bg-slate-900/20 backdrop-blur-sm z-10">
                 <div className="flex items-center gap-3">
                   <h3 className="text-sm font-medium text-slate-200">{t("cmPreviewTitle")}</h3>
                   {activeDocumentType && (
@@ -387,7 +570,33 @@ export default function ContentManagerPage() {
                     </span>
                   )}
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  {revisions.length > 0 && (
+                    <label className="flex items-center gap-2 text-xs text-slate-400">
+                      <span className="hidden lg:inline">{t("cmRevisions")}</span>
+                      <select
+                        value={selectedRevisionId}
+                        onChange={(event) => selectRevision(event.target.value)}
+                        className="rounded-md border border-slate-700 bg-slate-900 px-2 py-1.5 text-xs text-slate-200"
+                        aria-label={t("cmRevisions")}
+                      >
+                        <option value="latest">{t("cmLatestVersion")}</option>
+                        {[...revisions].reverse().map((revision) => (
+                          <option key={revision.id} value={revision.id}>
+                            {t("cmRevision")} {revision.revision_number}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                  <button
+                    type="button"
+                    data-testid="content-manager-revise"
+                    onClick={() => document.getElementById("content-manager-revision-input")?.focus()}
+                    className="px-3 py-1.5 rounded-md border border-emerald-800/60 text-xs text-emerald-300 hover:bg-emerald-950/50 transition-colors"
+                  >
+                    {t("cmRevise")}
+                  </button>
                   <button
                     onClick={clearState}
                     className="px-3 py-1.5 rounded-md border border-slate-700 text-xs text-slate-300 hover:bg-slate-800 transition-colors"
@@ -411,6 +620,20 @@ export default function ContentManagerPage() {
                       </>
                     )}
                   </button>
+                  <button
+                    onClick={() => void handleExport("pdf")}
+                    disabled={Boolean(exporting)}
+                    className="px-3 py-1.5 rounded-md border border-slate-700 text-xs text-slate-200 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {exporting === "pdf" ? t("cmExporting") : t("cmDownloadPdf")}
+                  </button>
+                  <button
+                    onClick={() => void handleExport("docx")}
+                    disabled={Boolean(exporting)}
+                    className="px-3 py-1.5 rounded-md border border-slate-700 text-xs text-slate-200 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    {exporting === "docx" ? t("cmExporting") : t("cmDownloadDocx")}
+                  </button>
                 </div>
               </div>
               
@@ -423,7 +646,10 @@ export default function ContentManagerPage() {
                     </div>
                   </div>
                 )}
-                <div className="max-w-3xl mx-auto bg-white text-slate-900 p-8 sm:p-12 min-h-full rounded-sm shadow-2xl whitespace-pre-wrap font-sans text-[15px] leading-relaxed border border-slate-200">
+                <div
+                  dir="auto"
+                  className="max-w-3xl mx-auto bg-white text-slate-900 p-8 sm:p-12 min-h-full rounded-sm shadow-2xl whitespace-pre-wrap font-sans text-[15px] leading-relaxed border border-slate-200"
+                >
                   {currentDocument}
                 </div>
               </div>

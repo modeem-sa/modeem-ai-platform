@@ -1,4 +1,4 @@
-"""Add tenant-scoped operations tasks and append-only history.
+"""Add tenant-scoped operation tasks and append-only history.
 
 Revision ID: 0007
 Revises: 0006
@@ -7,6 +7,7 @@ Revises: 0006
 from collections.abc import Sequence
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision: str = "0007"
@@ -15,7 +16,11 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
-def upgrade() -> None:
+def _table_names() -> set[str]:
+    return set(sa.inspect(op.get_bind()).get_table_names())
+
+
+def _upgrade_operation_schema() -> None:
     op.create_table(
         "operation_tasks",
         sa.Column("id", sa.Uuid(), primary_key=True),
@@ -65,6 +70,12 @@ def upgrade() -> None:
     )
     op.create_index("ix_operation_task_history_task_id", "operation_task_history", ["task_id"])
     op.create_index("ix_operation_task_history_tenant_id", "operation_task_history", ["tenant_id"])
+
+
+def upgrade() -> None:
+    """Create operation tables unless a legacy 0007 already created them."""
+    if "operation_tasks" not in _table_names():
+        _upgrade_operation_schema()
 
 
 def downgrade() -> None:

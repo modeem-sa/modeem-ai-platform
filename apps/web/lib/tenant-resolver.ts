@@ -55,7 +55,7 @@ export function getCookieValue(cookieHeader: string, name: string): string | nul
   return null;
 }
 
-interface SessionClaims {
+export interface SessionClaims {
   sub?: string;
   tid?: string;
   exp?: number;
@@ -100,14 +100,8 @@ export function verifySessionToken(token: string, secret: string): SessionClaims
   return claims;
 }
 
-/**
- * Resolve the tenant ID for an incoming server-side request from the
- * authenticated session cookie.
- *
- * Returns `null` (→ 401 in the proxy) when there is no cookie, the token is
- * invalid or expired, or the session carries no tenant.
- */
-export function resolveTenantFromRequest(req: ResolvableRequest): string | null {
+/** Resolve and verify the full authenticated session, with or without a tenant claim. */
+export function resolveSessionFromRequest(req: ResolvableRequest): SessionClaims | null {
   const cookieHeader = req.headers?.get("cookie");
   if (!cookieHeader) return null;
 
@@ -118,5 +112,16 @@ export function resolveTenantFromRequest(req: ResolvableRequest): string | null 
   if (!secret) return null;
 
   const claims = verifySessionToken(token, secret);
-  return claims?.tid ?? null;
+  return claims && typeof claims.sub === "string" && claims.sub ? claims : null;
+}
+
+/**
+ * Resolve the tenant ID for an incoming server-side request from the
+ * authenticated session cookie.
+ *
+ * Returns `null` (→ 401 in the proxy) when there is no cookie, the token is
+ * invalid or expired, or the session carries no tenant.
+ */
+export function resolveTenantFromRequest(req: ResolvableRequest): string | null {
+  return resolveSessionFromRequest(req)?.tid ?? null;
 }
