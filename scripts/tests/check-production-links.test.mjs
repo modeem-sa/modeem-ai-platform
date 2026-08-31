@@ -59,3 +59,15 @@ test("ignores comments and development documentation", () => {
   write(root, "docs/setup.md", "Use https://example.replit.dev in development.\n");
   assert.deepEqual(findViolations(root), []);
 });
+
+test("scans a web-only build context and its local build output", () => {
+  const root = fixture();
+  write(root, "package-lock.json", '{"resolved":"https://registry.npmjs.org/example.tgz"}');
+  write(
+    root,
+    ".next/required-server-files.json",
+    '{"config":{"allowedDevOrigins":["preview.example.replit.dev"]}}',
+  );
+
+  assert.equal(findViolations(root, ".next").length, 1);
+});
