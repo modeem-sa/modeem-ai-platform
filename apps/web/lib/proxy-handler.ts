@@ -14,7 +14,7 @@ import {
   resolveTenantFromRequest,
 } from "./tenant-resolver.ts";
 
-const API_ORIGIN = "http://localhost:8000";
+const API_ORIGIN = "http://api:8000";
 
 const SAFE_UPSTREAM_RESPONSE_HEADERS = [
   "Content-Disposition",
