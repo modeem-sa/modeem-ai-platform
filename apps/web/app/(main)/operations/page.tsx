@@ -27,6 +27,7 @@ import { ApiError } from "@/lib/api";
 import { OdooTaskCard } from "./odoo-task-card";
 import { ManualTaskCard } from "./manual-task-card";
 import { RecurringTemplates } from "./recurring-templates";
+import { FinanceServices } from "./finance-services";
 
 export default function OperationsPage() {
   const { t } = useLocale();
@@ -37,7 +38,9 @@ export default function OperationsPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const [activeTab, setActiveTab] = useState<"tasks" | "templates">("tasks");
+  const [activeTab, setActiveTab] = useState<"tasks" | "templates" | "finance">("tasks");
+  const [bootstrapLoading, setBootstrapLoading] = useState(false);
+  const [bootstrapError, setBootstrapError] = useState<string | null>(null);
   const [sourceFilter, setSourceFilter] = useState<OpSourceType | "">("");
 
   const [filters, setFilters] = useState<TaskFilters>({
@@ -81,6 +84,20 @@ export default function OperationsPage() {
       void load();
     }
   }, [load, activeTab]);
+
+  useEffect(() => {
+    if (activeTab !== "finance" || bootstrap) return;
+    let cancelled = false;
+    setBootstrapLoading(true);
+    setBootstrapError(null);
+    void fetchOperationsBootstrap()
+      .then((result) => { if (!cancelled) setBootstrap(result); })
+      .catch((err: unknown) => {
+        if (!cancelled) setBootstrapError(err instanceof Error ? err.message : t("errorLoading"));
+      })
+      .finally(() => { if (!cancelled) setBootstrapLoading(false); });
+    return () => { cancelled = true; };
+  }, [activeTab, bootstrap, t]);
 
   useEffect(() => {
     const executionInProgress = tasks?.some((task) =>
@@ -149,9 +166,21 @@ export default function OperationsPage() {
           >
             {t("opTemplatesTitle")}
           </button>
+          <button
+            onClick={() => setActiveTab("finance")}
+            className={`px-4 py-2 text-sm font-semibold transition-colors ${activeTab === "finance" ? "text-indigo-400 border-b-2 border-indigo-400" : "text-slate-500 hover:text-slate-300"}`}
+          >
+            {t("opFinanceServices")}
+          </button>
         </div>
 
-        {activeTab === "templates" && bootstrap ? (
+        {activeTab === "finance" ? (
+          <FinanceServices
+            tenants={bootstrap?.tenants ?? []}
+            bootstrapLoading={bootstrapLoading}
+            bootstrapError={bootstrapError}
+          />
+        ) : activeTab === "templates" && bootstrap ? (
           <RecurringTemplates bootstrap={bootstrap} />
         ) : (
           <>

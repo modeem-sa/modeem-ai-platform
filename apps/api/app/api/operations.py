@@ -19,6 +19,7 @@ from app.content_manager.provider import (
 )
 from app.core.config import get_settings
 from app.integrations.odoo.errors import ConnectorError
+from app.integrations.odoo.reader import ReadPolicyError, ResourceUnavailableError, read_page
 from app.integrations.odoo.invoice_chatter_collection import (
     CollectionMessagePolicyError,
     read_invoice_collection_target,
@@ -79,6 +80,14 @@ _DECISION_ACTIONS = {
     "approve": ("submitted_for_approval", "approved"),
     "reject": ("submitted_for_approval", "rejected"),
 }
+_FINANCE_SERVICES = (
+    ("accounting_entries", "Accounting entries"),
+    ("journal_items", "Journal items"),
+    ("payments_summary", "Payments"),
+    ("journals_summary", "Journals"),
+    ("invoices", "Invoices"),
+    ("vendor_bills", "Vendor bills"),
+)
 _AUDIT_ACTIONS = {
     "created": "created",
     "start": "started",
@@ -103,6 +112,17 @@ class RecurringTemplateRequest(BaseModel):
 class RecurringTemplateOut(RecurringTemplateRequest):
     id: uuid.UUID
     enabled: bool
+
+
+class FinanceReadRequest(BaseModel):
+    """Deliberately narrow finance read shape: no models, domains or fields."""
+
+    model_config = {"extra": "forbid"}
+
+    tenant_id: uuid.UUID
+    service: str = Field(max_length=64)
+    limit: int = Field(default=25, ge=1, le=50)
+    offset: int = Field(default=0, ge=0, le=1000)
 
 
 def _active_tenant_ids(db: Session, user: User) -> list[uuid.UUID]:
@@ -144,6 +164,89 @@ def _role_in_tenant(db: Session, user: User, tenant_id: uuid.UUID) -> str | None
 
 def _is_manager(role: str | None) -> bool:
     return role == "superuser" or role in _MANAGER_ROLES
+
+
+def _operations_odoo_connection(
+    db: Session, user: User, tenant_id: uuid.UUID
+) -> Connection:
+    """Resolve a member-visible tenant to one currently approved Odoo read path."""
+    if _role_in_tenant(db, user, tenant_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
+    connection = (
+        db.query(Connection)
+        .filter(
+            Connection.tenant_id == tenant_id,
+            Connection.provider == "odoo",
+            Connection.is_active.is_(True),
+            Connection.status != "disabled",
+            Connection.last_test_status == "success",
+            Connection.selected_transport.in_(("xmlrpc", "json2")),
+            Connection.encrypted_credentials.is_not(None),
+            Connection.encryption_version.is_not(None),
+        )
+        .order_by(Connection.created_at.desc(), Connection.id.desc())
+        .first()
+    )
+    if connection is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Tenant has no active tested Odoo connection",
+        )
+    return connection
+
+
+def _operations_read_page(
+    connection: Connection,
+    *,
+    resource: str,
+    limit: int,
+    offset: int,
+    filters: list[dict] | None = None,
+    company_scoped: bool = True,
+) -> dict:
+    """Read a fixed policy resource with short-lived decrypted auth."""
+    try:
+        credentials = decrypt_credentials(
+            connection.encrypted_credentials,
+            tenant_id=connection.tenant_id,
+            connection_id=connection.id,
+            encryption_version=connection.encryption_version,
+        )
+    except EncryptionConfigError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except CredentialDecryptionError as exc:
+        raise HTTPException(
+            status_code=409, detail="Stored credentials cannot be decrypted"
+        ) from exc
+    try:
+        auth = resolve_auth_material(connection.username, credentials)
+    except AuthMaterialError as exc:
+        raise HTTPException(status_code=409, detail=exc.message) from exc
+    finally:
+        del credentials
+    try:
+        return read_page(
+            base_url=connection.base_url,
+            database=connection.database_name,
+            transport=connection.selected_transport,
+            login=auth.login,
+            secret=auth.secret,
+            environment=get_settings().environment,
+            resource=resource,
+            filters=filters,
+            limit=limit,
+            offset=offset,
+            # Never accept a company scope from the request.
+            company_id=connection.odoo_company_id if company_scoped else None,
+        )
+    except ReadPolicyError as exc:
+        raise HTTPException(status_code=422, detail=exc.message) from exc
+    except ResourceUnavailableError as exc:
+        raise HTTPException(status_code=409, detail=exc.message) from exc
+    except ConnectorError as exc:
+        raise HTTPException(status_code=502, detail={"error_code": exc.code}) from exc
+    finally:
+        del auth
 
 
 def _task_query(db: Session, tenant_ids: list[uuid.UUID]):
@@ -383,6 +486,55 @@ def operations_bootstrap(
             )
         )
     return OperationBootstrapOut(tenants=tenants)
+
+
+@router.get("/catalog")
+def operations_catalog(
+    tenant_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Expose finance only when its Odoo module is live-installed."""
+    connection = _operations_odoo_connection(db, user, tenant_id)
+    account_page = _operations_read_page(
+        connection,
+        resource="installed_modules",
+        filters=[{"field": "name", "operator": "=", "value": "account"}],
+        limit=1,
+        offset=0,
+        company_scoped=False,
+    )
+    modules = []
+    if account_page["records"]:
+        modules.append(
+            {
+                "key": "finance",
+                "label": "Finance",
+                "services": [
+                    {"key": key, "label": label} for key, label in _FINANCE_SERVICES
+                ],
+            }
+        )
+    return {"tenant_id": str(tenant_id), "modules": modules}
+
+
+@router.post("/finance/read", dependencies=[Depends(require_csrf)])
+def read_finance(
+    body: FinanceReadRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Read one bounded, server-policy-controlled finance page."""
+    if body.service not in {key for key, _label in _FINANCE_SERVICES}:
+        raise HTTPException(status_code=422, detail="Unsupported finance service")
+    connection = _operations_odoo_connection(db, user, body.tenant_id)
+    if connection.odoo_company_id is None:
+        raise HTTPException(
+            status_code=409, detail="Connection has no approved Odoo company scope"
+        )
+    return _operations_read_page(
+        connection, resource=body.service, limit=body.limit, offset=body.offset
+    )
 
 
 @router.get("/tasks", response_model=OperationTaskListOut)

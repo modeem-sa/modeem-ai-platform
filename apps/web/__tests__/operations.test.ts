@@ -4,7 +4,11 @@ import {
   buildExactCollectionMessagePayload,
   buildExactActionPayload,
   buildOperationsUrl,
+  buildOperationsCatalogUrl,
+  buildFinanceReadPayload,
   getCollectionDeliveryPresentation,
+  resetFinanceSelectionForModule,
+  resetFinanceSelectionForTenant,
   toTaskDueAt,
   type CollectionMessage,
 } from '../lib/operations.ts';
@@ -36,6 +40,34 @@ describe('Operations API Utilities', () => {
     });
     assert.ok(url.includes('category=financial'));
     assert.ok(!url.includes('status='));
+  });
+
+  it('builds the association-scoped catalog URL and finance read payload', () => {
+    assert.strictEqual(
+      buildOperationsCatalogUrl('tenant id'),
+      '/api/v1/operations/catalog?tenant_id=tenant+id',
+    );
+    assert.deepStrictEqual(buildFinanceReadPayload('tenant-1', 'invoices', 50, 100), {
+      tenant_id: 'tenant-1',
+      service: 'invoices',
+      limit: 50,
+      offset: 100,
+    });
+  });
+
+  it('clears dependent finance selections and data when association or module changes', () => {
+    const tenantSelection = resetFinanceSelectionForTenant('tenant-2');
+    assert.deepStrictEqual(tenantSelection, {
+      tenant_id: 'tenant-2', module_key: '', service: '', page: null,
+    });
+    assert.deepStrictEqual(resetFinanceSelectionForModule({
+      ...tenantSelection,
+      module_key: 'account',
+      service: 'invoices',
+      page: {} as never,
+    }, 'accounting'), {
+      tenant_id: 'tenant-2', module_key: 'accounting', service: '', page: null,
+    });
   });
 
   it('normalizes valid task due dates without shifting the calendar day', () => {

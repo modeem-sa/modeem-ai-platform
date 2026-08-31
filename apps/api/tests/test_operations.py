@@ -1,9 +1,18 @@
 """Focused lifecycle and tenancy coverage for operations tasks."""
 
 import uuid
+from types import SimpleNamespace
 
+from app.api import operations as operations_api
 from app.core.security import hash_password
-from app.models import AuditLog, OperationTask, OperationTaskHistory, TenantMembership, User
+from app.models import (
+    AuditLog,
+    Connection,
+    OperationTask,
+    OperationTaskHistory,
+    TenantMembership,
+    User,
+)
 from tests.test_auth_security import PASSWORD, TestingSession, _client, _csrf, _login
 
 
@@ -256,3 +265,161 @@ def test_bootstrap_superuser_without_membership_can_create_and_assign(seed):
     assert any(member["email"] == "tenant-b-worker@example.com" for member in tenant_b["members"])
     created = _create(client, seed["tenant_b"], assignee_id)
     assert created.status_code == 201
+
+
+def _operations_odoo_connection(tenant_id, *, company_id=41):
+    db = TestingSession()
+    connection = Connection(
+        tenant_id=tenant_id,
+        name=f"Operations Odoo {tenant_id}",
+        provider="odoo",
+        base_url="https://odoo.example.test",
+        database_name="odoo",
+        username="odoo-user",
+        encrypted_credentials=b"encrypted",
+        encryption_version=1,
+        odoo_company_id=company_id,
+        last_test_status="success",
+        selected_transport="xmlrpc",
+    )
+    db.add(connection)
+    db.commit()
+    db.close()
+    return connection
+
+
+def _mock_operations_odoo(monkeypatch, calls, *, module_installed=True):
+    monkeypatch.setattr(
+        operations_api, "decrypt_credentials", lambda *_args, **_kwargs: {"password_or_api_key": "secret"}
+    )
+    monkeypatch.setattr(
+        operations_api,
+        "resolve_auth_material",
+        lambda *_args, **_kwargs: SimpleNamespace(login="odoo-user", secret="secret"),
+    )
+
+    def fake_read_page(**kwargs):
+        calls.append(kwargs)
+        if kwargs["resource"] == "installed_modules":
+            return {"records": [{"id": 1, "name": "account"}] if module_installed else []}
+        return {
+            "resource": kwargs["resource"],
+            "fields": ["id"],
+            "records": [{"id": 9}],
+            "limit": kwargs["limit"],
+            "offset": kwargs["offset"],
+            "returned_count": 1,
+            "has_more": False,
+            "next_offset": None,
+            "transport": "xmlrpc",
+        }
+
+    monkeypatch.setattr(operations_api, "read_page", fake_read_page)
+
+
+def test_operations_catalog_allows_assigned_member_and_uses_live_module(seed, monkeypatch):
+    _operations_odoo_connection(seed["tenant_b"])
+    calls = []
+    _mock_operations_odoo(monkeypatch, calls)
+    client = _client()
+    _login(client, "b@example.com")
+
+    response = client.get(f"/api/v1/operations/catalog?tenant_id={seed['tenant_b']}")
+
+    assert response.status_code == 200
+    assert response.json()["tenant_id"] == str(seed["tenant_b"])
+    assert response.json()["modules"] == [
+        {
+            "key": "finance",
+            "label": "Finance",
+            "services": [
+                {"key": "accounting_entries", "label": "Accounting entries"},
+                {"key": "journal_items", "label": "Journal items"},
+                {"key": "payments_summary", "label": "Payments"},
+                {"key": "journals_summary", "label": "Journals"},
+                {"key": "invoices", "label": "Invoices"},
+                {"key": "vendor_bills", "label": "Vendor bills"},
+            ],
+        }
+    ]
+    assert calls[0]["resource"] == "installed_modules"
+    assert calls[0]["filters"] == [{"field": "name", "operator": "=", "value": "account"}]
+    assert calls[0]["company_id"] is None
+
+
+def test_operations_finance_read_forces_connection_company_and_rejects_extra_scope(
+    seed, monkeypatch
+):
+    _operations_odoo_connection(seed["tenant_b"], company_id=73)
+    calls = []
+    _mock_operations_odoo(monkeypatch, calls)
+    client = _client()
+    _login(client, "b@example.com")
+
+    response = client.post(
+        "/api/v1/operations/finance/read",
+        json={
+            "tenant_id": str(seed["tenant_b"]),
+            "service": "journal_items",
+            "limit": 7,
+            "offset": 3,
+        },
+        headers=_csrf(client),
+    )
+
+    assert response.status_code == 200
+    assert calls == [
+        {
+            "base_url": "https://odoo.example.test",
+            "database": "odoo",
+            "transport": "xmlrpc",
+            "login": "odoo-user",
+            "secret": "secret",
+            "environment": "development",
+            "resource": "journal_items",
+            "filters": None,
+            "limit": 7,
+            "offset": 3,
+            "company_id": 73,
+        }
+    ]
+    rejected = client.post(
+        "/api/v1/operations/finance/read",
+        json={
+            "tenant_id": str(seed["tenant_b"]),
+            "service": "journal_items",
+            "company_id": 999,
+        },
+        headers=_csrf(client),
+    )
+    assert rejected.status_code == 422
+    assert len(calls) == 1
+
+
+def test_operations_endpoints_hide_cross_tenant_and_allow_superuser(seed, monkeypatch):
+    _operations_odoo_connection(seed["tenant_a"])
+    db = TestingSession()
+    superuser = User(
+        email="operations-superuser@example.com",
+        full_name="Operations Superuser",
+        password_hash=hash_password(PASSWORD),
+        is_superuser=True,
+    )
+    db.add(superuser)
+    db.commit()
+    db.close()
+    calls = []
+    _mock_operations_odoo(monkeypatch, calls)
+
+    member = _client()
+    _login(member, "b@example.com")
+    assert (
+        member.get(f"/api/v1/operations/catalog?tenant_id={seed['tenant_a']}").status_code
+        == 404
+    )
+
+    admin = _client()
+    _login(admin, "operations-superuser@example.com")
+    response = admin.get(f"/api/v1/operations/catalog?tenant_id={seed['tenant_a']}")
+    assert response.status_code == 200
+    assert calls and calls[0]["resource"] == "installed_modules"

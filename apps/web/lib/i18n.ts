@@ -308,6 +308,15 @@ export const dictionaries: Record<Locale, Record<string, string>> = {
 
     // Summary
     opActiveTasks: "Active Tasks",
+    opFinanceServices: "Finance & Services",
+    opFinanceServicesDesc: "Choose an association, active Odoo module, and service before reading data.",
+    opOdooModule: "Odoo module",
+    opSelectModule: "Select module",
+    opLoadingModules: "Loading active modules…",
+    opService: "Service",
+    opSelectService: "Select service",
+    opFinanceReadyToRead: "The selected service is ready to read.",
+    opReadService: "Read data",
 
     // Data states
     errorLoading: "Failed to load data.",
@@ -665,6 +674,15 @@ export const dictionaries: Record<Locale, Record<string, string>> = {
 
     // Summary
     opActiveTasks: "المهام النشطة",
+    opFinanceServices: "المالية والخدمات",
+    opFinanceServicesDesc: "اختر الجمعية ثم موديول أودو النشط والخدمة قبل قراءة البيانات.",
+    opOdooModule: "موديول أودو",
+    opSelectModule: "اختر الموديول",
+    opLoadingModules: "جارٍ تحميل الموديولات النشطة…",
+    opService: "الخدمة",
+    opSelectService: "اختر الخدمة",
+    opFinanceReadyToRead: "الخدمة المحددة جاهزة للقراءة.",
+    opReadService: "قراءة البيانات",
 
     // Data states
     errorLoading: "فشل تحميل البيانات.",

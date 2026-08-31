@@ -263,8 +263,96 @@ export interface OperationsBootstrap {
   tenants: BootstrapTenant[];
 }
 
+export type FinanceServiceKey =
+  | "accounting_entries"
+  | "journal_items"
+  | "payments_summary"
+  | "journals_summary"
+  | "invoices"
+  | "vendor_bills";
+
+export interface OperationsCatalogService {
+  key: FinanceServiceKey;
+  label: string;
+}
+
+export interface OperationsCatalogModule {
+  key: string;
+  label: string;
+  services: OperationsCatalogService[];
+}
+
+export interface OperationsCatalog {
+  tenant_id: string;
+  modules: OperationsCatalogModule[];
+}
+
+export type FinanceReadRecord = Record<string, unknown>;
+
+/** The bounded Odoo page envelope returned by the finance read endpoint. */
+export interface FinanceReadPage {
+  resource: FinanceServiceKey;
+  records: FinanceReadRecord[];
+  limit: number;
+  offset: number;
+  returned_count: number;
+  has_more: boolean;
+  next_offset: number | null;
+}
+
+export interface FinanceReadPayload {
+  tenant_id: string;
+  service: FinanceServiceKey;
+  limit: number;
+  offset: number;
+}
+
+export interface FinanceSelectionState {
+  tenant_id: string;
+  module_key: string;
+  service: FinanceServiceKey | "";
+  page: FinanceReadPage | null;
+}
+
+export function buildOperationsCatalogUrl(tenantId: string): string {
+  return `/api/v1/operations/catalog?${new URLSearchParams({ tenant_id: tenantId }).toString()}`;
+}
+
+export function buildFinanceReadPayload(
+  tenantId: string,
+  service: FinanceServiceKey,
+  limit: number,
+  offset: number,
+): FinanceReadPayload {
+  return { tenant_id: tenantId, service, limit, offset };
+}
+
+/** A new association invalidates every catalog-dependent choice and result. */
+export function resetFinanceSelectionForTenant(tenantId: string): FinanceSelectionState {
+  return { tenant_id: tenantId, module_key: "", service: "", page: null };
+}
+
+/** A new module invalidates the selected service and its previously read page. */
+export function resetFinanceSelectionForModule(
+  selection: FinanceSelectionState,
+  moduleKey: string,
+): FinanceSelectionState {
+  return { ...selection, module_key: moduleKey, service: "", page: null };
+}
+
 export async function fetchOperationsBootstrap(): Promise<OperationsBootstrap> {
   return apiFetch<OperationsBootstrap>("/api/v1/operations/bootstrap");
+}
+
+export async function fetchOperationsCatalog(tenantId: string): Promise<OperationsCatalog> {
+  return apiFetch<OperationsCatalog>(buildOperationsCatalogUrl(tenantId));
+}
+
+export async function readFinanceService(payload: FinanceReadPayload): Promise<FinanceReadPage> {
+  return apiFetch<FinanceReadPage>("/api/v1/operations/finance/read", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
 }
 
 export async function fetchTasks(filters: TaskFilters): Promise<TasksResponse> {

@@ -62,6 +62,8 @@ def test_registry_contains_exactly_approved_resources():
         "vendor_bills",
         "payments_summary",
         "journals_summary",
+        "accounting_entries",
+        "journal_items",
     }
 
 
@@ -514,6 +516,8 @@ def test_only_approved_resources_are_registered():
         "vendor_bills",
         "payments_summary",
         "journals_summary",
+        "accounting_entries",
+        "journal_items",
     ]
     policy = READ_POLICIES["countries"]
     assert policy.odoo_model == "res.country"
@@ -527,6 +531,8 @@ def test_operational_resources_require_expected_modules_and_company_scope():
         "vendor_bills": "account",
         "payments_summary": "account",
         "journals_summary": "account",
+        "accounting_entries": "account",
+        "journal_items": "account",
     }
     for resource, module in expected.items():
         policy = READ_POLICIES[resource]

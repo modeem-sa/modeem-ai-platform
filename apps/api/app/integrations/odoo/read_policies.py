@@ -455,6 +455,57 @@ _JOURNALS_SUMMARY = ReadPolicy(
     requires_company_scope=True,
 )
 
+_ACCOUNTING_ENTRIES = ReadPolicy(
+    # General journal entries only. Customer/vendor invoices and their free
+    # text are deliberately covered by their separate, narrower resources.
+    resource_key="accounting_entries",
+    odoo_model="account.move",
+    fields=_fields(
+        ReadFieldPolicy(name="id", value_type="integer", nullable=False),
+        ReadFieldPolicy(name="name", value_type="string", nullable=False, max_length=255),
+        ReadFieldPolicy(name="date", value_type="date", nullable=False),
+        ReadFieldPolicy(name="ref", value_type="string", nullable=True, max_length=255),
+        ReadFieldPolicy(name="state", value_type="string", nullable=False, max_length=16),
+        ReadFieldPolicy(name="journal_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="company_id", value_type="many2one", nullable=False),
+    ),
+    default_fields=("id", "name", "date", "ref", "state", "journal_id", "company_id"),
+    allowed_filter_fields=frozenset({"id", "name", "date", "state"}),
+    allowed_filter_operators=SAFE_OPERATORS,
+    allowed_order_fields=frozenset({"id", "name", "date"}),
+    base_domain=(("move_type", "=", "entry"),),
+    required_module="account",
+    requires_company_scope=True,
+)
+
+_JOURNAL_ITEMS = ReadPolicy(
+    # Excludes section/note display rows and intentionally omits line
+    # descriptions, analytic allocations, reconciliation details and taxes.
+    resource_key="journal_items",
+    odoo_model="account.move.line",
+    fields=_fields(
+        ReadFieldPolicy(name="id", value_type="integer", nullable=False),
+        ReadFieldPolicy(name="move_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="date", value_type="date", nullable=False),
+        ReadFieldPolicy(name="account_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="partner_id", value_type="many2one", nullable=True),
+        ReadFieldPolicy(name="company_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="debit", value_type="number", nullable=False),
+        ReadFieldPolicy(name="credit", value_type="number", nullable=False),
+        ReadFieldPolicy(name="balance", value_type="number", nullable=False),
+    ),
+    default_fields=(
+        "id", "move_id", "date", "account_id", "partner_id", "company_id",
+        "debit", "credit", "balance",
+    ),
+    allowed_filter_fields=frozenset({"id", "date"}),
+    allowed_filter_operators=SAFE_OPERATORS,
+    allowed_order_fields=frozenset({"id", "date"}),
+    base_domain=(("display_type", "=", False),),
+    required_module="account",
+    requires_company_scope=True,
+)
+
 READ_POLICIES: dict[str, ReadPolicy] = {
     _COUNTRIES.resource_key: _COUNTRIES,
     _BENEFICIARIES_SUMMARY.resource_key: _BENEFICIARIES_SUMMARY,
@@ -467,6 +518,8 @@ READ_POLICIES: dict[str, ReadPolicy] = {
     _VENDOR_BILLS.resource_key: _VENDOR_BILLS,
     _PAYMENTS_SUMMARY.resource_key: _PAYMENTS_SUMMARY,
     _JOURNALS_SUMMARY.resource_key: _JOURNALS_SUMMARY,
+    _ACCOUNTING_ENTRIES.resource_key: _ACCOUNTING_ENTRIES,
+    _JOURNAL_ITEMS.resource_key: _JOURNAL_ITEMS,
 }
 
 
