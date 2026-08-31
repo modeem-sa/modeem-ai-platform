@@ -10,6 +10,7 @@ COPY --chown=node:node apps/web/package.json apps/web/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 
 COPY --chown=node:node apps/web .
+COPY --chown=node:node scripts /srv/scripts
 
 RUN npm run build
 
