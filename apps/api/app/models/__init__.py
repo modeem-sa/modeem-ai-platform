@@ -1,4 +1,5 @@
 from app.models.audit_log import AuditLog
+from app.models.automation_workflow_override import AutomationWorkflowOverride
 from app.models.connection import Connection
 from app.models.content_document import ContentDocument, ContentDocumentRevision
 from app.models.execution import Execution
@@ -20,6 +21,7 @@ from app.models.workflow import Workflow
 
 __all__ = [
     "AuditLog",
+    "AutomationWorkflowOverride",
     "CollectionMessage",
     "CollectionMessageEvent",
     "Connection",

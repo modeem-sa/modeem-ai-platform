@@ -26,9 +26,12 @@ ABSOLUTE_MAX_PAGE_SIZE = 50
 
 # Small safe operator subset. AND-only semantics; no |, &, !, child_of,
 # parent_of, raw domains, or arbitrary operators.
-SAFE_OPERATORS = frozenset({"=", "!=", "in", "ilike"})
+SAFE_OPERATORS = frozenset({"=", "!=", "in", "ilike", ">=", "<="})
+FINANCIAL_SAFE_OPERATORS = SAFE_OPERATORS
 
-FieldValueType = Literal["integer", "string", "boolean", "number", "date", "many2one"]
+FieldValueType = Literal[
+    "integer", "string", "boolean", "number", "date", "datetime", "many2one"
+]
 
 
 @dataclass(frozen=True)
@@ -355,6 +358,106 @@ _EMPLOYEES_SUMMARY = ReadPolicy(
     requires_company_scope=True,
 )
 
+_ATTENDANCE_SUMMARY = ReadPolicy(
+    resource_key="attendance_summary",
+    odoo_model="hr.attendance",
+    fields=_fields(
+        ReadFieldPolicy(name="id", value_type="integer", nullable=False),
+        ReadFieldPolicy(name="employee_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(
+            name="check_in", value_type="datetime", nullable=False, max_length=32
+        ),
+        ReadFieldPolicy(
+            name="check_out", value_type="datetime", nullable=True, max_length=32
+        ),
+        ReadFieldPolicy(name="worked_hours", value_type="number", nullable=False),
+        ReadFieldPolicy(name="company_id", value_type="many2one", nullable=False),
+    ),
+    default_fields=(
+        "id",
+        "employee_id",
+        "check_in",
+        "check_out",
+        "worked_hours",
+        "company_id",
+    ),
+    allowed_filter_fields=frozenset({"id", "employee_id", "check_in", "check_out"}),
+    allowed_filter_operators=SAFE_OPERATORS,
+    allowed_order_fields=frozenset({"id", "check_in", "check_out", "worked_hours"}),
+    required_module="hr_attendance",
+    requires_company_scope=True,
+)
+
+_LEAVES_SUMMARY = ReadPolicy(
+    resource_key="leaves_summary",
+    odoo_model="hr.leave",
+    fields=_fields(
+        ReadFieldPolicy(name="id", value_type="integer", nullable=False),
+        ReadFieldPolicy(name="employee_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="holiday_status_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="request_date_from", value_type="date", nullable=True),
+        ReadFieldPolicy(name="request_date_to", value_type="date", nullable=True),
+        ReadFieldPolicy(name="number_of_days", value_type="number", nullable=False),
+        ReadFieldPolicy(name="state", value_type="string", nullable=False, max_length=32),
+        ReadFieldPolicy(name="company_id", value_type="many2one", nullable=False),
+    ),
+    default_fields=(
+        "id",
+        "employee_id",
+        "holiday_status_id",
+        "request_date_from",
+        "request_date_to",
+        "number_of_days",
+        "state",
+        "company_id",
+    ),
+    allowed_filter_fields=frozenset(
+        {"id", "employee_id", "request_date_from", "request_date_to", "state"}
+    ),
+    allowed_filter_operators=SAFE_OPERATORS,
+    allowed_order_fields=frozenset(
+        {"id", "request_date_from", "request_date_to", "number_of_days"}
+    ),
+    required_module="hr_holidays",
+    requires_company_scope=True,
+)
+
+_PAYROLL_SUMMARY = ReadPolicy(
+    resource_key="payroll_summary",
+    odoo_model="hr.payslip",
+    fields=_fields(
+        ReadFieldPolicy(name="id", value_type="integer", nullable=False),
+        ReadFieldPolicy(name="name", value_type="string", nullable=False, max_length=255),
+        ReadFieldPolicy(name="employee_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="date_from", value_type="date", nullable=False),
+        ReadFieldPolicy(name="date_to", value_type="date", nullable=False),
+        ReadFieldPolicy(name="state", value_type="string", nullable=False, max_length=32),
+        ReadFieldPolicy(name="struct_id", value_type="many2one", nullable=True),
+        ReadFieldPolicy(name="net_wage", value_type="number", nullable=True),
+        ReadFieldPolicy(name="company_id", value_type="many2one", nullable=False),
+    ),
+    default_fields=(
+        "id",
+        "name",
+        "employee_id",
+        "date_from",
+        "date_to",
+        "state",
+        "struct_id",
+        "net_wage",
+        "company_id",
+    ),
+    allowed_filter_fields=frozenset(
+        {"id", "employee_id", "date_from", "date_to", "state"}
+    ),
+    allowed_filter_operators=SAFE_OPERATORS,
+    allowed_order_fields=frozenset(
+        {"id", "name", "date_from", "date_to", "net_wage"}
+    ),
+    required_module="hr_payroll",
+    requires_company_scope=True,
+)
+
 _DEPARTMENTS_SUMMARY = ReadPolicy(
     resource_key="departments_summary",
     odoo_model="hr.department",
@@ -428,7 +531,7 @@ _PAYMENTS_SUMMARY = ReadPolicy(
     allowed_filter_fields=frozenset(
         {"id", "name", "date", "payment_type", "partner_type", "state"}
     ),
-    allowed_filter_operators=SAFE_OPERATORS,
+    allowed_filter_operators=FINANCIAL_SAFE_OPERATORS,
     allowed_order_fields=frozenset({"id", "name", "date", "amount"}),
     required_module="account",
     requires_company_scope=True,
@@ -455,9 +558,10 @@ _JOURNALS_SUMMARY = ReadPolicy(
     requires_company_scope=True,
 )
 
+# General ledger header resource used by the operations service. Keep this
+# separate from the richer employee-facing financial review resource so callers
+# that only need the compact operation catalog do not gain extra fields.
 _ACCOUNTING_ENTRIES = ReadPolicy(
-    # General journal entries only. Customer/vendor invoices and their free
-    # text are deliberately covered by their separate, narrower resources.
     resource_key="accounting_entries",
     odoo_model="account.move",
     fields=_fields(
@@ -465,7 +569,13 @@ _ACCOUNTING_ENTRIES = ReadPolicy(
         ReadFieldPolicy(name="name", value_type="string", nullable=False, max_length=255),
         ReadFieldPolicy(name="date", value_type="date", nullable=False),
         ReadFieldPolicy(name="ref", value_type="string", nullable=True, max_length=255),
-        ReadFieldPolicy(name="state", value_type="string", nullable=False, max_length=16),
+        ReadFieldPolicy(
+            name="state",
+            value_type="string",
+            nullable=False,
+            max_length=16,
+            pattern=r"(draft|posted|cancel)",
+        ),
         ReadFieldPolicy(name="journal_id", value_type="many2one", nullable=False),
         ReadFieldPolicy(name="company_id", value_type="many2one", nullable=False),
     ),
@@ -478,30 +588,99 @@ _ACCOUNTING_ENTRIES = ReadPolicy(
     requires_company_scope=True,
 )
 
+# Read-only general journal entries. The server-owned move_type domain prevents
+# invoices and bills from being mixed into this resource. Chatter, attachments,
+# invoice lines and unrestricted narration are deliberately excluded.
+_JOURNAL_ENTRIES = ReadPolicy(
+    resource_key="journal_entries",
+    odoo_model="account.move",
+    fields=_fields(
+        ReadFieldPolicy(name="id", value_type="integer", nullable=False),
+        ReadFieldPolicy(name="name", value_type="string", nullable=False, max_length=255),
+        ReadFieldPolicy(name="date", value_type="date", nullable=False),
+        ReadFieldPolicy(name="ref", value_type="string", nullable=True, max_length=255),
+        ReadFieldPolicy(name="journal_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="partner_id", value_type="many2one", nullable=True),
+        ReadFieldPolicy(name="currency_id", value_type="many2one", nullable=True),
+        ReadFieldPolicy(name="company_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(
+            name="state",
+            value_type="string",
+            nullable=False,
+            max_length=16,
+            pattern=r"(draft|posted|cancel)",
+        ),
+        ReadFieldPolicy(name="amount_total_signed", value_type="number", nullable=False),
+    ),
+    default_fields=(
+        "id",
+        "name",
+        "date",
+        "ref",
+        "journal_id",
+        "partner_id",
+        "currency_id",
+        "company_id",
+        "state",
+        "amount_total_signed",
+    ),
+    allowed_filter_fields=frozenset({"id", "name", "date", "state", "journal_id"}),
+    allowed_filter_operators=FINANCIAL_SAFE_OPERATORS,
+    allowed_order_fields=frozenset({"id", "name", "date", "amount_total_signed"}),
+    base_domain=(("move_type", "=", "entry"),),
+    required_module="account",
+    requires_company_scope=True,
+)
+
+# Bounded ledger lines for one or more explicitly selected journal entries.
+# Account codes/names arrive through the allowlisted many2one relation only;
+# reconciliation, analytic, bank and attachment data remain inaccessible.
 _JOURNAL_ITEMS = ReadPolicy(
-    # Excludes section/note display rows and intentionally omits line
-    # descriptions, analytic allocations, reconciliation details and taxes.
     resource_key="journal_items",
     odoo_model="account.move.line",
     fields=_fields(
         ReadFieldPolicy(name="id", value_type="integer", nullable=False),
-        ReadFieldPolicy(name="move_id", value_type="many2one", nullable=False),
         ReadFieldPolicy(name="date", value_type="date", nullable=False),
+        ReadFieldPolicy(name="move_id", value_type="many2one", nullable=False),
         ReadFieldPolicy(name="account_id", value_type="many2one", nullable=False),
+        ReadFieldPolicy(name="name", value_type="string", nullable=True, max_length=255),
         ReadFieldPolicy(name="partner_id", value_type="many2one", nullable=True),
+        ReadFieldPolicy(name="currency_id", value_type="many2one", nullable=True),
         ReadFieldPolicy(name="company_id", value_type="many2one", nullable=False),
         ReadFieldPolicy(name="debit", value_type="number", nullable=False),
         ReadFieldPolicy(name="credit", value_type="number", nullable=False),
         ReadFieldPolicy(name="balance", value_type="number", nullable=False),
+        ReadFieldPolicy(
+            name="parent_state",
+            value_type="string",
+            nullable=False,
+            max_length=16,
+            pattern=r"(draft|posted|cancel)",
+        ),
     ),
     default_fields=(
-        "id", "move_id", "date", "account_id", "partner_id", "company_id",
-        "debit", "credit", "balance",
+        "id",
+        "date",
+        "move_id",
+        "account_id",
+        "name",
+        "partner_id",
+        "currency_id",
+        "company_id",
+        "debit",
+        "credit",
+        "balance",
+        "parent_state",
     ),
-    allowed_filter_fields=frozenset({"id", "date"}),
-    allowed_filter_operators=SAFE_OPERATORS,
-    allowed_order_fields=frozenset({"id", "date"}),
-    base_domain=(("display_type", "=", False),),
+    allowed_filter_fields=frozenset(
+        {"id", "date", "move_id", "account_id", "parent_state"}
+    ),
+    allowed_filter_operators=FINANCIAL_SAFE_OPERATORS,
+    allowed_order_fields=frozenset({"id", "date", "debit", "credit", "balance"}),
+    base_domain=(
+        ("move_id.move_type", "=", "entry"),
+        ("display_type", "=", False),
+    ),
     required_module="account",
     requires_company_scope=True,
 )
@@ -514,11 +693,15 @@ READ_POLICIES: dict[str, ReadPolicy] = {
     _INSTALLED_MODULES.resource_key: _INSTALLED_MODULES,
     _COMPANIES.resource_key: _COMPANIES,
     _EMPLOYEES_SUMMARY.resource_key: _EMPLOYEES_SUMMARY,
+    _ATTENDANCE_SUMMARY.resource_key: _ATTENDANCE_SUMMARY,
+    _LEAVES_SUMMARY.resource_key: _LEAVES_SUMMARY,
+    _PAYROLL_SUMMARY.resource_key: _PAYROLL_SUMMARY,
     _DEPARTMENTS_SUMMARY.resource_key: _DEPARTMENTS_SUMMARY,
     _VENDOR_BILLS.resource_key: _VENDOR_BILLS,
     _PAYMENTS_SUMMARY.resource_key: _PAYMENTS_SUMMARY,
     _JOURNALS_SUMMARY.resource_key: _JOURNALS_SUMMARY,
     _ACCOUNTING_ENTRIES.resource_key: _ACCOUNTING_ENTRIES,
+    _JOURNAL_ENTRIES.resource_key: _JOURNAL_ENTRIES,
     _JOURNAL_ITEMS.resource_key: _JOURNAL_ITEMS,
 }
 

@@ -2,11 +2,16 @@ import { useState } from "react";
 import { useLocale } from "@/components/locale-provider";
 import {
   OperationTask,
+  approveAction,
   approveCollectionMessage,
+  generateAction,
   generateCollectionMessage,
   getCollectionDeliveryPresentation,
+  rejectAction,
   rejectCollectionMessage,
+  retryAction,
   retryCollectionMessage,
+  submitAction,
   submitCollectionMessage,
 } from "@/lib/operations";
 
@@ -22,6 +27,7 @@ export function OdooTaskCard({ task, onRefresh }: { task: OperationTask, onRefre
   const currency = String(snapshot.currency ?? "");
   
   const message = task.collection_message;
+  const action = task.action;
   
   const handleGenerate = async () => {
     setLoading(true); setError(null);
@@ -87,12 +93,46 @@ export function OdooTaskCard({ task, onRefresh }: { task: OperationTask, onRefre
     }
   };
 
+  const handleActionGenerate = async () => {
+    setLoading(true); setError(null);
+    try {
+      await generateAction(task.id, task.version);
+      await onRefresh();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : t("opFailedGenerate"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleActionTransition = async (
+    transition: "submit" | "approve" | "reject" | "retry",
+  ) => {
+    if (!action) return;
+    setLoading(true); setError(null);
+    try {
+      const args = [task.id, task.version, action.version, action.proposal_hash] as const;
+      if (transition === "submit") await submitAction(...args);
+      else if (transition === "approve") await approveAction(...args);
+      else if (transition === "reject") await rejectAction(...args);
+      else await retryAction(...args);
+      await onRefresh();
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : t("connError"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const delivery = message ? getCollectionDeliveryPresentation(message) : null;
 
   return (
     <div className="flex flex-col rounded-xl border border-sky-800/40 bg-slate-900/80 p-5 shadow-sm transition-shadow">
       {/* Header: Odoo Facts */}
       <div className="mb-4 border-b border-slate-800 pb-4">
+        <div className="mb-3 text-[10px] font-bold uppercase tracking-widest text-sky-400">
+          {t("opConfirmedOdooFacts")}
+        </div>
         <div className="flex items-start justify-between gap-4">
           <div>
             <span className="text-xs font-semibold uppercase tracking-wider text-sky-400/80">
@@ -126,6 +166,102 @@ export function OdooTaskCard({ task, onRefresh }: { task: OperationTask, onRefre
             {task.source_synced_at ? dateFmt.format(new Date(task.source_synced_at)) : "—"}
           </div>
         </div>
+      </div>
+
+      <div className="mb-4 rounded-xl border border-indigo-800/40 bg-indigo-950/20 p-4">
+        <div className="mb-3 flex items-center justify-between gap-3">
+          <div>
+            <h4 className="text-sm font-bold text-indigo-300">{t("opAutomationWorkflow")}</h4>
+            <p className="mt-1 text-xs text-slate-500">{t("opAutomationWorkflowDesc")}</p>
+          </div>
+          {action && (
+            <span className="rounded-full bg-slate-800 px-2 py-1 text-[10px] font-semibold text-slate-300">
+              {t(`opActionState_${action.status}`)}
+            </span>
+          )}
+        </div>
+        {action ? (
+          <div className="space-y-3">
+            <div className="rounded-lg border border-slate-800 bg-slate-950/40 p-3">
+              <div className="text-sm font-semibold text-slate-100">
+                {String(action.proposal.title || t("opAiDraftProposal"))}
+              </div>
+              <div className="mt-1 text-[10px] font-semibold uppercase tracking-wider text-indigo-400">
+                {t("opAiGuidanceNotFact")}
+              </div>
+              {action.proposal.summary && (
+                <p className="mt-2 text-xs leading-6 text-slate-300">
+                  {String(action.proposal.summary)}
+                </p>
+              )}
+              {action.proposal.priority_reason && (
+                <p className="mt-2 text-xs text-amber-300">
+                  {String(action.proposal.priority_reason)}
+                </p>
+              )}
+              <div className="mt-2 text-[10px] text-slate-600" dir="ltr">
+                SHA-256: {action.proposal_hash.slice(0, 12)}…
+              </div>
+            </div>
+            {action.approved_hash && (
+              <div className="rounded-lg border border-emerald-900/50 bg-emerald-950/20 p-3 text-xs">
+                <div className="font-semibold text-emerald-300">{t("opExactApprovalEvidence")}</div>
+                <div className="mt-2 grid gap-1 text-slate-400">
+                  <span dir="ltr">SHA-256: {action.approved_hash.slice(0, 16)}…</span>
+                  {action.approved_at && <span>{t("opApprovedAt")}: {new Date(action.approved_at).toLocaleString(locale === "ar" ? "ar" : "en")}</span>}
+                  {action.approved_by_user_id && <span dir="ltr">{t("opApprovedBy")}: {action.approved_by_user_id}</span>}
+                </div>
+              </div>
+            )}
+            <div className="flex flex-wrap gap-2">
+              {action.status === "proposed" && (
+                <>
+                  <button onClick={() => void handleActionTransition("submit")} disabled={loading}
+                    className="flex-1 rounded-lg bg-sky-600 px-3 py-2 text-xs font-semibold text-white hover:bg-sky-500 disabled:opacity-50">
+                    {t("opSubmitApproval")}
+                  </button>
+                  <button onClick={() => void handleActionGenerate()} disabled={loading}
+                    className="rounded-lg bg-slate-800 px-3 py-2 text-xs text-slate-300 hover:bg-slate-700 disabled:opacity-50">
+                    {t("opRegenerate")}
+                  </button>
+                </>
+              )}
+              {action.status === "awaiting_approval" && (
+                <>
+                  <button onClick={() => void handleActionTransition("approve")} disabled={loading}
+                    className="flex-1 rounded-lg bg-emerald-600 px-3 py-2 text-xs font-semibold text-white hover:bg-emerald-500 disabled:opacity-50">
+                    {t("opApproveAndExecute")}
+                  </button>
+                  <button onClick={() => void handleActionTransition("reject")} disabled={loading}
+                    className="flex-1 rounded-lg bg-rose-900/50 px-3 py-2 text-xs font-semibold text-rose-300 hover:bg-rose-800 disabled:opacity-50">
+                    {t("opReject")}
+                  </button>
+                </>
+              )}
+              {["queued", "executing", "verifying"].includes(action.status) && (
+                <div className="flex-1 rounded-lg border border-amber-900/40 bg-amber-950/20 px-3 py-2 text-center text-xs font-semibold text-amber-300">
+                  {t("opExecuting")}
+                </div>
+              )}
+              {action.status === "succeeded" && (
+                <div className="flex-1 rounded-lg border border-emerald-900/40 bg-emerald-950/20 px-3 py-2 text-xs font-semibold text-emerald-300">
+                  {t("opVerifiedOdooReceipt")} · #{action.external_activity_id}
+                </div>
+              )}
+              {action.status === "failed" && (
+                <button onClick={() => void handleActionTransition("retry")} disabled={loading || action.approved_hash !== action.proposal_hash}
+                  className="flex-1 rounded-lg bg-amber-600 px-3 py-2 text-xs font-semibold text-white hover:bg-amber-500 disabled:opacity-50">
+                  {t("opRetryExact")}
+                </button>
+              )}
+            </div>
+          </div>
+        ) : (
+          <button onClick={() => void handleActionGenerate()} disabled={loading}
+            className="w-full rounded-lg bg-indigo-600 px-3 py-2 text-xs font-semibold text-white hover:bg-indigo-500 disabled:opacity-50">
+            {loading ? t("opGenerating") : t("opGenerateAI")}
+          </button>
+        )}
       </div>
 
       {/* Arabic AI draft and the separately identified, hash-bound approved snapshot. */}

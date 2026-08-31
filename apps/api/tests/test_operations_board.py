@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from app.core.security import create_session_token
 from app.main import app
-from app.models import OperationsTask, Tenant, TenantMembership, User
+from app.models import AuditLog, OperationsTask, Tenant, TenantMembership, User
 from tests.test_auth_security import TestingSession
 
 INTERNAL_TOKEN = os.environ["SESSION_SECRET"]
@@ -86,6 +86,15 @@ def _client_for(user: User, tenant_id: uuid.UUID) -> TestClient:
     return client
 
 
+def _action_headers(client: TestClient) -> dict[str, str]:
+    token = "operations-board-csrf"
+    client.cookies.set("modeem_csrf", token)
+    return {
+        "X-Internal-Token": INTERNAL_TOKEN,
+        "X-CSRF-Token": token,
+    }
+
+
 def test_board_aggregates_only_assigned_associations(operations_seed) -> None:
     user, tenants, _hidden = operations_seed
     response = _client_for(user, tenants[0].id).get(
@@ -135,3 +144,117 @@ def test_board_requires_internal_token_and_user_session(operations_seed) -> None
         .status_code
         == 401
     )
+
+
+def test_board_task_actions_update_summary_and_record_safe_audit(operations_seed) -> None:
+    user, tenants, _hidden = operations_seed
+    client = _client_for(user, tenants[0].id)
+    headers = _action_headers(client)
+    board = client.get(
+        "/api/v1/operations/board", headers={"X-Internal-Token": INTERNAL_TOKEN}
+    ).json()
+    upcoming = next(item for item in board["items"] if item["status"] == "upcoming")
+
+    completed = client.post(
+        f"/api/v1/operations/board/tasks/{upcoming['id']}/complete",
+        json={"expected_version": upcoming["version"]},
+        headers=headers,
+    )
+    assert completed.status_code == 200
+    assert completed.json()["status"] == "completed"
+    assert completed.json()["available_actions"] == ["submit_for_approval"]
+
+    submitted = client.post(
+        f"/api/v1/operations/board/tasks/{upcoming['id']}/submit_for_approval",
+        json={"expected_version": completed.json()["version"]},
+        headers=headers,
+    )
+    assert submitted.status_code == 200
+    assert submitted.json()["status"] == "awaiting_approval"
+    assert submitted.json()["approval_state"] == "pending"
+
+    approved = client.post(
+        f"/api/v1/operations/board/tasks/{upcoming['id']}/approve",
+        json={"expected_version": submitted.json()["version"], "note": "Reviewed"},
+        headers=headers,
+    )
+    assert approved.status_code == 200
+    assert approved.json()["approval_state"] == "approved"
+    assert approved.json()["available_actions"] == []
+
+    refreshed = client.get(
+        "/api/v1/operations/board", headers={"X-Internal-Token": INTERNAL_TOKEN}
+    ).json()
+    assert refreshed["summary"]["total_active"] == board["summary"]["total_active"] - 1
+
+    db = TestingSession()
+    audit_rows = (
+        db.query(AuditLog)
+        .filter(AuditLog.resource_id == upcoming["id"])
+        .order_by(AuditLog.created_at)
+        .all()
+    )
+    assert [row.action for row in audit_rows] == [
+        "operations_board.task_complete",
+        "operations_board.task_submit_for_approval",
+        "operations_board.task_approve",
+    ]
+    assert all(row.tenant_id == uuid.UUID(upcoming["tenant_id"]) for row in audit_rows)
+    assert all(row.actor_id == str(user.id) for row in audit_rows)
+    assert "Reviewed" not in str([row.metadata_json for row in audit_rows])
+    db.close()
+
+
+def test_board_rejection_intervention_and_cross_tenant_guards(operations_seed) -> None:
+    user, tenants, hidden_tenant = operations_seed
+    client = _client_for(user, tenants[0].id)
+    headers = _action_headers(client)
+    board = client.get(
+        "/api/v1/operations/board", headers={"X-Internal-Token": INTERNAL_TOKEN}
+    ).json()
+    awaiting = next(item for item in board["items"] if item["status"] == "awaiting_approval")
+    overdue = next(item for item in board["items"] if item["status"] == "overdue")
+
+    missing_reason = client.post(
+        f"/api/v1/operations/board/tasks/{awaiting['id']}/reject",
+        json={"expected_version": awaiting["version"]},
+        headers=headers,
+    )
+    assert missing_reason.status_code == 422
+    rejected = client.post(
+        f"/api/v1/operations/board/tasks/{awaiting['id']}/reject",
+        json={"expected_version": awaiting["version"], "note": "Needs correction"},
+        headers=headers,
+    )
+    assert rejected.status_code == 200
+    assert rejected.json()["status"] == "needs_intervention"
+    assert rejected.json()["approval_state"] == "rejected"
+
+    intervened = client.post(
+        f"/api/v1/operations/board/tasks/{overdue['id']}/record_intervention",
+        json={"expected_version": overdue["version"], "note": "Called the association"},
+        headers=headers,
+    )
+    assert intervened.status_code == 200
+    assert intervened.json()["status"] == "needs_intervention"
+
+    db = TestingSession()
+    hidden_id = str(
+        db.query(OperationsTask.id)
+        .filter(OperationsTask.tenant_id == hidden_tenant.id)
+        .scalar()
+    )
+    db.close()
+    hidden = client.post(
+        f"/api/v1/operations/board/tasks/{hidden_id}/complete",
+        json={"expected_version": 1},
+        headers=headers,
+    )
+    assert hidden.status_code == 404
+
+    stale = client.post(
+        f"/api/v1/operations/board/tasks/{overdue['id']}/complete",
+        json={"expected_version": overdue["version"]},
+        headers=headers,
+    )
+    assert stale.status_code == 409

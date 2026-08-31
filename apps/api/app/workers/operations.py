@@ -2,11 +2,18 @@
 
 import json
 import time
+import uuid
 from datetime import UTC, datetime
 
 from pydantic import ValidationError
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
+from app.content_manager.provider import (
+    OpenAICompatibleProvider,
+    ProviderFailureError,
+    ProviderUnavailableError,
+)
 from app.core.config import get_settings
 from app.db.base import get_session_factory
 from app.integrations.odoo.activity_writer import create_invoice_activity
@@ -25,12 +32,21 @@ from app.models import (
     OperationTask,
     User,
 )
-from app.operations.ai_proposal import InvoiceActivityProposal, canonical_proposal
+from app.operations.ai_proposal import (
+    InvoiceActivityProposal,
+    canonical_proposal,
+    executable_invoice_activity_proposal,
+)
+from app.operations.automation_catalog import effective_config
 from app.operations.collection_message import (
     canonical_collection_message,
     canonical_collection_source_identity,
 )
 from app.operations.odoo_sync import scan_overdue_invoices
+from app.operations.proposals import (
+    OperationsProposalService,
+    invoice_summary_from_snapshot,
+)
 from app.operations.recurring import generate_occurrences
 from app.services.audit import record_audit
 from app.services.connection_auth import AuthMaterialError, resolve_auth_material
@@ -39,6 +55,152 @@ from app.services.credential_crypto import (
     EncryptionConfigError,
     decrypt_credentials,
 )
+
+_AI_AUTOMATION_RETRY_AFTER = 0.0
+
+
+def generate_missing_ai_proposals_once() -> int:
+    """Prepare and submit bounded AI proposals for new overdue-invoice tasks."""
+    global _AI_AUTOMATION_RETRY_AFTER
+
+    if time.monotonic() < _AI_AUTOMATION_RETRY_AFTER:
+        return 0
+    session = get_session_factory()()
+    generated = 0
+    try:
+        if (
+            session.bind
+            and session.bind.dialect.name == "postgresql"
+            and not session.execute(text("SELECT pg_try_advisory_xact_lock(810006)")).scalar()
+        ):
+            return 0
+        tasks = (
+            session.query(OperationTask)
+            .outerjoin(
+                OperationAction,
+                (OperationAction.task_id == OperationTask.id)
+                & (OperationAction.tenant_id == OperationTask.tenant_id),
+            )
+            .filter(
+                OperationTask.source_type == "odoo",
+                OperationTask.source_signal == "overdue_customer_invoice",
+                OperationTask.source_record_id.is_not(None),
+                OperationTask.source_snapshot_json.is_not(None),
+                OperationAction.id.is_(None),
+            )
+            .order_by(OperationTask.created_at.asc(), OperationTask.id.asc())
+            .limit(10)
+            .all()
+        )
+        if not tasks:
+            return 0
+        eligible_tasks: list[tuple[OperationTask, dict[str, object]]] = []
+        for task in tasks:
+            config = effective_config(
+                session, task.tenant_id, "finance.overdue_invoice_followup"
+            )
+            modes = config["step_modes"]
+            assert isinstance(modes, dict)
+            if not config["enabled"] or modes["prepare_draft"] == "manual":
+                continue
+            eligible_tasks.append((task, config))
+        if not eligible_tasks:
+            return 0
+        try:
+            provider = OpenAICompatibleProvider.from_environment()
+        except ProviderUnavailableError:
+            _AI_AUTOMATION_RETRY_AFTER = time.monotonic() + 300
+            return 0
+        service = OperationsProposalService(provider)
+        for task, config in eligible_tasks:
+            modes = config["step_modes"]
+            assert isinstance(modes, dict)
+            try:
+                snapshot = json.loads(task.source_snapshot_json or "")
+                summary, company_id, activity_type_id = invoice_summary_from_snapshot(
+                    tenant_id=task.tenant_id,
+                    snapshot=snapshot,
+                    as_of_date=datetime.now(UTC).date(),
+                )
+                draft = service.propose(tenant_id=task.tenant_id, summary=summary)
+                proposal = executable_invoice_activity_proposal(
+                    draft,
+                    company_id=company_id,
+                    invoice_id=task.source_record_id,
+                    activity_type_id=activity_type_id,
+                )
+                payload, digest = canonical_proposal(proposal)
+            except ProviderFailureError:
+                _AI_AUTOMATION_RETRY_AFTER = time.monotonic() + 300
+                break
+            except (ValidationError, ValueError, TypeError, json.JSONDecodeError):
+                continue
+
+            action = OperationAction(
+                tenant_id=task.tenant_id,
+                task_id=task.id,
+                proposal_json=payload,
+                proposal_hash=digest,
+                status="proposed",
+                version=1,
+                idempotency_marker=uuid.uuid4().hex,
+                workflow_key="finance.overdue_invoice_followup",
+                workflow_config_version=config["version"],
+            )
+            try:
+                with session.begin_nested():
+                    session.add(action)
+                    session.flush()
+            except IntegrityError:
+                # The API or another safe generator won the race. The unique
+                # task constraint remains the final idempotency boundary.
+                continue
+            session.add(
+                OperationActionHistory(
+                    action_id=action.id,
+                    task_id=task.id,
+                    tenant_id=task.tenant_id,
+                    actor_type="system",
+                    actor_id="operations-automation",
+                    event="generated",
+                    version=action.version,
+                    status=action.status,
+                    proposal_hash=action.proposal_hash,
+                    detail="automatic",
+                )
+            )
+            if modes["submit_for_approval"] == "automatic":
+                action.status = "awaiting_approval"
+                action.version += 1
+                session.add(
+                    OperationActionHistory(
+                        action_id=action.id,
+                        task_id=task.id,
+                        tenant_id=task.tenant_id,
+                        actor_type="system",
+                        actor_id="operations-automation",
+                        event="submitted",
+                        version=action.version,
+                        status=action.status,
+                        proposal_hash=action.proposal_hash,
+                        detail="automatic",
+                    )
+                )
+            record_audit(
+                session,
+                action="operation_action.automated_proposal_ready",
+                actor_type="system",
+                actor_id="operations-automation",
+                tenant_id=task.tenant_id,
+                resource_type="operation_action",
+                resource_id=str(action.id),
+                metadata={"proposal_hash": digest},
+            )
+            generated += 1
+        session.commit()
+        return generated
+    finally:
+        session.close()
 
 
 def run_queued_actions_once() -> int:
@@ -102,6 +264,21 @@ def run_queued_actions_once() -> int:
                 or task.source_record_id is None
             ):
                 _fail_action(session, action, "source_validation_failed")
+                continue
+            # Older queued records predate workflow metadata.  They are treated
+            # as the fixed invoice workflow but have no historical version to
+            # compare, preserving approved work while still honoring a disable.
+            workflow_key = action.workflow_key or "finance.overdue_invoice_followup"
+            try:
+                config = effective_config(session, action.tenant_id, workflow_key)
+            except ValueError:
+                _fail_action(session, action, "workflow_config_invalid")
+                continue
+            if not config["enabled"] or (
+                action.workflow_config_version is not None
+                and action.workflow_config_version != config["version"]
+            ):
+                _fail_action(session, action, "workflow_config_changed")
                 continue
             if (
                 not conn.is_active
@@ -462,6 +639,7 @@ def scan_connections_once() -> int:
 
 def main() -> None:
     while True:
+        generate_missing_ai_proposals_once()
         run_queued_actions_once()
         run_queued_collection_messages_once()
         scan_connections_once()

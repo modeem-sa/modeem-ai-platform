@@ -5,7 +5,7 @@ no Odoo client, persistence, approval, or execution capability.
 """
 
 from datetime import date, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -55,6 +55,51 @@ class OverdueInvoiceSummary(BaseModel):
             "total_overdue": format(self.total_overdue, "f"),
             "oldest_days_overdue": self.oldest_days_overdue,
         }
+
+
+def invoice_summary_from_snapshot(
+    *,
+    tenant_id: UUID,
+    snapshot: object,
+    as_of_date: date,
+) -> tuple[OverdueInvoiceSummary, int, int]:
+    """Build the bounded AI aggregate and server-owned targets from a trusted snapshot."""
+    if not isinstance(snapshot, dict):
+        raise TypeError("invalid snapshot")
+    company_id = snapshot.get("company_id")
+    activity_type_id = snapshot.get("activity_type_id", 1)
+    currency = snapshot.get("currency")
+    due_date = snapshot.get("due_date")
+    residual = snapshot.get("residual")
+    if (
+        isinstance(company_id, bool)
+        or not isinstance(company_id, int)
+        or company_id < 1
+        or isinstance(activity_type_id, bool)
+        or not isinstance(activity_type_id, int)
+        or activity_type_id < 1
+        or not isinstance(currency, str)
+    ):
+        raise ValueError("invalid snapshot")
+    try:
+        due = date.fromisoformat(str(due_date))
+        amount = Decimal(str(residual))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise ValueError("invalid snapshot") from exc
+    overdue_days = (as_of_date - due).days
+    return (
+        OverdueInvoiceSummary(
+            tenant_id=tenant_id,
+            as_of_date=as_of_date,
+            currency=currency,
+            invoice_count=1,
+            customers_affected=1,
+            total_overdue=amount,
+            oldest_days_overdue=overdue_days,
+        ),
+        company_id,
+        activity_type_id,
+    )
 
 
 class _ModelProposal(BaseModel):

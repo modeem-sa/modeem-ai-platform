@@ -58,11 +58,15 @@ def test_registry_contains_exactly_approved_resources():
         "installed_modules",
         "companies",
         "employees_summary",
+        "attendance_summary",
+        "leaves_summary",
+        "payroll_summary",
         "departments_summary",
         "vendor_bills",
         "payments_summary",
         "journals_summary",
         "accounting_entries",
+        "journal_entries",
         "journal_items",
     }
 
@@ -512,11 +516,15 @@ def test_only_approved_resources_are_registered():
         "installed_modules",
         "companies",
         "employees_summary",
+        "attendance_summary",
+        "leaves_summary",
+        "payroll_summary",
         "departments_summary",
         "vendor_bills",
         "payments_summary",
         "journals_summary",
         "accounting_entries",
+        "journal_entries",
         "journal_items",
     ]
     policy = READ_POLICIES["countries"]
@@ -527,11 +535,15 @@ def test_only_approved_resources_are_registered():
 def test_operational_resources_require_expected_modules_and_company_scope():
     expected = {
         "employees_summary": "hr",
+        "attendance_summary": "hr_attendance",
+        "leaves_summary": "hr_holidays",
+        "payroll_summary": "hr_payroll",
         "departments_summary": "hr",
         "vendor_bills": "account",
         "payments_summary": "account",
         "journals_summary": "account",
         "accounting_entries": "account",
+        "journal_entries": "account",
         "journal_items": "account",
     }
     for resource, module in expected.items():
@@ -566,7 +578,18 @@ def test_employee_preview_checks_module_and_enforces_company_domain(fake_odoo):
     assert execs[1][3] == "hr.employee"
     assert ["company_id", "=", 15] in execs[1][5][0]
 
-
+def test_hr_review_resources_are_bounded_company_scoped_summaries():
+    expected = {
+        "attendance_summary": "hr.attendance",
+        "leaves_summary": "hr.leave",
+        "payroll_summary": "hr.payslip",
+    }
+    for resource, model in expected.items():
+        policy = READ_POLICIES[resource]
+        assert policy.odoo_model == model
+        assert policy.requires_company_scope is True
+        assert "employee_id" in policy.allowed_filter_fields
+        assert "company_id" in policy.allowed_fields
 def test_missing_required_module_rejected_safely(fake_odoo, monkeypatch):
     from app.integrations.odoo.reader import ResourceUnavailableError
 
@@ -679,3 +702,16 @@ def test_capabilities_json_shape_unchanged(roles_seed):
     conn = db.get(Connection, uuid.UUID(cid))
     assert isinstance(json.loads(conn.capabilities_json), dict)
     db.close()
+
+def test_attendance_employee_and_period_filters_are_server_validated(fake_odoo):
+    _read(
+        resource="attendance_summary",
+        company_id=15,
+        filters=[
+            {"field": "employee_id", "operator": "=", "value": 7},
+            {"field": "check_in", "operator": ">=", "value": "2026-08-01 00:00:00"},
+        ],
+    )
+    execs = [params for method, params in fake_odoo.xmlrpc_calls if method == "execute_kw"]
+    assert ["employee_id", "=", 7] in execs[-1][5][0]
+    assert ["check_in", ">=", "2026-08-01 00:00:00"] in execs[-1][5][0]

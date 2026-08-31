@@ -8,6 +8,7 @@
 """
 
 import uuid
+from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
@@ -36,7 +37,12 @@ from app.schemas.connections import (
     ConnectionUpdate,
     validate_base_url,
 )
-from app.schemas.odoo_read import ReadPreviewRequest, ReadPreviewResponse
+from app.schemas.odoo_read import (
+    FinancialReadRequest,
+    FinancialReadResponse,
+    ReadPreviewRequest,
+    ReadPreviewResponse,
+)
 from app.services.audit import record_audit
 from app.services.connection_auth import AuthMaterialError, resolve_auth_material
 from app.services.credential_crypto import (
@@ -49,6 +55,7 @@ from app.services.credential_crypto import (
 router = APIRouter(prefix="/api/v1")
 
 _WRITE_ROLES = ("owner", "admin")
+_READ_PREVIEW_ROLES = ("owner", "admin", "manager")
 
 
 def _to_out(conn: Connection) -> ConnectionOut:
@@ -497,15 +504,17 @@ def test_connection(
 def read_preview(
     connection_id: uuid.UUID,
     body: ReadPreviewRequest,
-    ctx: TenantContext = Depends(require_role(*_WRITE_ROLES)),
+    ctx: TenantContext = Depends(require_role(*_READ_PREVIEW_ROLES)),
     actor: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ReadPreviewResponse:
     """Policy-driven READ-ONLY preview of ONE bounded page. POST is used
     intentionally so filters never appear in URLs. Owner/admin only in
-    Phase 2D. No Odoo record is ever persisted locally."""
+    Managers may review data while connection configuration remains restricted
+    to owners/admins. No Odoo record is ever persisted locally."""
     from app.integrations.odoo import reader as odoo_reader
     from app.integrations.odoo.errors import ConnectorError
+    from app.integrations.odoo.read_policies import get_policy
     from app.integrations.odoo.reader import ReadPolicyError, ResourceUnavailableError
 
     conn = _scoped_get(db, ctx, connection_id)
@@ -532,6 +541,20 @@ def read_preview(
             status_code=status.HTTP_409_CONFLICT,
             detail="Connection must be re-tested before data preview",
         )
+    policy = get_policy(body.resource)
+    resolved_company_id = body.company_id
+    if policy is not None and policy.requires_company_scope:
+        if conn.odoo_company_id is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Connection has no configured Odoo company",
+            )
+        if body.company_id is not None and body.company_id != conn.odoo_company_id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="company_id must match the configured Odoo company",
+            )
+        resolved_company_id = conn.odoo_company_id
 
     try:
         credentials = decrypt_credentials(
@@ -603,7 +626,7 @@ def read_preview(
             offset=body.offset,
             order_by=body.order_by,
             order_direction=body.order_direction,
-            company_id=body.company_id,
+            company_id=resolved_company_id,
         )
     except ReadPolicyError as exc:
         # Modeem-side policy violation: safe static message, never sent
@@ -631,7 +654,135 @@ def read_preview(
     db.flush()
     return ReadPreviewResponse(**page)
 
+@router.post(
+    "/connections/{connection_id}/financial-read",
+    response_model=FinancialReadResponse,
+    dependencies=[Depends(require_csrf)],
+)
+def financial_read(
+    connection_id: uuid.UUID,
+    body: FinancialReadRequest,
+    ctx: TenantContext = Depends(get_current_tenant),
+    actor: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> FinancialReadResponse:
+    """Employee-facing, bounded financial read.
 
+    The resource allowlist is narrower than read-preview and the Odoo company
+    scope always comes from the tenant-scoped connection, never the browser.
+    """
+    from app.integrations.odoo import reader as odoo_reader
+    from app.integrations.odoo.errors import ConnectorError
+    from app.integrations.odoo.reader import ReadPolicyError, ResourceUnavailableError
+
+    conn = _scoped_get(db, ctx, connection_id)
+    if (
+        not conn.is_active
+        or conn.status == "disabled"
+        or conn.provider != "odoo"
+        or conn.last_test_status != "success"
+        or conn.selected_transport not in ("xmlrpc", "json2")
+        or conn.encrypted_credentials is None
+        or conn.encryption_version is None
+        or conn.odoo_company_id is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Connection is not ready for financial reading",
+        )
+
+    try:
+        credentials = decrypt_credentials(
+            conn.encrypted_credentials,
+            tenant_id=conn.tenant_id,
+            connection_id=conn.id,
+            encryption_version=conn.encryption_version,
+        )
+        auth = resolve_auth_material(conn.username, credentials)
+    except EncryptionConfigError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
+    except (CredentialDecryptionError, AuthMaterialError) as exc:
+        detail = (
+            exc.message
+            if isinstance(exc, AuthMaterialError)
+            else "Stored credentials cannot be decrypted"
+        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail) from exc
+    finally:
+        if "credentials" in locals():
+            del credentials
+
+    def _audit(success: bool, returned_count: int | None, error_code: str | None) -> None:
+        record_audit(
+            db,
+            action=(
+                "connection.financial_read_succeeded"
+                if success
+                else "connection.financial_read_failed"
+            ),
+            actor_type="user",
+            actor_id=str(actor.id),
+            tenant_id=ctx.tenant.id,
+            resource_type="connection",
+            resource_id=str(conn.id),
+            metadata={
+                "resource": body.resource,
+                "company_id": conn.odoo_company_id,
+                "requested_limit": body.limit,
+                "offset": body.offset,
+                "filter_count": len(body.filters or []),
+                "returned_count": returned_count,
+                "error_code": error_code,
+            },
+        )
+
+    try:
+        page = odoo_reader.read_page(
+            base_url=conn.base_url,
+            database=conn.database_name,
+            transport=conn.selected_transport,
+            login=auth.login,
+            secret=auth.secret,
+            environment=get_settings().environment,
+            resource=body.resource,
+            filters=[item.model_dump() for item in body.filters] if body.filters else None,
+            limit=body.limit,
+            offset=body.offset,
+            order_by=body.order_by,
+            order_direction=body.order_direction,
+            company_id=conn.odoo_company_id,
+        )
+    except ReadPolicyError as exc:
+        _audit(False, None, "policy_violation")
+        db.flush()
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=exc.message
+        ) from exc
+    except ResourceUnavailableError as exc:
+        _audit(False, None, "resource_unavailable")
+        db.flush()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.message) from exc
+    except ConnectorError as exc:
+        _audit(False, None, exc.code)
+        db.flush()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error_code": exc.code},
+        ) from exc
+    finally:
+        del auth
+
+    read_at = datetime.now(UTC)
+    _audit(True, page["returned_count"], None)
+    db.flush()
+    return FinancialReadResponse(
+        **page,
+        source_name=conn.name,
+        source_company_id=conn.odoo_company_id,
+        read_at=read_at,
+    )
 @router.post("/connections/{connection_id}/sync-overdue-invoices", dependencies=[Depends(require_csrf)])
 def sync_overdue_invoices(
     connection_id: uuid.UUID,

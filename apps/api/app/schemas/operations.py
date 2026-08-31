@@ -1,12 +1,12 @@
 """Request and response schemas for operations tasks."""
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-TaskCategory = Literal["administrative", "financial"]
+TaskCategory = Literal["administrative", "financial", "human_resources"]
 TaskPriority = Literal["low", "medium", "high", "urgent"]
 TaskStatus = Literal[
     "pending", "in_progress", "completed", "submitted_for_approval", "approved", "rejected"
@@ -18,8 +18,43 @@ class OperationTaskCreate(BaseModel):
     title: str = Field(min_length=1, max_length=255)
     description: str | None = Field(default=None, max_length=10000)
     category: TaskCategory
+    procedure_type: str | None = Field(default=None, min_length=1, max_length=64)
+    request_data: dict[str, str] | None = None
     priority: TaskPriority
     due_at: datetime | None = None
+    assigned_user_id: uuid.UUID | None = None
+
+    @field_validator("request_data")
+    @classmethod
+    def validate_request_data(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        if value is None:
+            return None
+        if len(value) > 12:
+            raise ValueError("Request data cannot contain more than 12 fields")
+        for key, item in value.items():
+            if not key or len(key) > 64 or len(item) > 1000:
+                raise ValueError("Request data contains an invalid field")
+        return value
+
+
+class HrReviewTaskCreate(BaseModel):
+    # UUIDs and dates arrive as JSON strings; field bounds still reject
+    # malformed identifiers and non-positive numeric references.
+    model_config = ConfigDict(extra="forbid")
+
+    tenant_id: uuid.UUID
+    connection_id: uuid.UUID
+    resource: Literal[
+        "employees_summary",
+        "attendance_summary",
+        "leaves_summary",
+        "payroll_summary",
+    ]
+    record_id: int = Field(ge=1)
+    employee_id: int | None = Field(default=None, ge=1)
+    date_from: date | None = None
+    date_to: date | None = None
+    priority: TaskPriority = "medium"
     assigned_user_id: uuid.UUID | None = None
 
 
@@ -53,6 +88,8 @@ class OperationActionOut(BaseModel):
     error: str | None
     external_activity_id: int | None
     verified_at: datetime | None
+    workflow_key: str | None
+    workflow_config_version: int | None
 
 
 class CollectionMessageGenerateRequest(BaseModel):
@@ -102,6 +139,8 @@ class OperationTaskOut(BaseModel):
     title: str
     description: str | None
     category: TaskCategory
+    procedure_type: str | None
+    request_data: dict[str, str] | None
     priority: TaskPriority
     status: TaskStatus
     assigned_user_id: uuid.UUID | None

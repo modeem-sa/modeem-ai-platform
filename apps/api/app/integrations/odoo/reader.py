@@ -16,7 +16,7 @@ Odoo record is persisted locally.
 """
 
 import re
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from . import http as safe_http
@@ -109,8 +109,22 @@ def _validate_typed_scalar(field_policy: ReadFieldPolicy, value: Any) -> Any:
         except ValueError as exc:
             raise ReadPolicyError("filter value has invalid format") from exc
         return value
+    if kind == "datetime":
+        if not isinstance(value, str):
+            raise ReadPolicyError("filter value type mismatch")
+        try:
+            datetime.fromisoformat(value.replace(" ", "T"))
+        except ValueError as exc:
+            raise ReadPolicyError("filter value has invalid format") from exc
+        return value
     if kind == "many2one":
-        raise ReadPolicyError("relational filters are not supported")
+        # Odoo many2one domains accept the related integer id. The response
+        # shape remains the strictly validated [id, display_name] pair.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ReadPolicyError("filter value type mismatch")
+        if value < field_policy.min_value or value > field_policy.max_value:
+            raise ReadPolicyError("filter value out of range")
+        return value
     raise ReadPolicyError("unsupported filter value type")
 
 
@@ -136,6 +150,13 @@ def _validate_filters(
         field_policy = policy.fields.get(fld)
         if field_policy is None:
             raise ReadPolicyError("filter field not allowed")
+        if op in (">=", "<=") and field_policy.value_type not in (
+            "integer",
+            "number",
+            "date",
+            "datetime",
+        ):
+            raise ReadPolicyError("range operator is not valid for this field")
         if op == "in":
             if not isinstance(value, list) or not value:
                 raise ReadPolicyError("'in' filter requires a non-empty list")
@@ -207,6 +228,17 @@ def _sanitize_output_value(field_policy: ReadFieldPolicy, value: Any) -> Any:
         except ValueError as exc:
             raise ConnectorError(
                 "unsupported_response", "invalid date value"
+            ) from exc
+    elif kind == "datetime":
+        if not isinstance(value, str):
+            raise ConnectorError("unsupported_response", "field type mismatch")
+        if len(value) > 32:
+            raise ConnectorError("unsupported_response", "field value too long")
+        try:
+            datetime.fromisoformat(value.replace(" ", "T"))
+        except ValueError as exc:
+            raise ConnectorError(
+                "unsupported_response", "invalid datetime value"
             ) from exc
     elif kind == "many2one":
         if (

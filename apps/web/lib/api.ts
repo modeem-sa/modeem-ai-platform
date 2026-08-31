@@ -24,6 +24,11 @@ export class ApiError extends Error {
 
 function apiErrorDetail(detail: unknown): string | null {
   if (typeof detail === "string") return detail;
+  if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+    const item = detail as { error_code?: unknown; message?: unknown };
+    if (typeof item.error_code === "string") return item.error_code;
+    if (typeof item.message === "string") return item.message;
+  }
   if (!Array.isArray(detail)) return null;
 
   const messages = detail.flatMap((issue) => {
@@ -224,10 +229,20 @@ export interface OperationsTask {
   due_at: string;
   assignee_name: string;
   source: string;
+  version: number;
+  approval_state: "none" | "pending" | "approved" | "rejected";
+  last_note: string | null;
+  available_actions: OperationsTaskAction[];
 }
 
 export type OperationsPriority = "urgent" | "high" | "normal";
 
+export type OperationsTaskAction =
+  | "complete"
+  | "submit_for_approval"
+  | "approve"
+  | "reject"
+  | "record_intervention";
 export interface OperationsBoardResponse {
   items: OperationsTask[];
   total: number;

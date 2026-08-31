@@ -5,6 +5,7 @@ method, domain expression, or raw order string. Structural validation
 lives here; policy-level validation (allowlists) lives in the reader.
 """
 
+from datetime import datetime
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -28,7 +29,7 @@ class ReadFilter(BaseModel):
     model_config = {"extra": "forbid"}
 
     field: str = Field(max_length=64)
-    operator: Literal["=", "!=", "in", "ilike"]
+    operator: Literal["=", "!=", "in", "ilike", ">=", "<="]
     value: _Scalar | list[_Scalar] = Field()
 
 
@@ -56,11 +57,28 @@ class ReadPreviewResponse(BaseModel):
     next_offset: int | None
     transport: str
 
+class FinancialReadRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    resource: Literal["journal_entries", "journal_items", "payments_summary"]
+    filters: list[ReadFilter] | None = Field(default=None, max_length=MAX_FILTERS)
+    limit: int = Field(default=DEFAULT_PAGE_SIZE, ge=1, le=ABSOLUTE_MAX_PAGE_SIZE)
+    offset: int = Field(default=0, ge=0, le=MAX_PREVIEW_OFFSET)
+    order_by: str | None = Field(default=None, max_length=64)
+    order_direction: Literal["asc", "desc"] = "desc"
+
 
 __all__ = [
     "MAX_FILTER_LIST_ITEMS",
     "MAX_FILTER_STRING_LENGTH",
+    "FinancialReadRequest",
+    "FinancialReadResponse",
     "ReadFilter",
     "ReadPreviewRequest",
     "ReadPreviewResponse",
 ]
+
+class FinancialReadResponse(ReadPreviewResponse):
+    source_name: str
+    source_company_id: int
+    read_at: datetime

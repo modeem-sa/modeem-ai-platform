@@ -8,6 +8,7 @@ import { useAuth } from "@/components/auth-provider";
 const items = [
   { href: "/", key: "dashboard" },
   { href: "/operations", key: "operations" },
+  { href: "/hr-review", key: "hrReview" },
   { href: "/connections", key: "connections" },
   { href: "/workflows", key: "workflows" },
   { href: "/executions", key: "executions" },

@@ -19,7 +19,7 @@ from sqlalchemy.orm import Mapped, mapped_column, validates
 
 from app.db.base import Base
 
-TASK_CATEGORIES = ("administrative", "financial")
+TASK_CATEGORIES = ("administrative", "financial", "human_resources")
 TASK_PRIORITIES = ("low", "medium", "high", "urgent")
 TASK_STATUSES = (
     "pending",
@@ -39,7 +39,7 @@ class OperationTask(Base):
     __tablename__ = "operation_tasks"
     __table_args__ = (
         CheckConstraint(
-            "category IN ('administrative', 'financial')",
+            "category IN ('administrative', 'financial', 'human_resources')",
             name="ck_operation_tasks_category",
         ),
         CheckConstraint(
@@ -66,6 +66,8 @@ class OperationTask(Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     category: Mapped[str] = mapped_column(String(32), nullable=False)
+    procedure_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    request_data_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     priority: Mapped[str] = mapped_column(String(16), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     assigned_user_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -199,6 +201,8 @@ class OperationAction(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     external_activity_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    workflow_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    workflow_config_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow)
 

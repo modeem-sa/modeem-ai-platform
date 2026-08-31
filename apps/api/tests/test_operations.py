@@ -266,6 +266,104 @@ def test_bootstrap_superuser_without_membership_can_create_and_assign(seed):
     created = _create(client, seed["tenant_b"], assignee_id)
     assert created.status_code == 201
 
+def test_active_member_can_open_self_assigned_human_resources_request(seed):
+    db = TestingSession()
+    worker = User(
+        email="hr-requester@example.com",
+        full_name="HR Requester",
+        password_hash=hash_password(PASSWORD),
+    )
+    db.add(worker)
+    db.flush()
+    db.add(TenantMembership(tenant_id=seed["tenant_a"], user_id=worker.id, role="member"))
+    db.commit()
+    worker_id = worker.id
+    db.close()
+
+    client = _client()
+    _login(client, "hr-requester@example.com")
+    bootstrap = client.get("/api/v1/operations/bootstrap")
+    assert bootstrap.status_code == 200
+    assert bootstrap.json()["tenants"][0]["can_create"] is True
+    assert bootstrap.json()["tenants"][0]["members"] == []
+
+    response = client.post(
+        "/api/v1/operations/tasks",
+        json={
+            "tenant_id": str(seed["tenant_a"]),
+            "title": "Prepare payroll",
+            "description": "August payroll",
+            "category": "human_resources",
+            "procedure_type": "prepare_payroll",
+            "request_data": {"period": "2026-08", "details": "Review all employees"},
+            "priority": "medium",
+        },
+        headers=_csrf(client),
+    )
+
+    assert response.status_code == 201
+    request = response.json()
+    assert request["assigned_user_id"] == str(worker_id)
+    assert request["created_by_user_id"] == str(worker_id)
+    assert request["category"] == "human_resources"
+    assert request["procedure_type"] == "prepare_payroll"
+    assert request["request_data"]["period"] == "2026-08"
+    assert request["source_type"] == "manual"
+
+def test_hr_review_task_persists_only_server_approved_reference(seed):
+    db = TestingSession()
+    connection = Connection(
+        tenant_id=seed["tenant_a"],
+        name="HR Odoo",
+        provider="odoo",
+        base_url="https://example.odoo.com",
+        status="configured",
+        is_active=True,
+        last_test_status="success",
+        odoo_company_id=15,
+        created_by_user_id=seed["user_a"],
+    )
+    db.add(connection)
+    db.commit()
+    connection_id = connection.id
+    db.close()
+
+    client = _client()
+    _login(client, "a@example.com")
+    payload = {
+        "tenant_id": str(seed["tenant_a"]),
+        "connection_id": str(connection_id),
+        "resource": "payroll_summary",
+        "record_id": 88,
+        "employee_id": 7,
+        "date_from": "2026-08-01",
+        "date_to": "2026-08-31",
+        "priority": "high",
+    }
+    response = client.post(
+        "/api/v1/operations/hr-review-tasks",
+        json=payload,
+        headers=_csrf(client),
+    )
+    assert response.status_code == 201
+    task = response.json()
+    assert task["source_type"] == "odoo"
+    assert task["source_record_id"] == 88
+    assert task["source_snapshot"] == {
+        "resource": "payroll_summary",
+        "record_id": 88,
+        "employee_id": 7,
+        "date_from": "2026-08-01",
+        "date_to": "2026-08-31",
+        "company_id": 15,
+    }
+    assert "salary" not in task["description"].lower()
+    assert client.post(
+        "/api/v1/operations/hr-review-tasks",
+        json={**payload, "description": "Net salary: SECRET"},
+        headers=_csrf(client),
+    ).status_code == 422
+
 
 def _operations_odoo_connection(tenant_id, *, company_id=41):
     db = TestingSession()
@@ -423,3 +521,82 @@ def test_operations_endpoints_hide_cross_tenant_and_allow_superuser(seed, monkey
     response = admin.get(f"/api/v1/operations/catalog?tenant_id={seed['tenant_a']}")
     assert response.status_code == 200
     assert calls and calls[0]["resource"] == "installed_modules"
+
+def test_service_request_contract_rejects_browser_bypass_payloads(seed):
+    client = _client()
+    _login(client, "a@example.com")
+    base = {
+        "tenant_id": str(seed["tenant_a"]),
+        "title": "Prepare payroll",
+        "category": "human_resources",
+        "priority": "medium",
+    }
+
+    cases = [
+        base,
+        {**base, "procedure_type": "prepare_payroll"},
+        {
+            **base,
+            "procedure_type": "prepare_payroll",
+            "request_data": {"period": "2026-08"},
+        },
+        {
+            **base,
+            "procedure_type": "prepare_payroll",
+            "request_data": {
+                "period": "2026-08",
+                "details": "Review payroll",
+                "unexpected": "not allowed",
+            },
+        },
+        {
+            **base,
+            "procedure_type": "review_journal_entry",
+            "request_data": {
+                "reference": "JV-1",
+                "period": "2026-08",
+                "details": "Review entry",
+            },
+        },
+    ]
+
+    for payload in cases:
+        response = client.post(
+            "/api/v1/operations/tasks",
+            json=payload,
+            headers=_csrf(client),
+        )
+        assert response.status_code == 422
+
+def test_hr_review_task_rejects_cross_tenant_connection(seed):
+    db = TestingSession()
+    connection = Connection(
+        tenant_id=seed["tenant_b"],
+        name="Foreign HR Odoo",
+        provider="odoo",
+        base_url="https://example.odoo.com",
+        status="configured",
+        is_active=True,
+        last_test_status="success",
+        odoo_company_id=99,
+        created_by_user_id=seed["user_b"],
+    )
+    db.add(connection)
+    db.commit()
+    connection_id = connection.id
+    db.close()
+
+    client = _client()
+    _login(client, "a@example.com")
+    response = client.post(
+        "/api/v1/operations/hr-review-tasks",
+        json={
+            "tenant_id": str(seed["tenant_a"]),
+            "connection_id": str(connection_id),
+            "resource": "employees_summary",
+            "record_id": 1,
+            "priority": "medium",
+        },
+        headers=_csrf(client),
+    )
+    assert response.status_code == 404

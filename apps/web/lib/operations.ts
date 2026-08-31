@@ -1,7 +1,7 @@
 import { apiFetch } from "./api.ts";
 
 export type OpStatus = 'pending' | 'in_progress' | 'completed' | 'submitted_for_approval' | 'approved' | 'rejected';
-export type OpCategory = 'administrative' | 'financial';
+export type OpCategory = 'administrative' | 'financial' | 'human_resources';
 export type OpPriority = 'low' | 'medium' | 'high' | 'urgent';
 export type OpAction = 'start' | 'complete' | 'submit_for_approval' | 'approve' | 'reject';
 
@@ -158,6 +158,8 @@ export interface OperationTask {
   title: string;
   description: string | null;
   category: OpCategory;
+  procedure_type: ProcedureType | null;
+  request_data: Record<string, string> | null;
   priority: OpPriority;
   status: OpStatus;
   assigned_user_id: string | null;
@@ -208,11 +210,39 @@ export interface CreateTaskPayload {
   title: string;
   description?: string;
   category: OpCategory;
+  procedure_type?: ProcedureType;
+  request_data?: Record<string, string>;
   priority: OpPriority;
   due_at?: string;
   assigned_user_id?: string;
 }
 
+export type ProcedureType =
+  | 'review_journal_entry'
+  | 'track_payment'
+  | 'review_expenses'
+  | 'follow_attendance'
+  | 'review_leave'
+  | 'prepare_payroll'
+  | 'prepare_official_letter'
+  | 'organize_contract'
+  | 'update_association_record';
+
+export interface CreateHrReviewTaskPayload {
+  tenant_id: string;
+  connection_id: string;
+  resource:
+    | 'employees_summary'
+    | 'attendance_summary'
+    | 'leaves_summary'
+    | 'payroll_summary';
+  record_id: number;
+  employee_id?: number;
+  date_from?: string;
+  date_to?: string;
+  priority: OpPriority;
+  assigned_user_id?: string;
+}
 export function toTaskDueAt(date: string | undefined): string | undefined {
   if (!date) return undefined;
   if (!/^(?:20\d{2}|2100)-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])$/.test(date)) {
@@ -241,7 +271,7 @@ export function buildOperationsUrl(filters: TaskFilters, limit = 200, offset = 0
   if (filters.priority) params.append("priority", filters.priority);
   if (filters.source_type) params.append("source_type", filters.source_type);
 
-  return `/api/v1/operations/board?${params.toString()}`;
+  return `/api/v1/operations/tasks?${params.toString()}`;
 }
 
 export interface BootstrapMember {
@@ -307,6 +337,41 @@ export interface FinanceReadPayload {
   offset: number;
 }
 
+export type AutomationMode = "automatic" | "approval_required" | "manual";
+
+export interface FinanceAssistantFinding {
+  title: string;
+  evidence: string;
+  severity: "info" | "attention" | "risk";
+}
+
+export interface FinanceAutomationOpportunity {
+  workflow_key:
+    | "monitor_records"
+    | "prepare_follow_up"
+    | "prepare_invoice_activity"
+    | "prepare_collection_draft"
+    | "human_review";
+  title: string;
+  mode: AutomationMode;
+  reason: string;
+}
+
+export interface FinanceAssistantResult {
+  headline: string;
+  summary: string;
+  findings: FinanceAssistantFinding[];
+  automation_opportunities: FinanceAutomationOpportunity[];
+  next_step: string;
+  confidence: number;
+  service: FinanceServiceKey;
+  locale: "ar" | "en";
+  analyzed_count: number;
+  prompt_version: string;
+  prompt_sha256: string;
+  model: string;
+}
+
 export interface FinanceSelectionState {
   tenant_id: string;
   module_key: string;
@@ -355,6 +420,16 @@ export async function readFinanceService(payload: FinanceReadPayload): Promise<F
   });
 }
 
+export async function assistFinanceService(
+  payload: FinanceReadPayload,
+  locale: "ar" | "en",
+): Promise<FinanceAssistantResult> {
+  return apiFetch<FinanceAssistantResult>("/api/v1/operations/finance/assist", {
+    method: "POST",
+    body: JSON.stringify({ ...payload, locale }),
+  });
+}
+
 export async function fetchTasks(filters: TaskFilters): Promise<TasksResponse> {
   return apiFetch<TasksResponse>(buildOperationsUrl(filters));
 }
@@ -366,6 +441,14 @@ export async function createTask(payload: CreateTaskPayload): Promise<OperationT
   });
 }
 
+export async function createHrReviewTask(
+  payload: CreateHrReviewTaskPayload
+): Promise<OperationTask> {
+  return apiFetch<OperationTask>("/api/v1/operations/hr-review-tasks", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
 export async function performTaskAction(
   id: string,
   action: OpAction,
@@ -551,3 +634,212 @@ export async function syncOverdueInvoices(connectionId: string): Promise<{ creat
     method: "POST"
   });
 }
+
+export type ServiceField = {
+  key: string;
+  labelKey: string;
+  placeholderKey: string;
+  required?: boolean;
+  type?: 'text' | 'date' | 'textarea';
+};
+
+export type OdooRelation = [number, string] | null;
+
+export interface FinancialFilter {
+  field: string;
+  operator: "=" | "!=" | "in" | "ilike" | ">=" | "<=";
+  value: string | number | boolean | Array<string | number | boolean>;
+}
+
+export interface FinancialReadPage {
+  resource: FinancialResource;
+  records: FinancialRecord[];
+  limit: number;
+  offset: number;
+  returned_count: number;
+  has_more: boolean;
+  next_offset: number | null;
+  transport: string;
+  source_name: string;
+  source_company_id: number;
+  read_at: string;
+}
+
+export interface FinancialRecord {
+  id: number;
+  name?: string | null;
+  date?: string;
+  ref?: string | null;
+  journal_id?: OdooRelation;
+  move_id?: OdooRelation;
+  account_id?: OdooRelation;
+  partner_id?: OdooRelation;
+  currency_id?: OdooRelation;
+  state?: "draft" | "posted" | "cancel";
+  parent_state?: "draft" | "posted" | "cancel";
+  amount_total_signed?: number;
+  amount?: number;
+  debit?: number;
+  credit?: number;
+  balance?: number;
+  payment_type?: string;
+  partner_type?: string;
+}
+
+export async function fetchFinancialConnections(): Promise<FinancialConnection[]> {
+  return apiFetch<FinancialConnection[]>("/api/v1/connections");
+}
+
+export interface FinancialConnection {
+  id: string;
+  name: string;
+  odoo_company_id: number | null;
+  last_test_status: string | null;
+  selected_transport: string | null;
+  is_active: boolean;
+}
+
+export type FinancialResource = "journal_entries" | "journal_items" | "payments_summary";
+
+export async function fetchFinancialPage(
+  connectionId: string,
+  request: {
+    resource: FinancialResource;
+    filters?: FinancialFilter[];
+    limit?: number;
+    offset?: number;
+    order_by?: string;
+    order_direction?: "asc" | "desc";
+  }
+): Promise<FinancialReadPage> {
+  return apiFetch<FinancialReadPage>(
+    `/api/v1/connections/${connectionId}/financial-read`,
+    { method: "POST", body: JSON.stringify(request) }
+  );
+}
+
+export type ServiceProcedure = {
+  id: ProcedureType;
+  titleKey: string;
+  descriptionKey: string;
+  fields: ServiceField[];
+};
+
+export const SERVICE_CATALOG: ServiceDefinition[] = [
+  {
+    id: 'financial',
+    titleKey: 'serviceFinancial',
+    descriptionKey: 'serviceFinancialDesc',
+    accent: 'emerald',
+    procedures: [
+      {
+        id: 'review_journal_entry',
+        titleKey: 'serviceReviewJournal',
+        descriptionKey: 'serviceReviewJournalDesc',
+        fields: [
+          { key: 'reference', labelKey: 'serviceReference', placeholderKey: 'serviceReferencePlaceholder', required: true },
+          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true },
+          { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
+        ],
+      },
+      {
+        id: 'track_payment',
+        titleKey: 'serviceTrackPayment',
+        descriptionKey: 'serviceTrackPaymentDesc',
+        fields: [
+          { key: 'reference', labelKey: 'serviceReference', placeholderKey: 'serviceReferencePlaceholder', required: true },
+          { key: 'amount', labelKey: 'serviceAmount', placeholderKey: 'serviceAmountPlaceholder' },
+          { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
+        ],
+      },
+      {
+        id: 'review_expenses',
+        titleKey: 'serviceReviewExpenses',
+        descriptionKey: 'serviceReviewExpensesDesc',
+        fields: [
+          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true },
+          { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
+        ],
+      },
+    ],
+  },
+  {
+    id: 'human_resources',
+    titleKey: 'serviceHumanResources',
+    descriptionKey: 'serviceHumanResourcesDesc',
+    accent: 'sky',
+    procedures: [
+      {
+        id: 'follow_attendance',
+        titleKey: 'serviceFollowAttendance',
+        descriptionKey: 'serviceFollowAttendanceDesc',
+        fields: [
+          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true },
+          { key: 'employee', labelKey: 'serviceEmployee', placeholderKey: 'serviceEmployeePlaceholder' },
+          { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
+        ],
+      },
+      {
+        id: 'review_leave',
+        titleKey: 'serviceReviewLeave',
+        descriptionKey: 'serviceReviewLeaveDesc',
+        fields: [
+          { key: 'employee', labelKey: 'serviceEmployee', placeholderKey: 'serviceEmployeePlaceholder', required: true },
+          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true },
+          { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
+        ],
+      },
+      {
+        id: 'prepare_payroll',
+        titleKey: 'servicePreparePayroll',
+        descriptionKey: 'servicePreparePayrollDesc',
+        fields: [
+          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true },
+          { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
+        ],
+      },
+    ],
+  },
+  {
+    id: 'administrative',
+    titleKey: 'serviceAdministrative',
+    descriptionKey: 'serviceAdministrativeDesc',
+    accent: 'violet',
+    procedures: [
+      {
+        id: 'prepare_official_letter',
+        titleKey: 'serviceOfficialLetter',
+        descriptionKey: 'serviceOfficialLetterDesc',
+        fields: [
+          { key: 'recipient', labelKey: 'serviceRecipient', placeholderKey: 'serviceRecipientPlaceholder', required: true },
+          { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
+        ],
+      },
+      {
+        id: 'organize_contract',
+        titleKey: 'serviceOrganizeContract',
+        descriptionKey: 'serviceOrganizeContractDesc',
+        fields: [
+          { key: 'reference', labelKey: 'serviceReference', placeholderKey: 'serviceReferencePlaceholder', required: true },
+          { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
+        ],
+      },
+      {
+        id: 'update_association_record',
+        titleKey: 'serviceUpdateAssociation',
+        descriptionKey: 'serviceUpdateAssociationDesc',
+        fields: [
+          { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
+        ],
+      },
+    ],
+  },
+];
+
+export type ServiceDefinition = {
+  id: OpCategory;
+  titleKey: string;
+  descriptionKey: string;
+  accent: string;
+  procedures: ServiceProcedure[];
+};

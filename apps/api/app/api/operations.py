@@ -1,9 +1,10 @@
 """Cookie-authenticated, membership-scoped operations task lifecycle API."""
 
+import hashlib
 import json
 import uuid
 from datetime import UTC, date, datetime
-from decimal import Decimal, InvalidOperation
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
@@ -19,12 +20,13 @@ from app.content_manager.provider import (
 )
 from app.core.config import get_settings
 from app.integrations.odoo.errors import ConnectorError
-from app.integrations.odoo.reader import ReadPolicyError, ResourceUnavailableError, read_page
 from app.integrations.odoo.invoice_chatter_collection import (
     CollectionMessagePolicyError,
     read_invoice_collection_target,
 )
+from app.integrations.odoo.reader import ReadPolicyError, ResourceUnavailableError, read_page
 from app.models import (
+    AutomationWorkflowOverride,
     CollectionMessage,
     CollectionMessageEvent,
     Connection,
@@ -39,16 +41,30 @@ from app.models import (
 )
 from app.models.operation_task import TASK_CATEGORIES, TASK_PRIORITIES, TASK_STATUSES
 from app.operations.ai_proposal import canonical_proposal, executable_invoice_activity_proposal
+from app.operations.assistant import FinanceAssistantResult, FinanceAssistantService
+from app.operations.automation_catalog import (
+    CATALOG,
+    default_modes,
+    effective_config,
+    get_workflow,
+    serialize_effective,
+    validate_step_modes,
+)
 from app.operations.collection_message import (
     CollectionMessageProposalService,
     canonical_collection_message,
     canonical_collection_source_identity,
 )
-from app.operations.proposals import OperationsProposalService, OverdueInvoiceSummary
+from app.operations.proposals import (
+    OperationsProposalService,
+    OverdueInvoiceSummary,
+    invoice_summary_from_snapshot,
+)
 from app.schemas.operations import (
     CollectionMessageExactRequest,
     CollectionMessageGenerateRequest,
     CollectionMessageOut,
+    HrReviewTaskCreate,
     OperationActionExactRequest,
     OperationActionOut,
     OperationActionRequest,
@@ -88,6 +104,41 @@ _FINANCE_SERVICES = (
     ("invoices", "Invoices"),
     ("vendor_bills", "Vendor bills"),
 )
+_SERVICE_PROCEDURES = {
+    "financial": {
+        "review_journal_entry": (
+            {"reference", "period", "details"},
+            {"reference", "period", "details"},
+        ),
+        "track_payment": (
+            {"reference", "amount", "details"},
+            {"reference", "details"},
+        ),
+        "review_expenses": ({"period", "details"}, {"period", "details"}),
+    },
+    "human_resources": {
+        "follow_attendance": (
+            {"period", "employee", "details"},
+            {"period", "details"},
+        ),
+        "review_leave": (
+            {"employee", "period", "details"},
+            {"employee", "period", "details"},
+        ),
+        "prepare_payroll": ({"period", "details"}, {"period", "details"}),
+    },
+    "administrative": {
+        "prepare_official_letter": (
+            {"recipient", "details"},
+            {"recipient", "details"},
+        ),
+        "organize_contract": (
+            {"reference", "details"},
+            {"reference", "details"},
+        ),
+        "update_association_record": ({"details"}, {"details"}),
+    },
+}
 _AUDIT_ACTIONS = {
     "created": "created",
     "start": "started",
@@ -96,6 +147,12 @@ _AUDIT_ACTIONS = {
     "approve": "approved",
     "reject": "rejected",
     "reopened": "reopened",
+}
+_HR_REVIEW_LABELS = {
+    "employees_summary": "الموظفين",
+    "attendance_summary": "الحضور والانصراف",
+    "leaves_summary": "الإجازات",
+    "payroll_summary": "مسيرات الرواتب",
 }
 
 
@@ -123,6 +180,24 @@ class FinanceReadRequest(BaseModel):
     service: str = Field(max_length=64)
     limit: int = Field(default=25, ge=1, le=50)
     offset: int = Field(default=0, ge=0, le=1000)
+
+
+class FinanceAssistantRequest(FinanceReadRequest):
+    locale: Literal["ar", "en"] = "ar"
+
+
+class AutomationOverrideRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    tenant_id: uuid.UUID
+    enabled: bool
+    step_modes: dict[str, str]
+    expected_version: int = Field(ge=1)
+
+
+class AutomationResetRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    tenant_id: uuid.UUID
+    expected_version: int = Field(ge=1)
 
 
 def _active_tenant_ids(db: Session, user: User) -> list[uuid.UUID]:
@@ -164,6 +239,10 @@ def _role_in_tenant(db: Session, user: User, tenant_id: uuid.UUID) -> str | None
 
 def _is_manager(role: str | None) -> bool:
     return role == "superuser" or role in _MANAGER_ROLES
+
+
+def _can_manage_automation(role: str | None) -> bool:
+    return role in ("superuser", "owner", "admin")
 
 
 def _operations_odoo_connection(
@@ -310,6 +389,12 @@ def _to_out(db: Session, task: OperationTask, user: User) -> OperationTaskOut:
         category=task.category,
         priority=task.priority,
         status=task.status,
+        procedure_type=task.procedure_type,
+        request_data=(
+            json.loads(task.request_data_json)
+            if task.request_data_json
+            else None
+        ),
         assigned_user_id=task.assigned_user_id,
         assignee_name=assignee.full_name if assignee is not None else None,
         created_by_user_id=task.created_by_user_id,
@@ -337,7 +422,8 @@ def _to_out(db: Session, task: OperationTask, user: User) -> OperationTaskOut:
                 approved_hash=action.approved_hash, approved_by_user_id=action.approved_by_user_id,
                 approved_at=action.approved_at, attempt_count=action.attempt_count,
                 error=action.error, external_activity_id=action.external_activity_id,
-                verified_at=action.verified_at,
+                 verified_at=action.verified_at, workflow_key=action.workflow_key,
+                 workflow_config_version=action.workflow_config_version,
             ) if action else None
         ),
         collection_message=(
@@ -453,9 +539,11 @@ def operations_bootstrap(
         )
     tenants: list[OperationTenantBootstrapOut] = []
     for tenant, role in tenant_rows:
-        can_create = _is_manager(role)
+        # Every active member may open a request for an association they serve.
+        # Managers additionally receive the member list for delegation.
+        can_create = True
         members: list[OperationMemberOut] = []
-        if can_create:
+        if _is_manager(role):
             member_rows = (
                 db.query(User, TenantMembership.role)
                 .join(TenantMembership, TenantMembership.user_id == User.id)
@@ -518,6 +606,128 @@ def operations_catalog(
     return {"tenant_id": str(tenant_id), "modules": modules}
 
 
+@router.get("/automation/catalog")
+def automation_catalog(
+    tenant_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Return only fixed server-owned automation definitions and effective settings."""
+    role = _role_in_tenant(db, user, tenant_id)
+    if role is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
+    return {
+        "tenant_id": str(tenant_id),
+        "role": role,
+        "can_manage": _can_manage_automation(role),
+        "workflows": [serialize_effective(effective_config(db, tenant_id, workflow.key)) for workflow in CATALOG],
+    }
+
+
+@router.get("/automation/effective/{workflow_key}")
+@router.get("/automation/workflows/{workflow_key}")
+def automation_effective_config(
+    workflow_key: str,
+    tenant_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    role = _role_in_tenant(db, user, tenant_id)
+    if role is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
+    if get_workflow(workflow_key) is None:
+        raise HTTPException(status_code=404, detail="Automation workflow not found")
+    result = serialize_effective(effective_config(db, tenant_id, workflow_key))
+    result.update({"tenant_id": str(tenant_id), "role": role, "can_manage": _can_manage_automation(role)})
+    return result
+
+
+@router.put("/automation/workflows/{workflow_key}", dependencies=[Depends(require_csrf)])
+def update_automation_override(
+    workflow_key: str,
+    body: AutomationOverrideRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    role = _role_in_tenant(db, user, body.tenant_id)
+    if role is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    if not _can_manage_automation(role):
+        raise HTTPException(status_code=403, detail="Insufficient role")
+    workflow = get_workflow(workflow_key)
+    if workflow is None:
+        raise HTTPException(status_code=404, detail="Automation workflow not found")
+    try:
+        modes = validate_step_modes(workflow, body.step_modes)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    existing = db.query(AutomationWorkflowOverride).filter_by(
+        tenant_id=body.tenant_id, workflow_key=workflow_key
+    ).with_for_update().one_or_none()
+    current_version = existing.version if existing is not None else workflow.version
+    if body.expected_version != current_version:
+        raise HTTPException(status_code=409, detail="Automation workflow has been modified")
+    serialized = json.dumps(modes, sort_keys=True, separators=(",", ":"))
+    if existing is None:
+        existing = AutomationWorkflowOverride(
+            tenant_id=body.tenant_id, workflow_key=workflow_key, enabled=body.enabled,
+            step_modes_json=serialized, version=current_version + 1, updated_by_user_id=user.id,
+        )
+        db.add(existing)
+    else:
+        existing.enabled, existing.step_modes_json = body.enabled, serialized
+        existing.updated_by_user_id, existing.version = user.id, existing.version + 1
+    db.flush()
+    record_audit(db, action="automation_workflow.updated", actor_type="user", actor_id=str(user.id),
+                 tenant_id=body.tenant_id, resource_type="automation_workflow", resource_id=workflow_key,
+                 metadata={"version": existing.version, "enabled": existing.enabled})
+    result = serialize_effective(effective_config(db, body.tenant_id, workflow_key))
+    result.update({"tenant_id": str(body.tenant_id), "role": role, "can_manage": True})
+    db.commit()
+    return result
+
+
+@router.post("/automation/workflows/{workflow_key}/reset", dependencies=[Depends(require_csrf)])
+def reset_automation_override(
+    workflow_key: str,
+    body: AutomationResetRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    role = _role_in_tenant(db, user, body.tenant_id)
+    if role is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    if not _can_manage_automation(role):
+        raise HTTPException(status_code=403, detail="Insufficient role")
+    workflow = get_workflow(workflow_key)
+    if workflow is None:
+        raise HTTPException(status_code=404, detail="Automation workflow not found")
+    existing = db.query(AutomationWorkflowOverride).filter_by(
+        tenant_id=body.tenant_id, workflow_key=workflow_key
+    ).with_for_update().one_or_none()
+    current_version = existing.version if existing is not None else workflow.version
+    if body.expected_version != current_version:
+        raise HTTPException(status_code=409, detail="Automation workflow has been modified")
+    # Retain a versioned default row: deleting it would let a formerly approved
+    # version become valid again after reset.
+    if existing is None:
+        existing = AutomationWorkflowOverride(tenant_id=body.tenant_id, workflow_key=workflow_key,
+            enabled=workflow.enabled_default, step_modes_json=json.dumps(default_modes(workflow), sort_keys=True),
+            version=current_version + 1, updated_by_user_id=user.id)
+        db.add(existing)
+    else:
+        existing.enabled, existing.step_modes_json = workflow.enabled_default, json.dumps(default_modes(workflow), sort_keys=True)
+        existing.updated_by_user_id, existing.version = user.id, existing.version + 1
+    db.flush()
+    record_audit(db, action="automation_workflow.reset", actor_type="user", actor_id=str(user.id),
+                 tenant_id=body.tenant_id, resource_type="automation_workflow", resource_id=workflow_key,
+                 metadata={"version": existing.version})
+    result = serialize_effective(effective_config(db, body.tenant_id, workflow_key))
+    result.update({"tenant_id": str(body.tenant_id), "role": role, "can_manage": True})
+    db.commit()
+    return result
+
+
 @router.post("/finance/read", dependencies=[Depends(require_csrf)])
 def read_finance(
     body: FinanceReadRequest,
@@ -535,6 +745,71 @@ def read_finance(
     return _operations_read_page(
         connection, resource=body.service, limit=body.limit, offset=body.offset
     )
+
+
+@router.post(
+    "/finance/assist",
+    response_model=FinanceAssistantResult,
+    dependencies=[Depends(require_csrf)],
+)
+def assist_finance(
+    body: FinanceAssistantRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> FinanceAssistantResult:
+    """Read the selected Odoo page on the server, then return bounded AI guidance."""
+    if body.service not in {key for key, _label in _FINANCE_SERVICES}:
+        raise HTTPException(status_code=422, detail="Unsupported finance service")
+    connection = _operations_odoo_connection(db, user, body.tenant_id)
+    if connection.odoo_company_id is None:
+        raise HTTPException(
+            status_code=409, detail="Connection has no approved Odoo company scope"
+        )
+    page = _operations_read_page(
+        connection,
+        resource=body.service,
+        limit=body.limit,
+        offset=body.offset,
+    )
+    try:
+        provider = OpenAICompatibleProvider.from_environment()
+        result = FinanceAssistantService(provider).analyze(
+            service=body.service,
+            locale=body.locale,
+            records=page["records"],
+        )
+    except ProviderUnavailableError as exc:
+        raise HTTPException(
+            status_code=503, detail="Operations assistant is temporarily unavailable"
+        ) from exc
+    except ProviderFailureError as exc:
+        record_audit(
+            db,
+            action="operations_assistant.generation_failed",
+            actor_type="user",
+            actor_id=str(user.id),
+            tenant_id=body.tenant_id,
+            resource_type="operations_assistant",
+            resource_id=body.service,
+            metadata={"error_category": "provider_failure"},
+        )
+        db.commit()
+        raise HTTPException(status_code=502, detail="Operations assistant provider failed") from exc
+    record_audit(
+        db,
+        action="operations_assistant.generated",
+        actor_type="user",
+        actor_id=str(user.id),
+        tenant_id=body.tenant_id,
+        resource_type="operations_assistant",
+        resource_id=body.service,
+        metadata={
+            "service": body.service,
+            "analyzed_count": result.analyzed_count,
+            "prompt_version": result.prompt_version,
+        },
+    )
+    return result
 
 
 @router.get("/tasks", response_model=OperationTaskListOut)
@@ -602,18 +877,57 @@ def create_task(
     role = _role_in_tenant(db, user, body.tenant_id)
     if role is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
-    if not _is_manager(role):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient role")
+    service_request = body.procedure_type is not None or body.request_data is not None
+    if body.category == "human_resources" and not service_request:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Human resources requests require a procedure and request data",
+        )
+    if service_request:
+        procedure_contract = _SERVICE_PROCEDURES.get(body.category, {}).get(
+            body.procedure_type or ""
+        )
+        request_data = body.request_data or {}
+        if procedure_contract is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Procedure does not belong to the selected service category",
+            )
+        allowed_fields, required_fields = procedure_contract
+        supplied_fields = set(request_data)
+        if not supplied_fields.issubset(allowed_fields):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Request data contains fields unsupported by the selected procedure",
+            )
+        missing_fields = sorted(
+            key for key in required_fields if not request_data.get(key, "").strip()
+        )
+        if missing_fields:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Request data is missing required fields: {', '.join(missing_fields)}",
+            )
     if body.assigned_user_id is not None:
+        if not _is_manager(role) and body.assigned_user_id != user.id:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Members can only assign requests to themselves",
+            )
         _require_assignee_membership(db, body.tenant_id, body.assigned_user_id)
+    assigned_user_id = body.assigned_user_id
+    if not _is_manager(role):
+        assigned_user_id = user.id
     task = OperationTask(
         tenant_id=body.tenant_id,
         title=body.title,
         description=body.description.strip() if body.description else None,
         category=body.category,
+        procedure_type=body.procedure_type,
+        request_data_json=json.dumps(body.request_data, ensure_ascii=False) if body.request_data else None,
         priority=body.priority,
         due_at=body.due_at,
-        assigned_user_id=body.assigned_user_id,
+        assigned_user_id=assigned_user_id,
         created_by_user_id=user.id,
     )
     db.add(task)
@@ -621,7 +935,113 @@ def create_task(
     _record_history(db, task, user, action="created", from_status=None, note=None)
     return _to_out(db, task, user)
 
+@router.post(
+    "/hr-review-tasks",
+    response_model=OperationTaskOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_csrf)],
+)
+def create_hr_review_task(
+    body: HrReviewTaskCreate,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> OperationTaskOut:
+    """Create a reference-only follow-up; no HR record content is accepted."""
+    role = _role_in_tenant(db, user, body.tenant_id)
+    if role is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
+    if not _is_manager(role):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient role")
+    if body.date_from and body.date_to and body.date_from > body.date_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="date_from must not be after date_to",
+        )
+    if body.assigned_user_id is not None:
+        _require_assignee_membership(db, body.tenant_id, body.assigned_user_id)
 
+    connection = (
+        db.query(Connection)
+        .filter(
+            Connection.id == body.connection_id,
+            Connection.tenant_id == body.tenant_id,
+        )
+        .one_or_none()
+    )
+    if connection is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found")
+    if (
+        connection.provider != "odoo"
+        or not connection.is_active
+        or connection.status == "disabled"
+        or connection.last_test_status != "success"
+        or connection.odoo_company_id is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Odoo review source is unavailable",
+        )
+
+    snapshot = {
+        "resource": body.resource,
+        "record_id": body.record_id,
+        "employee_id": body.employee_id,
+        "date_from": body.date_from.isoformat() if body.date_from else None,
+        "date_to": body.date_to.isoformat() if body.date_to else None,
+        "company_id": connection.odoo_company_id,
+    }
+    identity = json.dumps(
+        {
+            "connection_id": str(connection.id),
+            **snapshot,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    source_signal = (
+        f"hr_review_{body.resource}_{hashlib.sha256(identity.encode()).hexdigest()[:12]}"
+    )
+    existing = (
+        db.query(OperationTask)
+        .filter(
+            OperationTask.tenant_id == body.tenant_id,
+            OperationTask.source_connection_id == connection.id,
+            OperationTask.source_record_id == body.record_id,
+            OperationTask.source_signal == source_signal,
+        )
+        .one_or_none()
+    )
+    if existing is not None:
+        return _to_out(db, existing, user)
+
+    label = _HR_REVIEW_LABELS[body.resource]
+    task = OperationTask(
+        tenant_id=body.tenant_id,
+        title=f"مراجعة موارد بشرية: {label} #{body.record_id}",
+        description=(
+            "متابعة نتيجة مراجعة مرجعية في أودو. "
+            "لا يحتوي هذا الوصف على بيانات الموظف أو تفاصيل الحضور أو الإجازة أو الراتب."
+        ),
+        category="administrative",
+        priority=body.priority,
+        assigned_user_id=body.assigned_user_id,
+        created_by_user_id=user.id,
+        source_type="odoo",
+        source_connection_id=connection.id,
+        source_record_id=body.record_id,
+        source_signal=source_signal,
+        source_reference=f"{body.resource}#{body.record_id}",
+        source_snapshot_json=json.dumps(
+            snapshot, ensure_ascii=True, separators=(",", ":"), sort_keys=True
+        ),
+        source_sync_state="reviewed",
+        source_synced_at=datetime.now(UTC),
+    )
+    db.add(task)
+    db.flush()
+    _record_history(db, task, user, action="created", from_status=None, note=None)
+    return _to_out(db, task, user)
 def _transition(
     task_id: uuid.UUID,
     body: OperationTaskAction,
@@ -715,41 +1135,10 @@ def _single_invoice_summary(
     *, tenant_id: uuid.UUID, snapshot: object, as_of_date: date
 ) -> tuple[OverdueInvoiceSummary, int, int]:
     """Derive an AI-safe aggregate from the server-sanitized Odoo snapshot."""
-    if not isinstance(snapshot, dict):
-        raise TypeError("invalid snapshot")
-    company_id = snapshot.get("company_id")
-    activity_type_id = snapshot.get("activity_type_id", 1)
-    currency = snapshot.get("currency")
-    due_date = snapshot.get("due_date")
-    residual = snapshot.get("residual")
-    if (
-        isinstance(company_id, bool)
-        or not isinstance(company_id, int)
-        or company_id < 1
-        or isinstance(activity_type_id, bool)
-        or not isinstance(activity_type_id, int)
-        or activity_type_id < 1
-        or not isinstance(currency, str)
-    ):
-        raise ValueError("invalid snapshot")
-    try:
-        due = date.fromisoformat(str(due_date))
-        amount = Decimal(str(residual))
-    except (InvalidOperation, ValueError, TypeError) as exc:
-        raise ValueError("invalid snapshot") from exc
-    overdue_days = (as_of_date - due).days
-    return (
-        OverdueInvoiceSummary(
-            tenant_id=tenant_id,
-            as_of_date=as_of_date,
-            currency=currency,
-            invoice_count=1,
-            customers_affected=1,
-            total_overdue=amount,
-            oldest_days_overdue=overdue_days,
-        ),
-        company_id,
-        activity_type_id,
+    return invoice_summary_from_snapshot(
+        tenant_id=tenant_id,
+        snapshot=snapshot,
+        as_of_date=as_of_date,
     )
 
 
@@ -1211,6 +1600,11 @@ def generate_action(task_id: uuid.UUID, body: OperationActionRequest,
         raise HTTPException(status_code=409, detail="Action can no longer be regenerated")
     if task.source_type != "odoo" or task.source_record_id is None or not task.source_snapshot_json:
         raise HTTPException(status_code=409, detail="Task has no supported Odoo invoice source")
+    config = effective_config(db, task.tenant_id, "finance.overdue_invoice_followup")
+    modes = config["step_modes"]
+    assert isinstance(modes, dict)
+    if not config["enabled"] or modes["prepare_draft"] == "manual":
+        raise HTTPException(status_code=409, detail="Automation workflow is not enabled for draft preparation")
     try:
         snapshot = json.loads(task.source_snapshot_json)
         summary, company_id, activity_type_id = _single_invoice_summary(
@@ -1239,12 +1633,18 @@ def generate_action(task_id: uuid.UUID, body: OperationActionRequest,
     regenerated = action is not None
     if action is None:
         action = OperationAction(tenant_id=task.tenant_id, task_id=task.id, proposal_json=payload,
-                                 proposal_hash=digest, idempotency_marker=uuid.uuid4().hex)
+                                  proposal_hash=digest, idempotency_marker=uuid.uuid4().hex,
+                                  workflow_key="finance.overdue_invoice_followup",
+                                  workflow_config_version=config["version"])
         db.add(action)
     else:
         action.proposal_json, action.proposal_hash, action.status = payload, digest, "proposed"
         action.approved_hash = action.approved_by_user_id = action.approved_at = None
         action.external_activity_id = action.verified_at = None
+        action.workflow_key, action.workflow_config_version = (
+            "finance.overdue_invoice_followup",
+            config["version"],
+        )
         action.error = None; action.version += 1
     db.flush()
     event = "regenerated" if regenerated else "generated"

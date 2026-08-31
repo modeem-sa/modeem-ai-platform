@@ -5,7 +5,7 @@ import { AuthProvider } from "@/components/auth-provider";
 import { LocaleProvider } from "@/components/locale-provider";
 
 export const metadata: Metadata = {
-  title: "Modeem AI Platform",
+  title: "مركز الخدمات المشتركة",
   description: "Business automation and AI workflows for Odoo users",
 };
 

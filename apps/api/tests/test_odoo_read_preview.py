@@ -446,7 +446,7 @@ def test_owner_admin_can_preview(roles_seed, stub_page, role):
     assert _preview(client, cid).status_code == 200
 
 
-@pytest.mark.parametrize("role", ["manager", "member", "viewer"])
+@pytest.mark.parametrize("role", ["member", "viewer"])
 def test_other_roles_cannot_preview(roles_seed, stub_page, role):
     owner = _client()
     _login(owner, "owner@example.com")
@@ -454,6 +454,50 @@ def test_other_roles_cannot_preview(roles_seed, stub_page, role):
     client = _client()
     _login(client, f"{role}@example.com")
     assert _preview(client, cid).status_code == 403
+
+
+def test_manager_can_review_data_without_managing_connection(roles_seed, stub_page):
+    owner = _client()
+    _login(owner, "owner@example.com")
+    cid = _tested_connection(owner)
+
+    manager = _client()
+    _login(manager, "manager@example.com")
+    assert _preview(manager, cid).status_code == 200
+
+
+def test_company_scoped_preview_rejects_caller_company_override(roles_seed, stub_page):
+    owner = _client()
+    _login(owner, "owner@example.com")
+    cid = _tested_connection(owner)
+    db = TestingSession()
+    conn = db.get(Connection, uuid.UUID(cid))
+    conn.odoo_company_id = 15
+    db.commit()
+    db.close()
+
+    response = _preview(
+        owner,
+        cid,
+        {"resource": "employees_summary", "company_id": 99},
+    )
+    assert response.status_code == 422
+    assert stub_page["kwargs"] is None
+
+
+def test_company_scoped_preview_derives_company_from_connection(roles_seed, stub_page):
+    owner = _client()
+    _login(owner, "owner@example.com")
+    cid = _tested_connection(owner)
+    db = TestingSession()
+    conn = db.get(Connection, uuid.UUID(cid))
+    conn.odoo_company_id = 15
+    db.commit()
+    db.close()
+
+    response = _preview(owner, cid, {"resource": "employees_summary"})
+    assert response.status_code == 200
+    assert stub_page["kwargs"]["company_id"] == 15
 
 
 # --- Endpoint: CSRF / tenancy / state (38-42) --------------------------------------------
@@ -724,6 +768,7 @@ def test_every_policy_filter_field_has_explicit_spec():
                 "boolean",
                 "number",
                 "date",
+                "datetime",
                 "many2one",
             )
 

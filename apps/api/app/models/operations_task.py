@@ -3,7 +3,7 @@
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, String, Text, Uuid
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -29,6 +29,11 @@ class OperationsTask(Base):
             "priority IN ('urgent', 'high', 'normal')",
             name="ck_operations_tasks_priority",
         ),
+        CheckConstraint(
+            "approval_state IN ('none', 'pending', 'approved', 'rejected')",
+            name="ck_operations_tasks_approval_state",
+        ),
+        CheckConstraint("version >= 1", name="ck_operations_tasks_version"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
@@ -43,6 +48,11 @@ class OperationsTask(Base):
     due_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
     assignee_name: Mapped[str] = mapped_column(String(255), nullable=False)
     source: Mapped[str] = mapped_column(String(64), nullable=False, default="manual")
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    approval_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="none"
+    )
+    last_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
