@@ -295,7 +295,11 @@ def test_active_member_can_open_self_assigned_human_resources_request(seed):
             "description": "August payroll",
             "category": "human_resources",
             "procedure_type": "prepare_payroll",
-            "request_data": {"period": "2026-08", "details": "Review all employees"},
+            "request_data": {
+                "period_from": "2026-08-01",
+                "period_to": "2026-08-31",
+                "details": "Review all employees",
+            },
             "priority": "medium",
         },
         headers=_csrf(client),
@@ -307,7 +311,8 @@ def test_active_member_can_open_self_assigned_human_resources_request(seed):
     assert request["created_by_user_id"] == str(worker_id)
     assert request["category"] == "human_resources"
     assert request["procedure_type"] == "prepare_payroll"
-    assert request["request_data"]["period"] == "2026-08"
+    assert request["request_data"]["period_from"] == "2026-08-01"
+    assert request["request_data"]["period_to"] == "2026-08-31"
     assert request["source_type"] == "manual"
 
 def test_hr_review_task_persists_only_server_approved_reference(seed):
@@ -623,6 +628,15 @@ def test_service_request_contract_rejects_browser_bypass_payloads(seed):
                 "reference": "JV-1",
                 "period": "2026-08",
                 "details": "Review entry",
+            },
+        },
+        {
+            **base,
+            "procedure_type": "prepare_payroll",
+            "request_data": {
+                "period_from": "2026-08-31",
+                "period_to": "2026-08-01",
+                "details": "Review payroll",
             },
         },
     ]

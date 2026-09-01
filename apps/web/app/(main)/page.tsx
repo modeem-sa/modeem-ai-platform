@@ -1154,6 +1154,20 @@ function ServicesWorkspacePage() {
         .map((field) => [field.key, (formData[field.key] ?? "").trim()] as const)
         .filter(([, value]) => value),
     );
+    const periodFrom = requestData.period_from;
+    const periodTo = requestData.period_to;
+    if (periodFrom || periodTo) {
+      if (!periodFrom || !periodTo) {
+        setError(t("servicePeriodBothRequired"));
+        setSaving(false);
+        return;
+      }
+      if (periodFrom > periodTo) {
+        setError(t("servicePeriodOrderError"));
+        setSaving(false);
+        return;
+      }
+    }
     try {
       const created = await createTask({
         tenant_id: selectedTenantId,
@@ -1371,11 +1385,24 @@ function ServicesWorkspacePage() {
                         <input
                           required={field.required}
                           type={field.type ?? "text"}
+                          min={field.key === "period_to" ? formData.period_from : undefined}
+                          max={field.key === "period_from" ? formData.period_to : undefined}
                           value={formData[field.key] ?? ""}
                           onChange={(event) => setFormData((current) => ({
                             ...current,
                             [field.key]: event.target.value,
                           }))}
+                          onClick={(event) => {
+                            if (field.type === "date") event.currentTarget.showPicker?.();
+                          }}
+                          onKeyDown={(event) => {
+                            if (field.type === "date" && event.key !== "Tab") {
+                              event.preventDefault();
+                            }
+                          }}
+                          onPaste={(event) => {
+                            if (field.type === "date") event.preventDefault();
+                          }}
                           placeholder={t(field.placeholderKey)}
                           className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-white outline-none placeholder:text-slate-600 focus:border-emerald-400"
                         />

@@ -87,10 +87,15 @@ describe('Operations API Utilities', () => {
   it('uses date fields for service periods and requires employee selection', () => {
     const procedures = SERVICE_CATALOG.flatMap((service) => service.procedures);
     const periodFields = procedures.flatMap((procedure) =>
-      procedure.fields.filter((field) => field.key === 'period')
+      procedure.fields.filter((field) => field.key === 'period_from' || field.key === 'period_to')
     );
     assert.ok(periodFields.length > 0);
     assert.ok(periodFields.every((field) => field.type === 'date'));
+    assert.ok(procedures
+      .filter((procedure) => procedure.fields.some((field) => field.key === 'period_from'))
+      .every((procedure) =>
+        procedure.fields.some((field) => field.key === 'period_to')
+      ));
 
     for (const procedureId of ['follow_attendance', 'review_leave']) {
       const procedure = procedures.find((item) => item.id === procedureId);

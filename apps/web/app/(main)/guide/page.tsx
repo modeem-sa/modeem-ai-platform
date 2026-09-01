@@ -10,7 +10,7 @@ const GUIDE_CONTENT = {
     updateLogTitle: "سجل التحديثات",
     versionInfo: "معلومات الإصدار",
     updateLogItems: [
-      "تحويل الفترة إلى حقل تاريخ وإضافة اختيار الموظف مباشرة من Odoo.",
+      "تحويل الفترة إلى تاريخ بداية ونهاية قابلين للاختيار، مع إضافة الموظف مباشرة من Odoo.",
       "استمرار إنشاء مقترح Modeem ومسودة التحصيل عند تعذر مزود الذكاء الاصطناعي.",
       "إعادة ربط مهام الفواتير القديمة باتصال Odoo النشط المطابق للجمعية والشركة."
     ],
@@ -41,7 +41,7 @@ const GUIDE_CONTENT = {
       selectDomain: "اختر المجال...",
       selectProc: "اختر الإجراء...",
       employee: "الموظف",
-      date: "التاريخ",
+      date: "الفترة من — إلى",
       invoiceTitle: "مقترح الفاتورة",
       amount: "المبلغ",
       approve: "اعتماد وتنفيذ",
@@ -59,7 +59,7 @@ const GUIDE_CONTENT = {
     updateLogTitle: "Update Log",
     versionInfo: "VERSION INFO",
     updateLogItems: [
-      "Added employee dropdown and attendance date field.",
+      "Replaced the single period field with selectable start and end dates, and added the Odoo employee dropdown.",
       "Two reliability fixes to improve system stability."
     ],
     sections: {
@@ -89,7 +89,7 @@ const GUIDE_CONTENT = {
       selectDomain: "Select Domain...",
       selectProc: "Select Procedure...",
       employee: "Employee",
-      date: "Date",
+      date: "Date range",
       invoiceTitle: "Invoice Proposal",
       amount: "Amount",
       approve: "Approve & Execute",

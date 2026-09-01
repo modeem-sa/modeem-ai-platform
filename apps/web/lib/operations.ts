@@ -762,7 +762,8 @@ export const SERVICE_CATALOG: ServiceDefinition[] = [
         descriptionKey: 'serviceReviewJournalDesc',
         fields: [
           { key: 'reference', labelKey: 'serviceReference', placeholderKey: 'serviceReferencePlaceholder', required: true },
-          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true, type: 'date' },
+  { key: 'period_from', labelKey: 'servicePeriodFrom', placeholderKey: 'servicePeriodFromPlaceholder', required: true, type: 'date' },
+  { key: 'period_to', labelKey: 'servicePeriodTo', placeholderKey: 'servicePeriodToPlaceholder', required: true, type: 'date' },
           { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
         ],
       },
@@ -781,7 +782,8 @@ export const SERVICE_CATALOG: ServiceDefinition[] = [
         titleKey: 'serviceReviewExpenses',
         descriptionKey: 'serviceReviewExpensesDesc',
         fields: [
-          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true, type: 'date' },
+          { key: 'period_from', labelKey: 'servicePeriodFrom', placeholderKey: 'servicePeriodFromPlaceholder', required: true, type: 'date' },
+          { key: 'period_to', labelKey: 'servicePeriodTo', placeholderKey: 'servicePeriodToPlaceholder', required: true, type: 'date' },
           { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
         ],
       },
@@ -798,7 +800,8 @@ export const SERVICE_CATALOG: ServiceDefinition[] = [
         titleKey: 'serviceFollowAttendance',
         descriptionKey: 'serviceFollowAttendanceDesc',
         fields: [
-          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true, type: 'date' },
+          { key: 'period_from', labelKey: 'servicePeriodFrom', placeholderKey: 'servicePeriodFromPlaceholder', required: true, type: 'date' },
+          { key: 'period_to', labelKey: 'servicePeriodTo', placeholderKey: 'servicePeriodToPlaceholder', required: true, type: 'date' },
           { key: 'employee', labelKey: 'serviceEmployee', placeholderKey: 'serviceEmployeePlaceholder', required: true },
           { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
         ],
@@ -809,7 +812,8 @@ export const SERVICE_CATALOG: ServiceDefinition[] = [
         descriptionKey: 'serviceReviewLeaveDesc',
         fields: [
           { key: 'employee', labelKey: 'serviceEmployee', placeholderKey: 'serviceEmployeePlaceholder', required: true },
-          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true, type: 'date' },
+          { key: 'period_from', labelKey: 'servicePeriodFrom', placeholderKey: 'servicePeriodFromPlaceholder', required: true, type: 'date' },
+          { key: 'period_to', labelKey: 'servicePeriodTo', placeholderKey: 'servicePeriodToPlaceholder', required: true, type: 'date' },
           { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
         ],
       },
@@ -818,7 +822,8 @@ export const SERVICE_CATALOG: ServiceDefinition[] = [
         titleKey: 'servicePreparePayroll',
         descriptionKey: 'servicePreparePayrollDesc',
         fields: [
-          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true, type: 'date' },
+          { key: 'period_from', labelKey: 'servicePeriodFrom', placeholderKey: 'servicePeriodFromPlaceholder', required: true, type: 'date' },
+          { key: 'period_to', labelKey: 'servicePeriodTo', placeholderKey: 'servicePeriodToPlaceholder', required: true, type: 'date' },
           { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
         ],
       },

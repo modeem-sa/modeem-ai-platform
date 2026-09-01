@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 import uuid
 from datetime import UTC, date, datetime
 from typing import Literal
@@ -109,25 +110,31 @@ _FINANCE_SERVICES = (
 _SERVICE_PROCEDURES = {
     "financial": {
         "review_journal_entry": (
-            {"reference", "period", "details"},
-            {"reference", "period", "details"},
+            {"reference", "period", "period_from", "period_to", "details"},
+            {"reference", "details"},
         ),
         "track_payment": (
             {"reference", "amount", "details"},
             {"reference", "details"},
         ),
-        "review_expenses": ({"period", "details"}, {"period", "details"}),
+        "review_expenses": (
+            {"period", "period_from", "period_to", "details"},
+            {"details"},
+        ),
     },
     "human_resources": {
         "follow_attendance": (
-            {"period", "employee", "details"},
-            {"period", "employee", "details"},
+            {"period", "period_from", "period_to", "employee", "details"},
+            {"employee", "details"},
         ),
         "review_leave": (
-            {"employee", "period", "details"},
-            {"employee", "period", "details"},
+            {"employee", "period", "period_from", "period_to", "details"},
+            {"employee", "details"},
         ),
-        "prepare_payroll": ({"period", "details"}, {"period", "details"}),
+        "prepare_payroll": (
+            {"period", "period_from", "period_to", "details"},
+            {"details"},
+        ),
     },
     "administrative": {
         "prepare_official_letter": (
@@ -966,6 +973,28 @@ def create_task(
         missing_fields = sorted(
             key for key in required_fields if not request_data.get(key, "").strip()
         )
+        if "period" in allowed_fields:
+            legacy_period = request_data.get("period", "").strip()
+            period_from = request_data.get("period_from", "").strip()
+            period_to = request_data.get("period_to", "").strip()
+            if not legacy_period and (not period_from or not period_to):
+                missing_fields.extend(["period_from", "period_to"])
+            if period_from and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", period_from):
+                missing_fields.append("period_from")
+            if period_to and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", period_to):
+                missing_fields.append("period_to")
+            if period_from and period_to:
+                try:
+                    parsed_from = date.fromisoformat(period_from)
+                    parsed_to = date.fromisoformat(period_to)
+                except ValueError:
+                    missing_fields.extend(["period_from", "period_to"])
+                else:
+                    if parsed_from > parsed_to:
+                        raise HTTPException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail="period_from must not be after period_to",
+                        )
         if missing_fields:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
