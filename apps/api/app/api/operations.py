@@ -54,11 +54,13 @@ from app.operations.collection_message import (
     CollectionMessageProposalService,
     canonical_collection_message,
     canonical_collection_source_identity,
+    rules_based_collection_message,
 )
 from app.operations.proposals import (
     OperationsProposalService,
     OverdueInvoiceSummary,
     invoice_summary_from_snapshot,
+    rules_based_activity_proposal,
 )
 from app.schemas.operations import (
     CollectionMessageExactRequest,
@@ -119,7 +121,7 @@ _SERVICE_PROCEDURES = {
     "human_resources": {
         "follow_attendance": (
             {"period", "employee", "details"},
-            {"period", "details"},
+            {"period", "employee", "details"},
         ),
         "review_leave": (
             {"employee", "period", "details"},
@@ -184,6 +186,30 @@ class FinanceReadRequest(BaseModel):
 
 class FinanceAssistantRequest(FinanceReadRequest):
     locale: Literal["ar", "en"] = "ar"
+
+
+class EmployeeReadRequest(BaseModel):
+    """Fixed employee-list read shape: no models, fields or domains."""
+
+    model_config = {"extra": "forbid"}
+
+    tenant_id: uuid.UUID
+    limit: int = Field(default=50, ge=1, le=50)
+    offset: int = Field(default=0, ge=0, le=1000)
+
+
+class EmployeeOptionOut(BaseModel):
+    id: int = Field(ge=1)
+    name: str = Field(min_length=1, max_length=255)
+
+
+class EmployeeReadResponse(BaseModel):
+    records: list[EmployeeOptionOut]
+    limit: int
+    offset: int
+    returned_count: int
+    has_more: bool
+    next_offset: int | None
 
 
 class AutomationOverrideRequest(BaseModel):
@@ -281,6 +307,7 @@ def _operations_read_page(
     limit: int,
     offset: int,
     filters: list[dict] | None = None,
+    fields: list[str] | None = None,
     company_scoped: bool = True,
 ) -> dict:
     """Read a fixed policy resource with short-lived decrypted auth."""
@@ -304,7 +331,7 @@ def _operations_read_page(
     finally:
         del credentials
     try:
-        return read_page(
+        read_kwargs = dict(
             base_url=connection.base_url,
             database=connection.database_name,
             transport=connection.selected_transport,
@@ -318,6 +345,9 @@ def _operations_read_page(
             # Never accept a company scope from the request.
             company_id=connection.odoo_company_id if company_scoped else None,
         )
+        if fields is not None:
+            read_kwargs["fields"] = fields
+        return read_page(**read_kwargs)
     except ReadPolicyError as exc:
         raise HTTPException(status_code=422, detail=exc.message) from exc
     except ResourceUnavailableError as exc:
@@ -744,6 +774,39 @@ def read_finance(
         )
     return _operations_read_page(
         connection, resource=body.service, limit=body.limit, offset=body.offset
+    )
+
+
+@router.post(
+    "/employees/read",
+    response_model=EmployeeReadResponse,
+    dependencies=[Depends(require_csrf)],
+)
+def read_employees(
+    body: EmployeeReadRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> EmployeeReadResponse:
+    """Read employee ids and names from one member-visible tenant's Odoo company."""
+    connection = _operations_odoo_connection(db, user, body.tenant_id)
+    if connection.odoo_company_id is None:
+        raise HTTPException(
+            status_code=409, detail="Connection has no approved Odoo company scope"
+        )
+    page = _operations_read_page(
+        connection,
+        resource="employees_summary",
+        fields=["id", "name"],
+        limit=body.limit,
+        offset=body.offset,
+    )
+    return EmployeeReadResponse(
+        records=[EmployeeOptionOut.model_validate(record) for record in page["records"]],
+        limit=page["limit"],
+        offset=page["offset"],
+        returned_count=page["returned_count"],
+        has_more=page["has_more"],
+        next_offset=page["next_offset"],
     )
 
 
@@ -1277,7 +1340,6 @@ def _require_collection_source(task: OperationTask) -> dict:
         task.category != "financial"
         or task.source_type != "odoo"
         or task.source_signal != "overdue_customer_invoice"
-        or task.source_connection_id is None
         or task.source_record_id is None
         or not task.source_snapshot_json
     ):
@@ -1299,20 +1361,45 @@ def _collection_source_identity(
     company_id = snapshot.get("company_id")
     if isinstance(company_id, bool) or not isinstance(company_id, int) or company_id < 1:
         raise HTTPException(status_code=409, detail="Collection message source is unavailable")
-    connection = (
-        db.query(Connection)
-        .filter_by(id=task.source_connection_id, tenant_id=task.tenant_id)
-        .with_for_update()
-        .one_or_none()
+    connection = None
+    if task.source_connection_id is not None:
+        connection = (
+            db.query(Connection)
+            .filter_by(
+                id=task.source_connection_id,
+                tenant_id=task.tenant_id,
+                provider="odoo",
+            )
+            .with_for_update()
+            .one_or_none()
+        )
+    connection_is_valid = (
+        connection is not None
+        and connection.odoo_company_id == company_id
+        and connection.is_active
+        and connection.last_test_status == "success"
+        and connection.selected_transport in ("xmlrpc", "json2")
     )
-    if (
-        connection is None
-        or connection.odoo_company_id != company_id
-        or not connection.is_active
-        or connection.last_test_status != "success"
-        or connection.selected_transport not in ("xmlrpc", "json2")
-    ):
-        raise HTTPException(status_code=409, detail="Collection message source is unavailable")
+    if not connection_is_valid:
+        candidates = (
+            db.query(Connection)
+            .filter_by(
+                tenant_id=task.tenant_id,
+                provider="odoo",
+                odoo_company_id=company_id,
+                is_active=True,
+                last_test_status="success",
+            )
+            .filter(Connection.selected_transport.in_(("xmlrpc", "json2")))
+            .with_for_update()
+            .all()
+        )
+        if len(candidates) != 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Collection message source is unavailable: reconnect or test the matching Odoo company",
+            )
+        connection = candidates[0]
     try:
         credentials = decrypt_credentials(
             connection.encrypted_credentials,
@@ -1387,15 +1474,15 @@ def generate_collection_message(
             snapshot=snapshot,
             as_of_date=datetime.now(UTC).date(),
         )
-        provider = OpenAICompatibleProvider.from_environment()
-        draft = CollectionMessageProposalService(provider).propose(summary)
+        try:
+            provider = OpenAICompatibleProvider.from_environment()
+            draft = CollectionMessageProposalService(provider).propose(summary)
+        except ProviderUnavailableError:
+            draft = rules_based_collection_message(summary)
         next_draft_version = 1 if message is None else message.draft_version + 1
         content, digest = canonical_collection_message(draft.content, next_draft_version)
     except CollectionMessagePolicyError as exc:
         raise _policy_http_error(db, task, user, message, exc) from exc
-    except ProviderUnavailableError:
-        _audit_proposal_failure(db, task, user, "provider_unavailable")
-        raise HTTPException(status_code=503, detail="Collection message service is unavailable")
     except ProviderFailureError:
         _audit_proposal_failure(db, task, user, "provider_failure")
         raise HTTPException(status_code=502, detail="Collection message provider failed")
@@ -1613,10 +1700,13 @@ def generate_action(task_id: uuid.UUID, body: OperationActionRequest,
     except (ValueError, TypeError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=409, detail="Task source cannot generate an action") from exc
     try:
-        provider = OpenAICompatibleProvider.from_environment()
-        draft = OperationsProposalService(provider).propose(
-            tenant_id=task.tenant_id, summary=summary
-        )
+        try:
+            provider = OpenAICompatibleProvider.from_environment()
+            draft = OperationsProposalService(provider).propose(
+                tenant_id=task.tenant_id, summary=summary
+            )
+        except ProviderUnavailableError:
+            draft = rules_based_activity_proposal(summary)
         executable = executable_invoice_activity_proposal(
             draft,
             company_id=company_id,
@@ -1624,9 +1714,6 @@ def generate_action(task_id: uuid.UUID, body: OperationActionRequest,
             activity_type_id=activity_type_id,
         )
         payload, digest = canonical_proposal(executable)
-    except ProviderUnavailableError:
-        _audit_proposal_failure(db, task, user, "provider_unavailable")
-        raise HTTPException(status_code=503, detail="Operations proposal service is temporarily unavailable")
     except ProviderFailureError:
         _audit_proposal_failure(db, task, user, "provider_failure")
         raise HTTPException(status_code=502, detail="Operations proposal provider failed")

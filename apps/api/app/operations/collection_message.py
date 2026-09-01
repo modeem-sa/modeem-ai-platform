@@ -89,3 +89,16 @@ class CollectionMessageProposalService:
             return CollectionMessageDraft.model_validate(raw)
         except (ProviderFailureError, ValidationError, TypeError) as exc:
             raise ProviderFailureError() from exc
+
+
+def rules_based_collection_message(
+    summary: OverdueInvoiceSummary,
+) -> CollectionMessageDraft:
+    """Prepare non-identifying Arabic text when no model provider is configured."""
+    return CollectionMessageDraft(
+        content=(
+            "نرجو التكرم بمراجعة المبلغ المستحق وسداده في أقرب وقت ممكن. "
+            f"مر على تاريخ الاستحقاق {summary.oldest_days_overdue} يومًا. "
+            "إذا تم السداد بالفعل، يرجى تجاهل هذه الرسالة والتواصل معنا عند الحاجة."
+        )
+    )

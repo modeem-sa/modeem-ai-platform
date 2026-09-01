@@ -15,6 +15,7 @@ import {
 } from "@/lib/api";
 import {
   createTask,
+  fetchOdooEmployees,
   fetchOperationsBootstrap,
   fetchTasks,
   fetchFinancialConnections,
@@ -25,6 +26,7 @@ import {
   type FinancialReadPage,
   type FinancialRecord,
   type FinancialResource,
+  type OdooEmployee,
   type OpCategory,
   type OperationTask,
   type OperationsBootstrap,
@@ -1002,10 +1004,14 @@ function ServicesWorkspacePage() {
   const [selectedCategory, setSelectedCategory] = useState<OpCategory>("financial");
   const [selectedProcedureId, setSelectedProcedureId] = useState<string>("");
   const [formData, setFormData] = useState<Record<string, string>>({});
+  const [employeeOptions, setEmployeeOptions] = useState<OdooEmployee[]>([]);
+  const [employeesLoading, setEmployeesLoading] = useState(false);
+  const [employeesError, setEmployeesError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState(false);
+  const employeeRequestGeneration = useRef(0);
 
   const loadWorkspace = useCallback(async () => {
     setLoading(true);
@@ -1051,6 +1057,72 @@ function ServicesWorkspacePage() {
         : service.procedures[0]?.id ?? "",
     );
   }, [service]);
+
+  const needsEmployeeOptions = Boolean(
+    selectedCategory === "human_resources"
+    && procedure?.fields.some((field) => field.key === "employee"),
+  );
+
+  useEffect(() => {
+    const generation = employeeRequestGeneration.current + 1;
+    employeeRequestGeneration.current = generation;
+    let cancelled = false;
+
+    if (!needsEmployeeOptions || !selectedTenantId) {
+      setEmployeeOptions([]);
+      setEmployeesError(null);
+      setEmployeesLoading(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setEmployeeOptions([]);
+    setEmployeesError(null);
+    setEmployeesLoading(true);
+
+    const loadEmployees = async () => {
+      try {
+        const employees = await fetchOdooEmployees(selectedTenantId);
+
+        if (cancelled || employeeRequestGeneration.current !== generation) return;
+        setEmployeeOptions(employees);
+        setFormData((current) => {
+          if (
+            !current.employee
+            || employees.some((employee) => String(employee.id) === current.employee)
+          ) {
+            return current;
+          }
+          const next = { ...current };
+          delete next.employee;
+          return next;
+        });
+      } catch (err: unknown) {
+        if (cancelled || employeeRequestGeneration.current !== generation) return;
+        if (err instanceof ApiError && err.status === 403) {
+          setEmployeesError(t("serviceEmployeePermissionError"));
+        } else if (err instanceof ApiError && err.status === 409) {
+          setEmployeesError(t("serviceEmployeeConnectionError"));
+        } else {
+          setEmployeesError(t("serviceEmployeeLoadError"));
+        }
+      } finally {
+        if (!cancelled && employeeRequestGeneration.current === generation) {
+          setEmployeesLoading(false);
+        }
+      }
+    };
+
+    void loadEmployees();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    needsEmployeeOptions,
+    selectedTenantId,
+    t,
+  ]);
 
   const activeTasks = useMemo(
     () => tasks.filter((task) => !["approved", "rejected"].includes(task.status)).length,
@@ -1148,7 +1220,11 @@ function ServicesWorkspacePage() {
               <select
                 required
                 value={selectedTenantId}
-                onChange={(event) => setSelectedTenantId(event.target.value)}
+                 onChange={(event) => {
+                   setSelectedTenantId(event.target.value);
+                   setFormData({});
+                   setSuccess(false);
+                 }}
                 disabled={loading || eligibleTenants.length === 0}
                 className="mt-5 w-full rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-sm text-white outline-none transition focus:border-emerald-400 md:max-w-xl"
                 aria-label={t("opTenant")}
@@ -1252,7 +1328,34 @@ function ServicesWorkspacePage() {
                         {t(field.labelKey)}
                         {field.required && <span className="ms-1 text-rose-300">*</span>}
                       </span>
-                      {field.type === "textarea" ? (
+                      {field.key === "employee" && needsEmployeeOptions ? (
+                        <>
+                          <select
+                            required={field.required}
+                            value={formData[field.key] ?? ""}
+                            onChange={(event) => setFormData((current) => ({
+                              ...current,
+                              [field.key]: event.target.value,
+                            }))}
+                            disabled={employeesLoading || employeeOptions.length === 0}
+                            className="rounded-xl border border-slate-700 bg-slate-950 px-4 py-3 text-white outline-none transition focus:border-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            <option value="">
+                              {employeesLoading
+                                ? t("serviceEmployeeLoading")
+                                : t("serviceEmployeeSelect")}
+                            </option>
+                            {employeeOptions.map((employee) => (
+                              <option key={employee.id} value={employee.id}>
+                                {employee.name}
+                              </option>
+                            ))}
+                          </select>
+                          {employeesError && (
+                            <span className="text-xs text-rose-300">{employeesError}</span>
+                          )}
+                        </>
+                      ) : field.type === "textarea" ? (
                         <textarea
                           required={field.required}
                           rows={4}

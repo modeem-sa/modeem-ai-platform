@@ -14,6 +14,7 @@ const items = [
   { href: "/executions", key: "executions" },
   { href: "/agents/content-manager", key: "contentManager" },
   { href: "/audit-logs", key: "auditLogs" },
+  { href: "/guide", key: "guide" },
   { href: "/settings", key: "settings" },
 ];
 

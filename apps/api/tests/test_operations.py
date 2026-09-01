@@ -400,6 +400,18 @@ def _mock_operations_odoo(monkeypatch, calls, *, module_installed=True):
         calls.append(kwargs)
         if kwargs["resource"] == "installed_modules":
             return {"records": [{"id": 1, "name": "account"}] if module_installed else []}
+        if kwargs["resource"] == "employees_summary":
+            return {
+                "resource": "employees_summary",
+                "fields": ["id", "name"],
+                "records": [{"id": 9, "name": "Employee Nine"}],
+                "limit": kwargs["limit"],
+                "offset": kwargs["offset"],
+                "returned_count": 1,
+                "has_more": False,
+                "next_offset": None,
+                "transport": "xmlrpc",
+            }
         return {
             "resource": kwargs["resource"],
             "fields": ["id"],
@@ -494,6 +506,53 @@ def test_operations_finance_read_forces_connection_company_and_rejects_extra_sco
     assert len(calls) == 1
 
 
+def test_operations_employee_read_uses_selected_tenant_company_and_fixed_fields(
+    seed, monkeypatch
+):
+    _operations_odoo_connection(seed["tenant_b"], company_id=73)
+    calls = []
+    _mock_operations_odoo(monkeypatch, calls)
+    client = _client()
+    _login(client, "b@example.com")
+
+    response = client.post(
+        "/api/v1/operations/employees/read",
+        json={"tenant_id": str(seed["tenant_b"]), "limit": 50, "offset": 0},
+        headers=_csrf(client),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["records"] == [{"id": 9, "name": "Employee Nine"}]
+    assert calls == [
+        {
+            "base_url": "https://odoo.example.test",
+            "database": "odoo",
+            "transport": "xmlrpc",
+            "login": "odoo-user",
+            "secret": "secret",
+            "environment": "development",
+            "resource": "employees_summary",
+            "filters": None,
+            "limit": 50,
+            "offset": 0,
+            "company_id": 73,
+            "fields": ["id", "name"],
+        }
+    ]
+
+    rejected = client.post(
+        "/api/v1/operations/employees/read",
+        json={
+            "tenant_id": str(seed["tenant_b"]),
+            "company_id": 999,
+            "resource": "hr.employee",
+        },
+        headers=_csrf(client),
+    )
+    assert rejected.status_code == 422
+    assert len(calls) == 1
+
+
 def test_operations_endpoints_hide_cross_tenant_and_allow_superuser(seed, monkeypatch):
     _operations_odoo_connection(seed["tenant_a"])
     db = TestingSession()
@@ -513,6 +572,14 @@ def test_operations_endpoints_hide_cross_tenant_and_allow_superuser(seed, monkey
     _login(member, "b@example.com")
     assert (
         member.get(f"/api/v1/operations/catalog?tenant_id={seed['tenant_a']}").status_code
+        == 404
+    )
+    assert (
+        member.post(
+            "/api/v1/operations/employees/read",
+            json={"tenant_id": str(seed["tenant_a"])},
+            headers=_csrf(member),
+        ).status_code
         == 404
     )
 

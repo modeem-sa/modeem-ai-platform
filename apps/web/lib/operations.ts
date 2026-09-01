@@ -699,6 +699,30 @@ export interface FinancialConnection {
   is_active: boolean;
 }
 
+export interface OdooEmployee {
+  id: number;
+  name: string;
+}
+
+interface OdooEmployeesPage {
+  records: OdooEmployee[];
+}
+
+export async function fetchOdooEmployees(tenantId: string): Promise<OdooEmployee[]> {
+  const page = await apiFetch<OdooEmployeesPage>(
+    "/api/v1/operations/employees/read",
+    {
+      method: "POST",
+      body: JSON.stringify({
+        tenant_id: tenantId,
+        limit: 50,
+        offset: 0,
+      }),
+    },
+  );
+  return page.records;
+}
+
 export type FinancialResource = "journal_entries" | "journal_items" | "payments_summary";
 
 export async function fetchFinancialPage(
@@ -738,7 +762,7 @@ export const SERVICE_CATALOG: ServiceDefinition[] = [
         descriptionKey: 'serviceReviewJournalDesc',
         fields: [
           { key: 'reference', labelKey: 'serviceReference', placeholderKey: 'serviceReferencePlaceholder', required: true },
-          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true },
+          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true, type: 'date' },
           { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
         ],
       },
@@ -757,7 +781,7 @@ export const SERVICE_CATALOG: ServiceDefinition[] = [
         titleKey: 'serviceReviewExpenses',
         descriptionKey: 'serviceReviewExpensesDesc',
         fields: [
-          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true },
+          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true, type: 'date' },
           { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
         ],
       },
@@ -774,8 +798,8 @@ export const SERVICE_CATALOG: ServiceDefinition[] = [
         titleKey: 'serviceFollowAttendance',
         descriptionKey: 'serviceFollowAttendanceDesc',
         fields: [
-          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true },
-          { key: 'employee', labelKey: 'serviceEmployee', placeholderKey: 'serviceEmployeePlaceholder' },
+          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true, type: 'date' },
+          { key: 'employee', labelKey: 'serviceEmployee', placeholderKey: 'serviceEmployeePlaceholder', required: true },
           { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
         ],
       },
@@ -785,7 +809,7 @@ export const SERVICE_CATALOG: ServiceDefinition[] = [
         descriptionKey: 'serviceReviewLeaveDesc',
         fields: [
           { key: 'employee', labelKey: 'serviceEmployee', placeholderKey: 'serviceEmployeePlaceholder', required: true },
-          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true },
+          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true, type: 'date' },
           { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
         ],
       },
@@ -794,7 +818,7 @@ export const SERVICE_CATALOG: ServiceDefinition[] = [
         titleKey: 'servicePreparePayroll',
         descriptionKey: 'servicePreparePayrollDesc',
         fields: [
-          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true },
+          { key: 'period', labelKey: 'servicePeriod', placeholderKey: 'servicePeriodPlaceholder', required: true, type: 'date' },
           { key: 'details', labelKey: 'serviceDetails', placeholderKey: 'serviceDetailsPlaceholder', required: true, type: 'textarea' },
         ],
       },

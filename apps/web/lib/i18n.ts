@@ -269,7 +269,12 @@ export const dictionaries: Record<Locale, Record<string, string>> = {
     serviceAmount: "Amount",
     serviceAmountPlaceholder: "Optional amount",
     serviceEmployee: "Employee",
-    serviceEmployeePlaceholder: "Employee name or number",
+    serviceEmployeePlaceholder: "Select an employee",
+    serviceEmployeeLoading: "Loading employees…",
+    serviceEmployeeSelect: "Select an employee",
+    serviceEmployeeConnectionError: "No tested Odoo connection with a company is available.",
+    serviceEmployeePermissionError: "Your role does not allow reading Odoo employees.",
+    serviceEmployeeLoadError: "Could not load employees from Odoo. Test the connection and try again.",
     serviceRecipient: "Recipient",
     serviceRecipientPlaceholder: "Person or entity receiving the letter",
     serviceNoOdooWrite: "Organizing only — no Odoo write",
@@ -327,6 +332,7 @@ export const dictionaries: Record<Locale, Record<string, string>> = {
     opSave: "Create Task",
     opCancel: "Cancel",
     opSummaryTitle: "Summary",
+    guide: "Usage Guide",
 
     // Operations Actions
     opOdooOperations: "Odoo Real Operations",
@@ -796,7 +802,12 @@ export const dictionaries: Record<Locale, Record<string, string>> = {
     serviceAmount: "المبلغ",
     serviceAmountPlaceholder: "المبلغ إن وجد",
     serviceEmployee: "الموظف",
-    serviceEmployeePlaceholder: "اسم الموظف أو رقمه",
+    serviceEmployeePlaceholder: "اختر الموظف",
+    serviceEmployeeLoading: "جارٍ تحميل أسماء الموظفين…",
+    serviceEmployeeSelect: "اختر الموظف",
+    serviceEmployeeConnectionError: "لا يوجد اتصال Odoo مختبر ومضبوط له رقم شركة.",
+    serviceEmployeePermissionError: "لا تملك صلاحية قراءة موظفي Odoo.",
+    serviceEmployeeLoadError: "تعذر تحميل أسماء الموظفين من Odoo. اختبر الاتصال وحاول مرة أخرى.",
     serviceRecipient: "الجهة الموجه إليها",
     serviceRecipientPlaceholder: "اسم الشخص أو الجهة المستلمة للخطاب",
     serviceNoOdooWrite: "تنظيم فقط — دون كتابة في أودو",
@@ -854,6 +865,7 @@ export const dictionaries: Record<Locale, Record<string, string>> = {
     opSave: "إنشاء المهمة",
     opCancel: "إلغاء",
     opSummaryTitle: "الملخص",
+    guide: "دليل الاستخدام",
 
     // Operations Actions
     opOdooOperations: "عمليات أودو الحقيقية",

@@ -188,3 +188,37 @@ class OperationsProposalService:
             + timedelta(days=model_proposal.deadline_offset_days),
             metadata=metadata,
         )
+
+
+def rules_based_activity_proposal(summary: OverdueInvoiceSummary) -> ActivityProposal:
+    """Prepare a bounded Modeem proposal when no model provider is configured."""
+    if summary.oldest_days_overdue >= 60:
+        priority, deadline_days = "urgent", 1
+    elif summary.oldest_days_overdue >= 30:
+        priority, deadline_days = "high", 3
+    elif summary.oldest_days_overdue >= 14:
+        priority, deadline_days = "medium", 5
+    else:
+        priority, deadline_days = "low", 7
+    rule_version = "overdue-activity-rules-v1"
+    return ActivityProposal(
+        title="متابعة فاتورة عميل متأخرة",
+        summary=(
+            f"توجد فاتورة مستحقة بقيمة {format(summary.total_overdue, 'f')} "
+            f"{summary.currency} ومتأخرة منذ {summary.oldest_days_overdue} يومًا."
+        ),
+        note="راجع حالة السداد ثم جهّز متابعة تحصيل وفق سياسة الجمعية قبل أي تواصل.",
+        deadline_offset_days=deadline_days,
+        priority=priority,
+        priority_reason=(
+            f"تم تحديد الأولوية آليًا وفق مدة التأخر البالغة "
+            f"{summary.oldest_days_overdue} يومًا."
+        ),
+        confidence=0.8,
+        recommended_deadline=summary.as_of_date + timedelta(days=deadline_days),
+        metadata=ProposalMetadata(
+            model="modeem-rules",
+            prompt_version=rule_version,
+            prompt_sha256=sha256(rule_version.encode("utf-8")).hexdigest(),
+        ),
+    )

@@ -9,6 +9,7 @@ import {
   getCollectionDeliveryPresentation,
   resetFinanceSelectionForModule,
   resetFinanceSelectionForTenant,
+  SERVICE_CATALOG,
   toTaskDueAt,
   type CollectionMessage,
 } from '../lib/operations.ts';
@@ -80,6 +81,23 @@ describe('Operations API Utilities', () => {
   it('rejects malformed, impossible, and expanded-year due dates', () => {
     for (const date of ['202601-01-01', '2026-02-31', '2026/01/01', '0999-01-01']) {
       assert.throws(() => toTaskDueAt(date), /INVALID_DUE_DATE/);
+    }
+  });
+
+  it('uses date fields for service periods and requires employee selection', () => {
+    const procedures = SERVICE_CATALOG.flatMap((service) => service.procedures);
+    const periodFields = procedures.flatMap((procedure) =>
+      procedure.fields.filter((field) => field.key === 'period')
+    );
+    assert.ok(periodFields.length > 0);
+    assert.ok(periodFields.every((field) => field.type === 'date'));
+
+    for (const procedureId of ['follow_attendance', 'review_leave']) {
+      const procedure = procedures.find((item) => item.id === procedureId);
+      assert.strictEqual(
+        procedure?.fields.find((field) => field.key === 'employee')?.required,
+        true,
+      );
     }
   });
 
