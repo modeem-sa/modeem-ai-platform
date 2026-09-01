@@ -4,13 +4,15 @@ import { useCallback, useEffect, useState } from "react";
 import { Header } from "@/components/header";
 import { useAuth } from "@/components/auth-provider";
 import { useLocale } from "@/components/locale-provider";
-import { apiFetch } from "@/lib/api";
+import { ApiError, apiFetch } from "@/lib/api";
 import {
   type BootstrapTenant,
+  type OdooEmployee,
   type OperationTask,
   type OperationsBootstrap,
   type OpPriority,
   createHrReviewTask,
+  fetchOdooEmployees,
 } from "@/lib/operations";
 
 type ConnectionOut = {
@@ -80,6 +82,9 @@ export default function HrReviewPage() {
   const [connectionId, setConnectionId] = useState("");
   const [resource, setResource] = useState<HrResource>("employees_summary");
   const [empId, setEmpId] = useState("");
+  const [employees, setEmployees] = useState<OdooEmployee[]>([]);
+  const [employeesLoading, setEmployeesLoading] = useState(false);
+  const [employeesError, setEmployeesError] = useState<string | null>(null);
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
 
@@ -116,9 +121,48 @@ export default function HrReviewPage() {
     void loadContext();
   }, [loadContext]);
 
+  useEffect(() => {
+    let cancelled = false;
+    if (!tenantId) {
+      setEmployees([]);
+      setEmployeesError(null);
+      setEmployeesLoading(false);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    setEmployees([]);
+    setEmpId("");
+    setEmployeesError(null);
+    setEmployeesLoading(true);
+    void fetchOdooEmployees(tenantId)
+      .then((records) => {
+        if (!cancelled) setEmployees(records);
+      })
+      .catch((error: unknown) => {
+        if (cancelled) return;
+        if (error instanceof ApiError && error.status === 403) {
+          setEmployeesError(t("serviceEmployeePermissionError"));
+        } else if (error instanceof ApiError && error.status === 409) {
+          setEmployeesError(t("serviceEmployeeConnectionError"));
+        } else {
+          setEmployeesError(t("serviceEmployeeLoadError"));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setEmployeesLoading(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [t, tenantId]);
+
   const handleTenantChange = async (nextTenantId: string) => {
     setTenantId(nextTenantId);
     setConnectionId("");
+    setEmpId("");
     setPage(null);
     setDataError(null);
     await selectTenant(nextTenantId);
@@ -283,15 +327,24 @@ export default function HrReviewPage() {
 
               <label className="flex flex-col gap-1.5 text-sm text-slate-300">
                 {t("hrFilterEmpId")}
-                <input
-                  type="number"
-                  min="1"
-                  step="1"
+                <select
                   value={empId}
                   onChange={(e) => setEmpId(e.target.value)}
-                  placeholder="123"
+                  disabled={!tenantId || employeesLoading || employees.length === 0}
                   className="rounded-lg border border-slate-700 bg-slate-950 px-3 py-2 text-white outline-none focus:border-indigo-500"
-                />
+                >
+                  <option value="">
+                    {employeesLoading ? t("serviceEmployeeLoading") : t("hrSelectAllEmployees")}
+                  </option>
+                  {employees.map((employee) => (
+                    <option key={employee.id} value={employee.id}>
+                      {employee.name}
+                    </option>
+                  ))}
+                </select>
+                {employeesError && (
+                  <span className="text-xs text-rose-400">{employeesError}</span>
+                )}
               </label>
 
               <label className="flex flex-col gap-1.5 text-sm text-slate-300">
