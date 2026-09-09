@@ -42,7 +42,6 @@ type PreviewResource =
 
 type PreviewRecord = {
   id?: number;
-  name?: string;
   code?: string;
   is_family?: boolean;
   total_draft_supports?: number;
@@ -63,8 +62,11 @@ type PreviewRecord = {
   amount_residual?: number;
   payment_state?: string | null;
   shortdesc?: string;
+  name?: string;
   installed_version?: string | null;
   application?: boolean;
+  read_supported?: boolean;
+  execution_supported?: boolean;
   category_id?: [number, string] | null;
   job_title?: string | null;
   department_id?: [number, string] | null;
@@ -131,6 +133,7 @@ export default function ConnectionsPage() {
   const { user } = useAuth();
   const role = user?.current_tenant?.role ?? "";
   const canWrite = role === "owner" || role === "admin" || role === "superuser";
+  const canReadInventory = canWrite || role === "manager";
 
   const [rows, setRows] = useState<ConnectionOut[] | null>(null);
   const [loadError, setLoadError] = useState(false);
@@ -153,7 +156,7 @@ export default function ConnectionsPage() {
   const [previewOffset, setPreviewOffset] = useState(0);
   const [previewLoading, setPreviewLoading] = useState(false);
   const [previewError, setPreviewError] = useState<string | null>(null);
-  const [installedModules, setInstalledModules] = useState<Set<string>>(new Set());
+  const [moduleSearch, setModuleSearch] = useState("");
   const [companies, setCompanies] = useState<PreviewRecord[]>([]);
   const [companyId, setCompanyId] = useState<number | null>(null);
   // Guards against out-of-order preview responses (e.g. switching
@@ -310,6 +313,7 @@ export default function ConnectionsPage() {
     offset: number,
     resource: PreviewResource,
     selectedCompanyId: number | null = companyId,
+    search = moduleSearch,
   ) => {
     const reqId = ++previewReqRef.current;
     setPreviewLoading(true);
@@ -326,6 +330,9 @@ export default function ConnectionsPage() {
           offset,
           order_by: "name",
           order_direction: "asc",
+          ...(resource === "installed_modules" && search.trim()
+            ? { filters: [{ field: "name", operator: "ilike", value: search.trim() }] }
+            : {}),
           ...(resourceRequiresCompany(resource) && selectedCompanyId
             ? { company_id: selectedCompanyId }
             : {}),
@@ -366,19 +373,11 @@ export default function ConnectionsPage() {
         body: JSON.stringify(body),
       });
     try {
-      const [moduleRes, companyRes] = await Promise.all([
-        request({
-          resource: "installed_modules",
-          filters: [{ field: "name", operator: "in", value: ["hr", "account"] }],
-          limit: 10,
-          order_by: "name",
-        }),
-        request({ resource: "companies", limit: 50, order_by: "name" }),
-      ]);
-      if (moduleRes.ok) {
-        const page: PreviewPage = await moduleRes.json();
-        setInstalledModules(new Set(page.records.map((r) => r.name).filter(Boolean) as string[]));
-      }
+      const companyRes = await request({
+        resource: "companies",
+        limit: 50,
+        order_by: "name",
+      });
       if (companyRes.ok) {
         const page: PreviewPage = await companyRes.json();
         setCompanies(page.records);
@@ -386,7 +385,6 @@ export default function ConnectionsPage() {
         setCompanyId(firstId);
       }
     } catch {
-      setInstalledModules(new Set());
       setCompanies([]);
       setCompanyId(null);
     }
@@ -396,7 +394,7 @@ export default function ConnectionsPage() {
     setPreviewConn(c);
     setPreviewPage(null);
     setPreviewResource("companies");
-    setInstalledModules(new Set());
+    setModuleSearch("");
     setCompanies([]);
     setCompanyId(null);
     void loadPreviewContext(c);
@@ -418,7 +416,6 @@ export default function ConnectionsPage() {
     setPreviewOffset(0);
     setPreviewLimit(25);
     setPreviewResource("countries");
-    setInstalledModules(new Set());
     setCompanies([]);
     setCompanyId(null);
   };
@@ -490,7 +487,7 @@ export default function ConnectionsPage() {
                   <th className="px-4 py-3 text-start font-medium">{t("connOdooVersion")}</th>
                   <th className="px-4 py-3 text-start font-medium">{t("connLastTest")}</th>
                   <th className="px-4 py-3 text-start font-medium">{t("connUpdated")}</th>
-                  {canWrite && (
+                  {canReadInventory && (
                     <th className="px-4 py-3 text-start font-medium">{t("connActions")}</th>
                   )}
                 </tr>
@@ -554,10 +551,10 @@ export default function ConnectionsPage() {
                       )}
                     </td>
                     <td className="px-4 py-3 text-slate-400">{dateFmt.format(new Date(c.updated_at))}</td>
-                    {canWrite && (
+                    {canReadInventory && (
                       <td className="px-4 py-3">
                         <div className="flex gap-3">
-                          {c.status !== "disabled" && c.has_credentials && (
+                          {canWrite && c.status !== "disabled" && c.has_credentials && (
                             <button
                               onClick={() => void testConnection(c)}
                               disabled={testingId === c.id}
@@ -566,7 +563,7 @@ export default function ConnectionsPage() {
                               {testingId === c.id ? t("connTesting") : t("connTest")}
                             </button>
                           )}
-                          {c.status !== "disabled" && c.last_test_status === "success" && (
+                           {c.status !== "disabled" && c.last_test_status === "success" && canReadInventory && (
                             <button
                               onClick={() => openPreview(c)}
                               className="text-violet-400 hover:text-violet-300"
@@ -574,7 +571,7 @@ export default function ConnectionsPage() {
                               {t("connPreview")}
                             </button>
                           )}
-                          {c.status !== "disabled" && c.last_test_status === "success" && c.odoo_company_id != null && (
+                          {canWrite && c.status !== "disabled" && c.last_test_status === "success" && c.odoo_company_id != null && (
                             <button
                               onClick={() => void syncInvoices(c)}
                               disabled={syncingId === c.id}
@@ -583,13 +580,13 @@ export default function ConnectionsPage() {
                               {syncingId === c.id ? t("connSyncing") : t("connSyncInvoices")}
                             </button>
                           )}
-                          <button
+                          {canWrite && <button
                             onClick={() => openEdit(c)}
                             className="text-emerald-400 hover:text-emerald-300"
                           >
                             {t("connEdit")}
-                          </button>
-                          {c.status !== "disabled" && (
+                          </button>}
+                          {canWrite && c.status !== "disabled" && (
                             <button
                               onClick={() => void disable(c)}
                               className="text-red-400 hover:text-red-300"
@@ -607,7 +604,7 @@ export default function ConnectionsPage() {
           </div>
         ) : null}
 
-        {previewConn && canWrite && (
+        {previewConn && canReadInventory && (
           <div
             className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
             onClick={closePreview}
@@ -645,21 +642,13 @@ export default function ConnectionsPage() {
                     <option value="beneficiaries_summary">{t("previewBeneficiaries")}</option>
                     <option value="customers">{t("previewCustomers")}</option>
                     <option value="invoices">{t("previewInvoices")}</option>
-                    <option value="installed_modules">{t("previewInstalledModules")}</option>
+                     <option value="installed_modules">{t("previewInstalledModules")}</option>
                     <option value="companies">{t("previewCompanies")}</option>
-                    {installedModules.has("hr") && (
-                      <>
-                        <option value="employees_summary">{t("previewEmployees")}</option>
-                        <option value="departments_summary">{t("previewDepartments")}</option>
-                      </>
-                    )}
-                    {installedModules.has("account") && (
-                      <>
-                        <option value="vendor_bills">{t("previewVendorBills")}</option>
-                        <option value="payments_summary">{t("previewPayments")}</option>
-                        <option value="journals_summary">{t("previewJournals")}</option>
-                      </>
-                    )}
+                    <option value="employees_summary">{t("previewEmployees")}</option>
+                    <option value="departments_summary">{t("previewDepartments")}</option>
+                    <option value="vendor_bills">{t("previewVendorBills")}</option>
+                    <option value="payments_summary">{t("previewPayments")}</option>
+                    <option value="journals_summary">{t("previewJournals")}</option>
                   </select>
                 </label>
                 {resourceRequiresCompany(previewResource) && (
@@ -688,6 +677,22 @@ export default function ConnectionsPage() {
                         </option>
                       ))}
                     </select>
+                  </label>
+                )}
+                {previewResource === "installed_modules" && (
+                  <label>
+                    {t("previewModuleSearch")}
+                    <input
+                      value={moduleSearch}
+                      onChange={(e) => {
+                        setModuleSearch(e.target.value);
+                        setPreviewPage(null);
+                        setPreviewOffset(0);
+                        void loadPreview(previewConn, previewLimit, 0, "installed_modules", companyId, e.target.value);
+                      }}
+                      placeholder={t("previewModuleSearchPlaceholder")}
+                      className="ms-2 rounded-md border border-slate-700 bg-slate-950 px-2 py-1 text-white"
+                    />
                   </label>
                 )}
                 <label>
@@ -749,10 +754,12 @@ export default function ConnectionsPage() {
                           </>
                         ) : previewResource === "installed_modules" ? (
                           <>
-                            <th className="px-4 py-2 text-start font-medium">{t("previewModuleTitle")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewModuleTechnicalName")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewModuleDescription")}</th>
                             <th className="px-4 py-2 text-start font-medium">{t("previewModuleVersion")}</th>
                             <th className="px-4 py-2 text-start font-medium">{t("previewModuleCategory")}</th>
                             <th className="px-4 py-2 text-start font-medium">{t("previewModuleApplication")}</th>
+                            <th className="px-4 py-2 text-start font-medium">{t("previewModuleCapabilities")}</th>
                           </>
                         ) : previewResource === "companies" ? (
                           <>
@@ -855,6 +862,7 @@ export default function ConnectionsPage() {
                             </>
                           ) : previewResource === "installed_modules" ? (
                             <>
+                              <td className="px-4 py-2 font-mono text-xs">{r.name ?? "—"}</td>
                               <td className="px-4 py-2">{r.shortdesc ?? "—"}</td>
                               <td className="px-4 py-2" dir="ltr">
                                 {r.installed_version ?? "—"}
@@ -866,6 +874,13 @@ export default function ConnectionsPage() {
                                     ? t("previewYes")
                                     : t("previewNo")
                                   : "—"}
+                              </td>
+                              <td className="px-4 py-2">
+                                <div className="flex flex-wrap gap-1">
+                                  <span className="rounded-full bg-emerald-950 px-2 py-0.5 text-xs text-emerald-300">{t("previewModuleInstalled")}</span>
+                                  {r.read_supported && <span className="rounded-full bg-sky-950 px-2 py-0.5 text-xs text-sky-300">{t("previewModuleSafeRead")}</span>}
+                                  {r.execution_supported && <span className="rounded-full bg-amber-950 px-2 py-0.5 text-xs text-amber-300">{t("previewModuleApprovedExecution")}</span>}
+                                </div>
                               </td>
                             </>
                           ) : previewResource === "companies" ? (

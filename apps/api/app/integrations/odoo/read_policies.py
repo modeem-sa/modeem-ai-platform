@@ -21,6 +21,7 @@ MAX_REQUESTED_FIELDS = 20
 MAX_FILTER_STRING_LENGTH = 200
 MAX_FILTER_LIST_ITEMS = 50
 MAX_PREVIEW_OFFSET = 1000
+MAX_INVENTORY_OFFSET = 100000
 DEFAULT_PAGE_SIZE = 25
 ABSOLUTE_MAX_PAGE_SIZE = 50
 
@@ -68,6 +69,7 @@ class ReadPolicy:
     allowed_order_fields: frozenset[str]
     base_domain: tuple[tuple[Any, ...], ...] = ()
     max_page_size: int = field(default=ABSOLUTE_MAX_PAGE_SIZE)
+    max_offset: int = field(default=MAX_PREVIEW_OFFSET)
     required_module: str | None = None
     requires_company_scope: bool = False
 
@@ -284,6 +286,7 @@ _INVOICES = ReadPolicy(
 _INSTALLED_MODULES = ReadPolicy(
     resource_key="installed_modules",
     odoo_model="ir.module.module",
+    max_offset=MAX_INVENTORY_OFFSET,
     fields=_fields(
         ReadFieldPolicy(name="id", value_type="integer", nullable=False),
         ReadFieldPolicy(

@@ -28,12 +28,16 @@ class MembershipOut(BaseModel):
     tenant_id: uuid.UUID
     tenant_name: str
     role: str
+    odoo_module_scope: list[str] | None = None
+    service_scope: list[str] | None = None
 
 
 class CurrentTenantOut(BaseModel):
     id: uuid.UUID
     name: str
     role: str
+    odoo_module_scope: list[str] | None = None
+    service_scope: list[str] | None = None
 
 
 class MeResponse(BaseModel):

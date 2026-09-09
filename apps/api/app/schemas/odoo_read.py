@@ -17,6 +17,7 @@ from app.integrations.odoo.read_policies import (
     MAX_FILTER_STRING_LENGTH,
     MAX_FILTERS,
     MAX_PREVIEW_OFFSET,
+    MAX_INVENTORY_OFFSET,
     MAX_REQUESTED_FIELDS,
 )
 
@@ -40,7 +41,9 @@ class ReadPreviewRequest(BaseModel):
     fields: list[str] | None = Field(default=None, max_length=MAX_REQUESTED_FIELDS)
     filters: list[ReadFilter] | None = Field(default=None, max_length=MAX_FILTERS)
     limit: int = Field(default=DEFAULT_PAGE_SIZE, ge=1, le=ABSOLUTE_MAX_PAGE_SIZE)
-    offset: int = Field(default=0, ge=0, le=MAX_PREVIEW_OFFSET)
+    # Structural maximum; the reader applies each resource policy's lower
+    # bound (1000 for all non-inventory resources).
+    offset: int = Field(default=0, ge=0, le=MAX_INVENTORY_OFFSET)
     order_by: str | None = Field(default=None, max_length=64)
     order_direction: Literal["asc", "desc"] = "asc"
     company_id: int | None = Field(default=None, ge=1)

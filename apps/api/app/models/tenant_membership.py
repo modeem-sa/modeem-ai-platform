@@ -9,6 +9,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     String,
+    Text,
     UniqueConstraint,
     Uuid,
 )
@@ -16,9 +17,9 @@ from sqlalchemy.orm import Mapped, mapped_column, validates
 
 from app.db.base import Base
 
-ALLOWED_ROLES = ("owner", "admin", "manager", "member", "viewer")
+ALLOWED_ROLES = ("owner", "admin", "manager", "member", "viewer", "customer")
 
-ROLE_CHECK_SQL = "role IN ('owner', 'admin', 'manager', 'member', 'viewer')"
+ROLE_CHECK_SQL = "role IN ('owner', 'admin', 'manager', 'member', 'viewer', 'customer')"
 
 
 def _utcnow() -> datetime:
@@ -41,6 +42,11 @@ class TenantMembership(Base):
     )
     role: Mapped[str] = mapped_column(String(32), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Null deliberately means unrestricted access.  A non-null JSON array is
+    # validated at the API boundary against Modeem-owned module identifiers.
+    odoo_module_scope_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Null deliberately means unrestricted service access.
+    service_scope_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )

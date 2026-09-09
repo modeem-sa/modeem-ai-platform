@@ -15,12 +15,17 @@ from sqlalchemy.orm import Session
 
 from app.api.csrf import require_csrf
 from app.api.deps import (
+    RESOURCE_MODULES,
     TenantContext,
+    allowed_odoo_modules,
     get_current_tenant,
     get_current_user,
     get_db,
+    require_odoo_resource_scope,
+    require_service_scope,
     require_role,
 )
+from app.operations.automation_catalog import CATALOG
 from app.core.config import get_settings
 from app.models import (
     Connection,
@@ -56,6 +61,17 @@ router = APIRouter(prefix="/api/v1")
 
 _WRITE_ROLES = ("owner", "admin")
 _READ_PREVIEW_ROLES = ("owner", "admin", "manager")
+
+
+def _require_read_scopes(db: Session, actor: User, tenant_id: uuid.UUID, resource: str) -> None:
+    module = RESOURCE_MODULES.get(resource)
+    service = (
+        "financial" if module == "account"
+        else "human_resources" if module in {"hr", "hr_attendance", "hr_holidays", "hr_payroll"}
+        else "administrative"
+    )
+    require_service_scope(db, actor, tenant_id, service)
+    require_odoo_resource_scope(db, actor, tenant_id, resource)
 
 
 def _to_out(conn: Connection) -> ConnectionOut:
@@ -144,6 +160,8 @@ def list_connections(
     ctx: TenantContext = Depends(get_current_tenant),
     db: Session = Depends(get_db),
 ) -> list[ConnectionOut]:
+    if ctx.role == "customer":
+        raise HTTPException(status_code=403, detail="Customer accounts use the service-request portal")
     rows = (
         db.query(Connection)
         .filter(Connection.tenant_id == ctx.tenant.id)
@@ -159,6 +177,8 @@ def get_connection(
     ctx: TenantContext = Depends(get_current_tenant),
     db: Session = Depends(get_db),
 ) -> ConnectionOut:
+    if ctx.role == "customer":
+        raise HTTPException(status_code=403, detail="Customer accounts use the service-request portal")
     return _to_out(_scoped_get(db, ctx, connection_id))
 
 
@@ -517,6 +537,10 @@ def read_preview(
     from app.integrations.odoo.read_policies import get_policy
     from app.integrations.odoo.reader import ReadPolicyError, ResourceUnavailableError
 
+    if ctx.role == "customer":
+        raise HTTPException(
+            status_code=403, detail="Customer accounts use the service-request portal"
+        )
     conn = _scoped_get(db, ctx, connection_id)
     if not conn.is_active or conn.status == "disabled":
         raise HTTPException(
@@ -542,6 +566,10 @@ def read_preview(
             detail="Connection must be re-tested before data preview",
         )
     policy = get_policy(body.resource)
+    # Preview remains policy-bound and also honors delegated technical module
+    # scope; unrestricted (NULL) memberships preserve prior behavior.
+    if policy is not None:
+        _require_read_scopes(db, actor, ctx.tenant.id, body.resource)
     resolved_company_id = body.company_id
     if policy is not None and policy.requires_company_scope:
         if conn.odoo_company_id is None:
@@ -609,6 +637,16 @@ def read_preview(
             },
         )
 
+    preview_filters = [f.model_dump() for f in body.filters] if body.filters else []
+    if body.resource == "installed_modules":
+        allowed_modules = allowed_odoo_modules(db, actor, ctx.tenant.id)
+        if allowed_modules is not None:
+            preview_filters.append(
+                {"field": "name", "operator": "in", "value": sorted(allowed_modules)}
+                if allowed_modules
+                else {"field": "id", "operator": "=", "value": -1}
+            )
+
     try:
         page = odoo_reader.read_page(
             base_url=conn.base_url,
@@ -619,9 +657,7 @@ def read_preview(
             environment=settings.environment,
             resource=body.resource,
             fields=body.fields,
-            filters=(
-                [f.model_dump() for f in body.filters] if body.filters else None
-            ),
+            filters=preview_filters,
             limit=body.limit,
             offset=body.offset,
             order_by=body.order_by,
@@ -650,6 +686,16 @@ def read_preview(
     finally:
         del auth
 
+    if body.resource == "installed_modules":
+        for record in page["records"]:
+            module = record.get("name")
+            record["read_supported"] = module in set(RESOURCE_MODULES.values())
+            record["execution_supported"] = any(
+                workflow.required_odoo_module == module
+                and workflow.enabled_default
+                and all(step.executor_available for step in workflow.steps)
+                for workflow in CATALOG
+            )
     _audit(success=True, returned_count=page["returned_count"], error_code=None)
     db.flush()
     return ReadPreviewResponse(**page)
@@ -675,6 +721,9 @@ def financial_read(
     from app.integrations.odoo.errors import ConnectorError
     from app.integrations.odoo.reader import ReadPolicyError, ResourceUnavailableError
 
+    if ctx.role == "customer":
+        raise HTTPException(status_code=403, detail="Customer accounts use the service-request portal")
+    _require_read_scopes(db, actor, ctx.tenant.id, body.resource)
     conn = _scoped_get(db, ctx, connection_id)
     if (
         not conn.is_active

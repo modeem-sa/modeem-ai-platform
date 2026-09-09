@@ -1,6 +1,7 @@
 """Reusable FastAPI dependencies for DB sessions, auth, and tenant context."""
 
 import uuid
+import json
 from collections.abc import Callable, Generator
 from dataclasses import dataclass
 
@@ -10,6 +11,18 @@ from sqlalchemy.orm import Session
 from app.core.security import SESSION_COOKIE_NAME, decode_session_token
 from app.db.base import get_session_factory
 from app.models import Tenant, TenantMembership, User
+
+# The browser never sends this map. It binds the fixed Modeem resource keys to
+# the technical Odoo modules that may be delegated on a membership.
+RESOURCE_MODULES = {
+    "accounting_entries": "account", "journal_items": "account",
+    "payments_summary": "account", "journals_summary": "account",
+    "invoices": "account", "vendor_bills": "account",
+    "journal_entries": "account",
+    "employees_summary": "hr", "departments_summary": "hr",
+    "attendance_summary": "hr_attendance", "leaves_summary": "hr_holidays",
+    "payroll_summary": "hr_payroll",
+}
 
 _session_factory = None
 import hmac
@@ -78,6 +91,86 @@ def get_active_memberships(db: Session, user: User) -> list[TenantMembership]:
         )
         .all()
     )
+
+
+def require_odoo_resource_scope(
+    db: Session, user: User, tenant_id: uuid.UUID, resource: str
+) -> None:
+    """Deny a fixed resource when a delegated membership lacks its module.
+
+    Null scope preserves historic full access. Malformed legacy data fails
+    closed rather than accidentally granting an Odoo capability.
+    """
+    module = RESOURCE_MODULES.get(resource)
+    if module is None:
+        return
+    require_odoo_module_scope(db, user, tenant_id, module)
+
+
+def require_odoo_module_scope(
+    db: Session, user: User, tenant_id: uuid.UUID, module: str
+) -> None:
+    """Deny one server-owned technical module outside the active membership scope."""
+    if user.is_superuser:
+        return
+    membership = (
+        db.query(TenantMembership)
+        .filter(TenantMembership.user_id == user.id, TenantMembership.tenant_id == tenant_id,
+                TenantMembership.is_active.is_(True))
+        .one_or_none()
+    )
+    if membership is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    if membership.odoo_module_scope_json is None:
+        return
+    try:
+        scope = json.loads(membership.odoo_module_scope_json)
+    except (TypeError, json.JSONDecodeError):
+        scope = []
+    if not isinstance(scope, list) or module not in scope:
+        raise HTTPException(status_code=403, detail="Odoo module scope does not permit this resource")
+
+
+def allowed_odoo_modules(
+    db: Session, user: User, tenant_id: uuid.UUID
+) -> set[str] | None:
+    """Return None for unrestricted access, otherwise the validated module set."""
+    if user.is_superuser:
+        return None
+    membership = db.query(TenantMembership).filter(
+        TenantMembership.user_id == user.id,
+        TenantMembership.tenant_id == tenant_id,
+        TenantMembership.is_active.is_(True),
+    ).one_or_none()
+    if membership is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    if membership.odoo_module_scope_json is None:
+        return None
+    try:
+        scope = json.loads(membership.odoo_module_scope_json)
+    except (TypeError, json.JSONDecodeError):
+        scope = []
+    return set(scope) if isinstance(scope, list) and all(isinstance(item, str) for item in scope) else set()
+
+
+def require_service_scope(db: Session, user: User, tenant_id: uuid.UUID, service: str) -> None:
+    """Check a fixed Modeem service key; null remains unrestricted."""
+    if user.is_superuser:
+        return
+    membership = db.query(TenantMembership).filter(
+        TenantMembership.user_id == user.id, TenantMembership.tenant_id == tenant_id,
+        TenantMembership.is_active.is_(True),
+    ).one_or_none()
+    if membership is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    if membership.service_scope_json is None:
+        return
+    try:
+        scope = json.loads(membership.service_scope_json)
+    except (TypeError, json.JSONDecodeError):
+        scope = []
+    if not isinstance(scope, list) or service not in scope:
+        raise HTTPException(status_code=403, detail="Service scope does not permit this operation")
 
 
 def resolve_tenant_context(

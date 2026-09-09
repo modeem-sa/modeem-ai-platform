@@ -3,8 +3,8 @@
 import { usePathname, useRouter } from "next/navigation";
 import { createContext, useCallback, useContext, useEffect, useState } from "react";
 
-export type Membership = { tenant_id: string; tenant_name: string; role: string };
-export type CurrentTenant = { id: string; name: string; role: string };
+export type Membership = { tenant_id: string; tenant_name: string; role: string; odoo_module_scope: string[] | null; service_scope: string[] | null };
+export type CurrentTenant = { id: string; name: string; role: string; odoo_module_scope: string[] | null; service_scope: string[] | null };
 export type AuthUser = {
   id: string;
   email: string;

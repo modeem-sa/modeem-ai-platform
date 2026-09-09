@@ -191,7 +191,7 @@ def _validate_order(
 def _validate_pagination(policy: ReadPolicy, limit: int, offset: int) -> None:
     if not isinstance(limit, int) or limit < 1 or limit > policy.max_page_size:
         raise ReadPolicyError("limit out of range")
-    if not isinstance(offset, int) or offset < 0 or offset > MAX_PREVIEW_OFFSET:
+    if not isinstance(offset, int) or offset < 0 or offset > policy.max_offset:
         raise ReadPolicyError("offset out of range")
 
 

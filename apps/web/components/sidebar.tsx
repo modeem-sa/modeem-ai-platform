@@ -7,6 +7,8 @@ import { useAuth } from "@/components/auth-provider";
 
 const items = [
   { href: "/", key: "dashboard" },
+  { href: "/service-requests", key: "reqPortal" },
+  { href: "/service-inbox", key: "reqInbox" },
   { href: "/operations", key: "operations" },
   { href: "/hr-review", key: "hrReview" },
   { href: "/connections", key: "connections" },
@@ -14,6 +16,7 @@ const items = [
   { href: "/executions", key: "executions" },
   { href: "/agents/content-manager", key: "contentManager" },
   { href: "/audit-logs", key: "auditLogs" },
+  { href: "/permissions", key: "permissions" },
   { href: "/guide", key: "guide" },
   { href: "/settings", key: "settings" },
 ];
@@ -34,7 +37,16 @@ export function Sidebar() {
 
       <div className="flex md:flex-col overflow-x-auto md:overflow-visible gap-2 md:gap-1 pb-2 md:pb-0 hide-scrollbar -mx-3 px-3 md:mx-0 md:px-0">
         {items.map((item) => {
-          const active = pathname === item.href;
+          const isCustomer = user?.current_tenant?.role === "customer";
+           const current = user?.current_tenant;
+           const canManagePermissions = Boolean(user?.is_superuser || ["owner", "admin"].includes(current?.role ?? "") ||
+             (current?.role === "manager" && current.service_scope?.includes("tenant_memberships")));
+          if (item.key === "reqPortal" && !isCustomer) return null;
+          if (item.key === "reqInbox" && isCustomer) return null;
+          if (isCustomer && !["dashboard", "reqPortal", "settings", "guide"].includes(item.key)) return null;
+           if (item.key === "permissions" && !canManagePermissions) return null;
+
+          const active = pathname === item.href || (item.href !== "/" && pathname.startsWith(item.href));
           return (
             <Link
               key={item.href}

@@ -13,7 +13,15 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.api.csrf import require_csrf
-from app.api.deps import get_current_user, get_db
+from app.api.deps import (
+    RESOURCE_MODULES,
+    allowed_odoo_modules,
+    get_current_user,
+    get_db,
+    require_odoo_module_scope,
+    require_odoo_resource_scope,
+    require_service_scope,
+)
 from app.content_manager.provider import (
     OpenAICompatibleProvider,
     ProviderFailureError,
@@ -26,6 +34,7 @@ from app.integrations.odoo.invoice_chatter_collection import (
     read_invoice_collection_target,
 )
 from app.integrations.odoo.reader import ReadPolicyError, ResourceUnavailableError, read_page
+from app.integrations.odoo.read_policies import MAX_INVENTORY_OFFSET, MAX_PREVIEW_OFFSET
 from app.models import (
     AutomationWorkflowOverride,
     CollectionMessage,
@@ -188,7 +197,7 @@ class FinanceReadRequest(BaseModel):
     tenant_id: uuid.UUID
     service: str = Field(max_length=64)
     limit: int = Field(default=25, ge=1, le=50)
-    offset: int = Field(default=0, ge=0, le=1000)
+    offset: int = Field(default=0, ge=0, le=MAX_PREVIEW_OFFSET)
 
 
 class FinanceAssistantRequest(FinanceReadRequest):
@@ -202,7 +211,7 @@ class EmployeeReadRequest(BaseModel):
 
     tenant_id: uuid.UUID
     limit: int = Field(default=50, ge=1, le=50)
-    offset: int = Field(default=0, ge=0, le=1000)
+    offset: int = Field(default=0, ge=0, le=MAX_PREVIEW_OFFSET)
 
 
 class EmployeeOptionOut(BaseModel):
@@ -245,6 +254,7 @@ def _active_tenant_ids(db: Session, user: User) -> list[uuid.UUID]:
             .filter(
                 TenantMembership.user_id == user.id,
                 TenantMembership.is_active.is_(True),
+                TenantMembership.role != "customer",
                 Tenant.is_active.is_(True),
             )
             .all()
@@ -263,6 +273,7 @@ def _role_in_tenant(db: Session, user: User, tenant_id: uuid.UUID) -> str | None
             TenantMembership.user_id == user.id,
             TenantMembership.tenant_id == tenant_id,
             TenantMembership.is_active.is_(True),
+            TenantMembership.role != "customer",
             Tenant.is_active.is_(True),
         )
         .one_or_none()
@@ -380,6 +391,62 @@ def _scoped_task(
     if task is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
     return task
+
+
+def _require_task_scope(db: Session, user: User, task: OperationTask) -> None:
+    # Categories are fixed server-owned service keys; clients never provide
+    # Odoo model identifiers or arbitrary capability names.
+    workflow = next(
+        (item for item in CATALOG if item.service == task.procedure_type),
+        None,
+    )
+    service = (
+        {
+            "finance": "financial",
+            "human_resources": "human_resources",
+            "purchasing": "purchasing",
+        }.get(workflow.module, "administrative")
+        if workflow is not None
+        else task.category
+    )
+    require_service_scope(db, user, task.tenant_id, service)
+    if task.source_type == "odoo" and task.source_snapshot_json:
+        try:
+            source_resource = json.loads(task.source_snapshot_json).get("resource")
+        except (AttributeError, json.JSONDecodeError):
+            source_resource = None
+        if isinstance(source_resource, str) and source_resource in RESOURCE_MODULES:
+            require_odoo_resource_scope(db, user, task.tenant_id, source_resource)
+            return
+    if workflow is not None and workflow.required_odoo_module:
+        require_odoo_module_scope(
+            db, user, task.tenant_id, workflow.required_odoo_module
+        )
+        return
+    module_resource = {
+        "financial": "accounting_entries",
+        "human_resources": "employees_summary",
+    }.get(task.category)
+    if module_resource:
+        require_odoo_resource_scope(db, user, task.tenant_id, module_resource)
+
+
+def _require_category_scope(db: Session, user: User, tenant_id: uuid.UUID, category: str) -> None:
+    service = {"financial": "financial", "human_resources": "human_resources",
+               "purchasing": "purchasing"}.get(category, "administrative")
+    require_service_scope(db, user, tenant_id, service)
+    module = {"financial": "account", "human_resources": "hr",
+              "purchasing": "purchase"}.get(category)
+    if module:
+        require_odoo_module_scope(db, user, tenant_id, module)
+
+
+def _require_workflow_scope(db: Session, user: User, tenant_id: uuid.UUID, workflow) -> None:
+    service = {"finance": "financial", "human_resources": "human_resources",
+               "purchasing": "purchasing"}.get(workflow.module, "administrative")
+    require_service_scope(db, user, tenant_id, service)
+    if workflow.required_odoo_module:
+        require_odoo_module_scope(db, user, tenant_id, workflow.required_odoo_module)
 
 
 def _available_actions(task: OperationTask, user: User, role: str | None) -> list[str]:
@@ -620,6 +687,18 @@ def operations_catalog(
     db: Session = Depends(get_db),
 ) -> dict:
     """Expose finance only when its Odoo module is live-installed."""
+    # Catalog visibility is authorization too: a restricted employee must not
+    # learn that a finance capability is available through this endpoint.
+    finance_permitted = True
+    try:
+        require_service_scope(db, user, tenant_id, "financial")
+        require_odoo_resource_scope(db, user, tenant_id, "accounting_entries")
+    except HTTPException as exc:
+        if exc.status_code != status.HTTP_403_FORBIDDEN:
+            raise
+        finance_permitted = False
+    if not finance_permitted:
+        return {"tenant_id": str(tenant_id), "modules": []}
     connection = _operations_odoo_connection(db, user, tenant_id)
     account_page = _operations_read_page(
         connection,
@@ -630,7 +709,7 @@ def operations_catalog(
         company_scoped=False,
     )
     modules = []
-    if account_page["records"]:
+    if account_page["records"] and finance_permitted:
         modules.append(
             {
                 "key": "finance",
@@ -643,6 +722,50 @@ def operations_catalog(
     return {"tenant_id": str(tenant_id), "modules": modules}
 
 
+@router.get("/modules")
+def installed_module_inventory(
+    tenant_id: uuid.UUID,
+    search: str | None = Query(default=None, min_length=1, max_length=100),
+    limit: int = Query(default=25, ge=1, le=50),
+    offset: int = Query(default=0, ge=0, le=MAX_INVENTORY_OFFSET),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    """Page the complete installed Odoo module inventory through one policy key.
+
+    Search is limited to module technical names and remains a server-built
+    allowlisted filter; no Odoo model, field, method, or raw domain is exposed.
+    """
+    role = _role_in_tenant(db, user, tenant_id)
+    if role is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    if not _can_manage_automation(role):
+        raise HTTPException(status_code=403, detail="Insufficient role")
+    connection = _operations_odoo_connection(db, user, tenant_id)
+    filters = [{"field": "name", "operator": "ilike", "value": search}] if search else []
+    allowed_modules = allowed_odoo_modules(db, user, tenant_id)
+    if allowed_modules is not None:
+        filters.append(
+            {"field": "name", "operator": "in", "value": sorted(allowed_modules)}
+            if allowed_modules
+            else {"field": "id", "operator": "=", "value": -1}
+        )
+    page = _operations_read_page(connection, resource="installed_modules", filters=filters,
+                                 limit=limit, offset=offset, company_scoped=False)
+    for record in page["records"]:
+        # Display classification is Modeem-owned. Inventory entries never
+        # become callable API resources merely by being installed.
+        module = record.get("name")
+        record["read_supported"] = module in set(RESOURCE_MODULES.values())
+        record["execution_supported"] = any(
+            workflow.required_odoo_module == module
+            and workflow.enabled_default
+            and all(step.executor_available for step in workflow.steps)
+            for workflow in CATALOG
+        )
+    return page
+
+
 @router.get("/automation/catalog")
 def automation_catalog(
     tenant_id: uuid.UUID,
@@ -653,11 +776,20 @@ def automation_catalog(
     role = _role_in_tenant(db, user, tenant_id)
     if role is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
+    workflows = []
+    for workflow in CATALOG:
+        try:
+            _require_workflow_scope(db, user, tenant_id, workflow)
+        except HTTPException as exc:
+            if exc.status_code in (403, 404):
+                continue
+            raise
+        workflows.append(serialize_effective(effective_config(db, tenant_id, workflow.key)))
     return {
         "tenant_id": str(tenant_id),
         "role": role,
         "can_manage": _can_manage_automation(role),
-        "workflows": [serialize_effective(effective_config(db, tenant_id, workflow.key)) for workflow in CATALOG],
+        "workflows": workflows,
     }
 
 
@@ -674,6 +806,7 @@ def automation_effective_config(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
     if get_workflow(workflow_key) is None:
         raise HTTPException(status_code=404, detail="Automation workflow not found")
+    _require_workflow_scope(db, user, tenant_id, get_workflow(workflow_key))
     result = serialize_effective(effective_config(db, tenant_id, workflow_key))
     result.update({"tenant_id": str(tenant_id), "role": role, "can_manage": _can_manage_automation(role)})
     return result
@@ -694,6 +827,7 @@ def update_automation_override(
     workflow = get_workflow(workflow_key)
     if workflow is None:
         raise HTTPException(status_code=404, detail="Automation workflow not found")
+    _require_workflow_scope(db, user, body.tenant_id, workflow)
     try:
         modes = validate_step_modes(workflow, body.step_modes)
     except ValueError as exc:
@@ -739,6 +873,7 @@ def reset_automation_override(
     workflow = get_workflow(workflow_key)
     if workflow is None:
         raise HTTPException(status_code=404, detail="Automation workflow not found")
+    _require_workflow_scope(db, user, body.tenant_id, workflow)
     existing = db.query(AutomationWorkflowOverride).filter_by(
         tenant_id=body.tenant_id, workflow_key=workflow_key
     ).with_for_update().one_or_none()
@@ -774,6 +909,8 @@ def read_finance(
     """Read one bounded, server-policy-controlled finance page."""
     if body.service not in {key for key, _label in _FINANCE_SERVICES}:
         raise HTTPException(status_code=422, detail="Unsupported finance service")
+    require_service_scope(db, user, body.tenant_id, "financial")
+    require_odoo_resource_scope(db, user, body.tenant_id, body.service)
     connection = _operations_odoo_connection(db, user, body.tenant_id)
     if connection.odoo_company_id is None:
         raise HTTPException(
@@ -795,6 +932,8 @@ def read_employees(
     db: Session = Depends(get_db),
 ) -> EmployeeReadResponse:
     """Read employee ids and names from one member-visible tenant's Odoo company."""
+    require_service_scope(db, user, body.tenant_id, "human_resources")
+    require_odoo_resource_scope(db, user, body.tenant_id, "employees_summary")
     connection = _operations_odoo_connection(db, user, body.tenant_id)
     if connection.odoo_company_id is None:
         raise HTTPException(
@@ -830,6 +969,8 @@ def assist_finance(
     """Read the selected Odoo page on the server, then return bounded AI guidance."""
     if body.service not in {key for key, _label in _FINANCE_SERVICES}:
         raise HTTPException(status_code=422, detail="Unsupported finance service")
+    require_service_scope(db, user, body.tenant_id, "financial")
+    require_odoo_resource_scope(db, user, body.tenant_id, body.service)
     connection = _operations_odoo_connection(db, user, body.tenant_id)
     if connection.odoo_company_id is None:
         raise HTTPException(
@@ -900,6 +1041,8 @@ def list_tasks(
         raise HTTPException(status_code=422, detail="Invalid task category")
     if priority is not None and priority not in TASK_PRIORITIES:
         raise HTTPException(status_code=422, detail="Invalid task priority")
+    if tenant_id is not None and category in _SERVICE_PROCEDURES:
+        require_service_scope(db, user, tenant_id, category)
     if source_type is not None and source_type not in ("manual", "odoo", "recurring"):
         raise HTTPException(status_code=422, detail="Invalid task source")
     tenant_ids = _active_tenant_ids(db, user)
@@ -914,13 +1057,23 @@ def list_tasks(
         query = query.filter(OperationTask.priority == priority)
     if source_type:
         query = query.filter(OperationTask.source_type == source_type)
-    total = query.count()
-    grouped = query.with_entities(OperationTask.status, func.count(OperationTask.id)).group_by(
-        OperationTask.status
-    ).all()
+    candidates = query.order_by(OperationTask.updated_at.desc(), OperationTask.id.desc()).all()
+    visible = []
+    for candidate in candidates:
+        try:
+            _require_task_scope(db, user, candidate)
+        except HTTPException as exc:
+            if exc.status_code in (403, 404):
+                continue
+            raise
+        visible.append(candidate)
+    total = len(visible)
+    grouped_counts = {}
+    for candidate in visible:
+        grouped_counts[candidate.status] = grouped_counts.get(candidate.status, 0) + 1
     summary = {task_status: 0 for task_status in TASK_STATUSES}
-    summary.update({row[0]: row[1] for row in grouped})
-    tasks = query.order_by(OperationTask.updated_at.desc(), OperationTask.id.desc()).offset(offset).limit(limit).all()
+    summary.update(grouped_counts)
+    tasks = visible[offset:offset + limit]
     return OperationTaskListOut(
         items=[_to_out(db, task, user) for task in tasks], total=total, summary=summary
     )
@@ -930,7 +1083,9 @@ def list_tasks(
 def get_task(
     task_id: uuid.UUID, user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> OperationTaskOut:
-    return _to_out(db, _scoped_task(db, user, task_id), user)
+    task = _scoped_task(db, user, task_id)
+    _require_task_scope(db, user, task)
+    return _to_out(db, task, user)
 
 
 @router.post(
@@ -947,6 +1102,11 @@ def create_task(
     role = _role_in_tenant(db, user, body.tenant_id)
     if role is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
+    if body.category in _SERVICE_PROCEDURES:
+        require_service_scope(db, user, body.tenant_id, body.category)
+    module_resource = {"financial": "accounting_entries", "human_resources": "employees_summary"}.get(body.category)
+    if module_resource:
+        require_odoo_resource_scope(db, user, body.tenant_id, module_resource)
     service_request = body.procedure_type is not None or body.request_data is not None
     if body.category == "human_resources" and not service_request:
         raise HTTPException(
@@ -1042,6 +1202,8 @@ def create_hr_review_task(
     role = _role_in_tenant(db, user, body.tenant_id)
     if role is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
+    require_service_scope(db, user, body.tenant_id, "human_resources")
+    require_odoo_resource_scope(db, user, body.tenant_id, body.resource)
     if not _is_manager(role):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient role")
     if body.date_from and body.date_to and body.date_from > body.date_to:
@@ -1115,7 +1277,7 @@ def create_hr_review_task(
             "متابعة نتيجة مراجعة مرجعية في أودو. "
             "لا يحتوي هذا الوصف على بيانات الموظف أو تفاصيل الحضور أو الإجازة أو الراتب."
         ),
-        category="administrative",
+        category="human_resources",
         priority=body.priority,
         assigned_user_id=body.assigned_user_id,
         created_by_user_id=user.id,
@@ -1142,6 +1304,7 @@ def _transition(
     db: Session,
 ) -> OperationTaskOut:
     task = _scoped_task(db, user, task_id, lock=True)
+    _require_task_scope(db, user, task)
     role = _role_in_tenant(db, user, task.tenant_id)
     if role is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
@@ -1218,6 +1381,7 @@ def reject_task(task_id: uuid.UUID, body: OperationTaskAction, user: User = Depe
 
 def _manager_task(db: Session, user: User, task_id: uuid.UUID) -> OperationTask:
     task = _scoped_task(db, user, task_id, lock=True)
+    _require_task_scope(db, user, task)
     if not _is_manager(_role_in_tenant(db, user, task.tenant_id)):
         raise HTTPException(status_code=403, detail="Insufficient role")
     return task
@@ -1868,13 +2032,23 @@ def retry_action(
 @router.get("/recurring-templates", response_model=list[RecurringTemplateOut])
 def list_recurring_templates(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     ids = _active_tenant_ids(db, user)
-    return [RecurringTemplateOut(id=t.id, tenant_id=t.tenant_id, title=t.title, description=t.description, category=t.category, priority=t.priority, frequency=t.frequency, timezone=t.timezone, enabled=t.enabled) for t in db.query(RecurringTaskTemplate).filter(RecurringTaskTemplate.tenant_id.in_(ids)).all()]
+    result = []
+    for t in db.query(RecurringTaskTemplate).filter(RecurringTaskTemplate.tenant_id.in_(ids)).all():
+        try:
+            _require_category_scope(db, user, t.tenant_id, t.category)
+        except HTTPException as exc:
+            if exc.status_code in (403, 404):
+                continue
+            raise
+        result.append(RecurringTemplateOut(id=t.id, tenant_id=t.tenant_id, title=t.title, description=t.description, category=t.category, priority=t.priority, frequency=t.frequency, timezone=t.timezone, enabled=t.enabled))
+    return result
 
 @router.post("/recurring-templates", response_model=RecurringTemplateOut, dependencies=[Depends(require_csrf)])
 def create_recurring_template(body: RecurringTemplateRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     if body.frequency not in ("daily", "weekly", "monthly") or body.category not in TASK_CATEGORIES or body.priority not in TASK_PRIORITIES:
         raise HTTPException(status_code=422, detail="Invalid recurring template")
     if not _is_manager(_role_in_tenant(db, user, body.tenant_id)): raise HTTPException(status_code=403, detail="Insufficient role")
+    _require_category_scope(db, user, body.tenant_id, body.category)
     from zoneinfo import ZoneInfo
     try: ZoneInfo(body.timezone)
     except Exception as exc: raise HTTPException(status_code=422, detail="Invalid timezone") from exc
@@ -1887,5 +2061,6 @@ def set_recurring_template(template_id: uuid.UUID, enabled: bool, user: User = D
     t = db.query(RecurringTaskTemplate).filter(RecurringTaskTemplate.id == template_id, RecurringTaskTemplate.tenant_id.in_(_active_tenant_ids(db, user))).one_or_none()
     if t is None: raise HTTPException(status_code=404, detail="Template not found")
     if not _is_manager(_role_in_tenant(db, user, t.tenant_id)): raise HTTPException(status_code=403, detail="Insufficient role")
+    _require_category_scope(db, user, t.tenant_id, t.category)
     t.enabled = enabled
     return RecurringTemplateOut(id=t.id, tenant_id=t.tenant_id, title=t.title, description=t.description, category=t.category, priority=t.priority, frequency=t.frequency, timezone=t.timezone, enabled=t.enabled)

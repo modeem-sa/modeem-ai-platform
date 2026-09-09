@@ -165,6 +165,11 @@ def _duration_bucket(elapsed: float) -> str:
 def _ensure_tenant_context(
     tenant_context: TenantContext, proxy_tenant_id: uuid.UUID
 ) -> uuid.UUID:
+    if tenant_context.role == "customer":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Customer accounts use the service-request portal",
+        )
     if tenant_context.tenant.id != proxy_tenant_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tenant context mismatch")
     return tenant_context.tenant.id
@@ -459,8 +464,7 @@ def export_document(
     _csrf: Annotated[None, Depends(require_csrf)],
 ) -> Response:
     """Export the reviewed browser text without persisting or enriching it."""
-    if tenant_context.tenant.id != proxy_tenant_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Tenant context mismatch")
+    _ensure_tenant_context(tenant_context, proxy_tenant_id)
 
     try:
         content, media_type = build_export(body.document, file_format)

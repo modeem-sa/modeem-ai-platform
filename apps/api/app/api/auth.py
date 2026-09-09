@@ -24,6 +24,7 @@ from app.core.security import (
     verify_password,
 )
 from app.models import Tenant, User
+import json
 from app.models.user import normalize_email
 from app.schemas.auth import (
     ChangePasswordRequest,
@@ -263,6 +264,8 @@ def _me_response(db: Session, user: User, tenant_id) -> MeResponse:
             tenant_id=m.tenant_id,
             tenant_name=tenants[m.tenant_id].name if m.tenant_id in tenants else "",
             role=m.role,
+            odoo_module_scope=json.loads(m.odoo_module_scope_json) if m.odoo_module_scope_json else None,
+            service_scope=json.loads(m.service_scope_json) if m.service_scope_json else None,
         )
         for m in memberships
     ]
@@ -271,7 +274,9 @@ def _me_response(db: Session, user: User, tenant_id) -> MeResponse:
         m = next((m for m in memberships if m.tenant_id == tenant_id), None)
         if m is not None and m.tenant_id in tenants:
             current = CurrentTenantOut(
-                id=m.tenant_id, name=tenants[m.tenant_id].name, role=m.role
+                id=m.tenant_id, name=tenants[m.tenant_id].name, role=m.role,
+                odoo_module_scope=json.loads(m.odoo_module_scope_json) if m.odoo_module_scope_json else None,
+                service_scope=json.loads(m.service_scope_json) if m.service_scope_json else None,
             )
         elif user.is_superuser:
             t = db.get(Tenant, tenant_id)
