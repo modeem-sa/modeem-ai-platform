@@ -13,6 +13,7 @@ export interface AutomationStep {
 export interface AutomationWorkflow {
   key: string;
   module: string;
+  required_odoo_module: string | null;
   service: string;
   label_ar: string;
   label_en: string;

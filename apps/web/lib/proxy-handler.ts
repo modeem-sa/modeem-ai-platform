@@ -57,6 +57,9 @@ function isPublicPath(segments: string[]): boolean {
 function supportsTenantlessSession(segments: string[]): boolean {
   const path = segments.join("/");
   return (
+    path === "api/v1/permissions" ||
+    path === "api/v1/operations/bootstrap" ||
+    path === "api/v1/operations/automation/catalog" ||
     path === "api/v1/operations/board" ||
     path.startsWith("api/v1/operations/board/tasks/")
   );

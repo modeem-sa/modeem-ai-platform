@@ -146,6 +146,28 @@ describe("proxy authorization boundary", () => {
     );
   });
 
+  for (const path of [
+    ["api", "v1", "permissions"],
+    ["api", "v1", "operations", "bootstrap"],
+    ["api", "v1", "operations", "automation", "catalog"],
+  ]) {
+    it(`allows authenticated aggregate ${path.slice(2).join("/")} requests without a selected tenant`, async () => {
+      const capture: { url: string; init?: RequestInit } = { url: "" };
+      const result = await proxyRequest(
+        makeReq(`http://x/backend/${path.join("/")}`, {
+          cookie: sessionCookie(false),
+        }),
+        path,
+        "?tenant_id=tenant-from-query",
+        okFetch(capture) as never,
+      );
+
+      assert.equal(result.status, 200);
+      const headers = capture.init?.headers as Headers;
+      assert.equal(headers.get("X-Tenant-ID"), null);
+    });
+  }
+
   it("forwards tenant-scoped requests with trusted internal headers", async () => {
     const capture: { url: string; init?: RequestInit } = { url: "" };
     const result = await proxyRequest(

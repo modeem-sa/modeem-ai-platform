@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     # derived from or defaulted to them. In development, connection
     # operations fail clearly until this is configured.
     connection_encryption_key: str = ""
+    # A private application directory.  It is intentionally not tied to any
+    # hosting runtime and can be replaced with an absolute mounted directory.
+    invoice_upload_dir: str = "./data/invoice_uploads"
+    service_request_upload_dir: str = "/var/lib/modeem/service_requests"
 
     # Bootstrap admin (development convenience; never commit real values).
     bootstrap_admin_email: str = ""

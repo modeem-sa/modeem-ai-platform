@@ -28,6 +28,7 @@ class CatalogStep:
 class CatalogWorkflow:
     key: str
     module: str
+    required_odoo_module: str | None
     service: str
     label_ar: str
     label_en: str
@@ -65,20 +66,23 @@ _PROPOSED_STEPS = tuple(
 )
 
 CATALOG: tuple[CatalogWorkflow, ...] = (
-    CatalogWorkflow("finance.overdue_invoice_followup", "finance", "overdue_invoice_followup",
+    CatalogWorkflow("finance.overdue_invoice_followup", "finance", "account", "overdue_invoice_followup",
         "متابعة الفواتير المتأخرة", "Overdue invoice follow-up",
         "قراءة الفواتير المتأخرة وتجهيز نشاط متابعة آمن للاعتماد.",
         "Read overdue invoices and prepare a safe follow-up activity for approval.",
         1, True, _STANDARD_STEPS),
-    CatalogWorkflow("hr.attendance_review", "human_resources", "attendance_review",
+    CatalogWorkflow("hr.attendance_review", "human_resources", "hr_attendance", "attendance_review",
         "مراجعة الحضور", "Attendance review", "اقتراح مراجعة حالات الحضور.",
         "Proposed attendance exception review.", 1, False, _PROPOSED_STEPS),
-    CatalogWorkflow("purchasing.purchase_request_review", "purchasing", "purchase_request_review",
+    CatalogWorkflow("purchasing.purchase_request_review", "purchasing", "purchase", "purchase_request_review",
         "مراجعة طلبات الشراء", "Purchase request review", "اقتراح مراجعة طلبات الشراء.",
         "Proposed purchase request review.", 1, False, _PROPOSED_STEPS),
-    CatalogWorkflow("administrative.official_letter", "administrative", "official_letter",
+    CatalogWorkflow("administrative.official_letter", "administrative", None, "official_letter",
         "إعداد خطاب رسمي", "Official letter preparation", "اقتراح إعداد خطاب رسمي.",
         "Proposed official letter preparation.", 1, False, _PROPOSED_STEPS),
+    CatalogWorkflow("hr.payroll_report", "human_resources", "hr_payroll", "payroll_report",
+        "تقرير الرواتب", "Payroll report", "استخراج تقرير رواتب للموظف بعد مراجعته.",
+        "Employee-directed read-only payroll extraction.", 1, False, _PROPOSED_STEPS),
 )
 _BY_KEY = {workflow.key: workflow for workflow in CATALOG}
 
@@ -134,7 +138,8 @@ def serialize_effective(config: dict[str, object]) -> dict[str, object]:
     modes = config["step_modes"]
     assert isinstance(modes, dict)
     return {
-        "key": workflow.key, "module": workflow.module, "service": workflow.service,
+        "key": workflow.key, "module": workflow.module,
+        "required_odoo_module": workflow.required_odoo_module, "service": workflow.service,
         "label_ar": workflow.label_ar, "label_en": workflow.label_en,
         "description_ar": workflow.description_ar, "description_en": workflow.description_en,
         "definition_version": workflow.version, "enabled_default": workflow.enabled_default,
