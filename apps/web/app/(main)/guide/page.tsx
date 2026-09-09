@@ -6,15 +6,21 @@ import { Header } from "@/components/header";
 const GUIDE_CONTENT = {
   ar: {
     title: "دليل استخدام المنصة",
-    lastUpdated: "آخر تحديث: 31 أغسطس 2026",
+    lastUpdated: "آخر تحديث: 9 سبتمبر 2026",
     updateLogTitle: "سجل التحديثات",
     versionInfo: "معلومات الإصدار",
     updateLogItems: [
+      "إضافة إدارة المستخدمين وعضويات الجمعيات ونطاقات خدمات Modeem وموديولات Odoo من شاشة المستخدمين والصلاحيات.",
+      "إضافة جرد موديولات Odoo المثبتة مع البحث والتصفح وبيان دعم القراءة والتنفيذ.",
       "تحويل الفترة إلى تاريخ بداية ونهاية قابلين للاختيار، مع إضافة الموظف مباشرة من Odoo.",
       "استمرار إنشاء مقترح Modeem ومسودة التحصيل عند تعذر مزود الذكاء الاصطناعي.",
       "إعادة ربط مهام الفواتير القديمة باتصال Odoo النشط المطابق للجمعية والشركة."
     ],
     sections: {
+      permissions: {
+        title: "إدارة المستخدمين وصلاحيات الجمعيات",
+        desc: "يستطيع المالك أو المدير الإداري فتح «المستخدمون والصلاحيات» من القائمة الجانبية، ثم إنشاء حساب جديد أو اختيار حساب موجود وإسناده إلى جمعية أو عدة جمعيات. لكل عضوية حدد الدور والحالة، ثم اختر وصولًا غير مقيّد أو نطاقًا مقيّدًا لخدمات Modeem وموديولات Odoo. المدير المفوض يحتاج إلى صلاحية tenant_memberships صراحةً لإدارة العضويات، ولا يستطيع منح صلاحيات أعلى من نطاقه."
+      },
       selection: {
         title: "اختيار الجمعية والمجال والإجراء",
         desc: "تبدأ جميع العمليات بتحديد نطاق العمل. اختر الجمعية أولاً لعرض البيانات المرتبطة بها، ثم حدد المجال (إداري أو مالي) لتصفية الإجراءات المتاحة بدقة."
@@ -50,19 +56,30 @@ const GUIDE_CONTENT = {
       draftContent: "السيد العميل، نود تذكيركم بلطف بقرب موعد استحقاق الفاتورة المرفقة. نرجو التكرم بالاطلاع وإتمام عملية السداد لضمان استمرارية الخدمة بأفضل شكل.",
       statusLoading: "قيد المعالجة...",
       statusSuccess: "مكتمل بنجاح",
-      statusUnavailable: "غير متاح"
+      statusUnavailable: "غير متاح",
+      permissionsTitle: "عضوية الجمعية",
+      permissionsRole: "الدور: مدير",
+      permissionsServices: "الخدمات: المالية، المشتريات",
+      permissionsModules: "Odoo: account، purchase",
+      permissionsMode: "وصول مقيّد"
     }
   },
   en: {
     title: "Platform Guide",
-    lastUpdated: "Last updated: August 31, 2026",
+    lastUpdated: "Last updated: September 9, 2026",
     updateLogTitle: "Update Log",
     versionInfo: "VERSION INFO",
     updateLogItems: [
+      "Added user accounts, multi-association memberships, Modeem service scopes, and Odoo module scopes under People & Permissions.",
+      "Added searchable, paginated installed Odoo module inventory with truthful read and execution capability indicators.",
       "Replaced the single period field with selectable start and end dates, and added the Odoo employee dropdown.",
       "Two reliability fixes to improve system stability."
     ],
     sections: {
+      permissions: {
+        title: "Managing People and Association Permissions",
+        desc: "An owner or administrator can open People & Permissions from the sidebar, create a new account or select an existing one, and assign it to one or more associations. For each membership, choose the role and status, then select unrestricted access or a restricted set of Modeem services and Odoo modules. A delegated manager must explicitly hold tenant_memberships to manage memberships and cannot grant access beyond their own scope."
+      },
       selection: {
         title: "Choosing Association, Domain, and Procedure",
         desc: "All operations start by defining the scope. Select the association first to view related data, then select the domain (administrative or financial) to filter available procedures and accurately direct AI tasks."
@@ -98,7 +115,12 @@ const GUIDE_CONTENT = {
       draftContent: "السيد العميل، نود تذكيركم بلطف بقرب موعد استحقاق الفاتورة المرفقة. نرجو التكرم بالاطلاع وإتمام عملية السداد لضمان استمرارية الخدمة بأفضل شكل.",
       statusLoading: "Processing...",
       statusSuccess: "Completed",
-      statusUnavailable: "Unavailable"
+      statusUnavailable: "Unavailable",
+      permissionsTitle: "Association membership",
+      permissionsRole: "Role: Manager",
+      permissionsServices: "Services: Financial, Purchasing",
+      permissionsModules: "Odoo: account, purchase",
+      permissionsMode: "Restricted access"
     }
   }
 };
@@ -138,6 +160,30 @@ function DiagramSelection({ uiDesc }: { uiDesc: GuideUi }) {
             {uiDesc.selectProc}
           </span>
           <Icons.ChevronDown className="w-4 h-4 text-slate-500" />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function DiagramPermissions({ uiDesc }: { uiDesc: GuideUi }) {
+  return (
+    <div className="rounded-2xl border border-emerald-900/50 bg-slate-900/80 p-5 shadow-lg">
+      <div className="mb-4 flex items-center justify-between">
+        <div>
+          <div className="text-xs font-bold uppercase tracking-widest text-emerald-400">{uiDesc.permissionsTitle}</div>
+          <div className="mt-1 text-sm font-semibold text-slate-100">{uiDesc.permissionsRole}</div>
+        </div>
+        <span className="rounded-full border border-emerald-700/50 bg-emerald-950/60 px-3 py-1 text-xs text-emerald-300">
+          {uiDesc.permissionsMode}
+        </span>
+      </div>
+      <div className="space-y-2.5">
+        <div className="rounded-lg border border-slate-700/60 bg-slate-800/70 px-3 py-2.5 text-sm text-slate-300">
+          {uiDesc.permissionsServices}
+        </div>
+        <div className="rounded-lg border border-slate-700/60 bg-slate-800/70 px-3 py-2.5 font-mono text-sm text-sky-300" dir="ltr">
+          {uiDesc.permissionsModules}
         </div>
       </div>
     </div>
@@ -281,6 +327,10 @@ export default function GuidePage() {
 
   const sections = [
     {
+      ...content.sections.permissions,
+      diagram: <DiagramPermissions uiDesc={content.uiDesc} />
+    },
+    {
       ...content.sections.selection,
       diagram: <DiagramSelection uiDesc={content.uiDesc} />
     },
@@ -346,7 +396,7 @@ export default function GuidePage() {
                 {content.versionInfo}
               </div>
               <div className="text-sm font-mono text-sky-100 bg-sky-900/40 px-4 py-2 rounded-lg border border-sky-500/20 inline-block shadow-sm" dir="ltr">
-                2026-08-31
+                2026-09-09
               </div>
             </div>
           </div>
