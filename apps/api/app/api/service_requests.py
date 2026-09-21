@@ -47,6 +47,8 @@ WORKER_ROLES = (*MANAGER_ROLES, "member")
 READONLY_EMPLOYEE_ROLES = (*WORKER_ROLES, "viewer")
 MAX_FILE = 10 * 1024 * 1024
 MAX_TOTAL = 25 * 1024 * 1024
+MODULE_PAGE_SIZE = 50
+MAX_MODULE_INVENTORY = 5000
 ALLOWED_FILES = {
     "application/pdf": (".pdf",),
     "image/png": (".png",),
@@ -292,6 +294,31 @@ def _audit(db: Session, request: ServiceRequest, user: User, action: str) -> Non
     )
 
 
+def _module_connection(db: Session, tenant_id: uuid.UUID) -> Connection:
+    connection = (
+        db.query(Connection)
+        .filter(
+            Connection.tenant_id == tenant_id,
+            Connection.provider == "odoo",
+            Connection.is_active.is_(True),
+            Connection.status == "configured",
+            Connection.last_test_status == "success",
+            Connection.selected_transport.in_(("xmlrpc", "json2")),
+            Connection.encrypted_credentials.is_not(None),
+            Connection.encryption_version.is_not(None),
+        )
+        .order_by(
+            Connection.last_tested_at.desc().nullslast(),
+            Connection.created_at.desc(),
+            Connection.id.desc(),
+        )
+        .first()
+    )
+    if connection is None:
+        raise HTTPException(status_code=409, detail="Tenant has no active tested Odoo connection")
+    return connection
+
+
 def _live_modules(
     db: Session,
     user: User,
@@ -300,6 +327,7 @@ def _live_modules(
     search: str | None = None,
     limit: int = 50,
     offset: int = 0,
+    apply_user_scope: bool = True,
 ) -> dict:
     if not user.is_superuser and db.query(TenantMembership.id).filter(
         TenantMembership.user_id == user.id,
@@ -307,21 +335,10 @@ def _live_modules(
         TenantMembership.is_active.is_(True),
     ).first() is None:
         raise HTTPException(status_code=404, detail="Tenant not found")
-    connection = db.query(Connection).filter(
-        Connection.tenant_id == tenant_id,
-        Connection.provider == "odoo",
-        Connection.is_active.is_(True),
-        Connection.status != "disabled",
-        Connection.last_test_status == "success",
-        Connection.selected_transport.in_(("xmlrpc", "json2")),
-        Connection.encrypted_credentials.is_not(None),
-        Connection.encryption_version.is_not(None),
-    ).order_by(Connection.created_at.desc(), Connection.id.desc()).first()
-    if connection is None:
-        raise HTTPException(status_code=409, detail="Tenant has no active tested Odoo connection")
+    connection = _module_connection(db, tenant_id)
     filters = [{"field": "name", "operator": "=", "value": search}] if search else []
     allowed_modules = allowed_odoo_modules(db, user, tenant_id)
-    if allowed_modules is not None:
+    if apply_user_scope and allowed_modules is not None:
         filters.append(
             {"field": "name", "operator": "in", "value": sorted(allowed_modules)}
             if allowed_modules
@@ -335,6 +352,84 @@ def _live_modules(
         offset=offset,
         company_scoped=False,
     )
+
+
+def _all_live_modules(
+    db: Session,
+    user: User,
+    tenant_id: uuid.UUID,
+    *,
+    apply_user_scope: bool,
+) -> list[dict]:
+    records: list[dict] = []
+    seen_names: set[str] = set()
+    visited_offsets: set[int] = set()
+    offset = 0
+    while True:
+        if offset in visited_offsets:
+            raise HTTPException(status_code=502, detail="Invalid Odoo module pagination metadata")
+        visited_offsets.add(offset)
+        page = _live_modules(
+            db,
+            user,
+            tenant_id,
+            limit=MODULE_PAGE_SIZE,
+            offset=offset,
+            apply_user_scope=apply_user_scope,
+        )
+        page_records = page.get("records")
+        if not isinstance(page_records, list):
+            raise HTTPException(status_code=502, detail="Invalid Odoo module inventory response")
+        if (
+            page.get("offset") != offset
+            or page.get("returned_count") != len(page_records)
+            or not isinstance(page.get("has_more"), bool)
+        ):
+            raise HTTPException(status_code=502, detail="Invalid Odoo module pagination metadata")
+        for record in page_records:
+            name = record.get("name")
+            if isinstance(name, str) and name not in seen_names:
+                seen_names.add(name)
+                records.append(record)
+                if len(records) > MAX_MODULE_INVENTORY:
+                    raise HTTPException(status_code=502, detail="Odoo module inventory exceeds safe limit")
+        has_more = page.get("has_more")
+        next_offset = page.get("next_offset")
+        if not has_more:
+            break
+        if not isinstance(next_offset, int) or next_offset <= offset:
+            raise HTTPException(status_code=502, detail="Invalid Odoo module pagination metadata")
+        offset = next_offset
+    return sorted(records, key=lambda item: (str(item.get("name", "")), int(item.get("id", 0))))
+
+
+def _module_capabilities(db: Session, tenant_id: uuid.UUID, module: str) -> dict:
+    matching = [workflow for workflow in CATALOG if workflow.required_odoo_module == module]
+    return {
+        "installed": True,
+        "accepts_requests": bool(matching),
+        "read_supported": module in set(RESOURCE_MODULES.values()),
+        "execution_supported": any(
+            bool(effective_config(db, tenant_id, workflow.key)["enabled"])
+            and all(step.executor_available for step in workflow.steps)
+            for workflow in matching
+        ),
+    }
+
+
+def _paginate_module_records(records: list[dict], *, limit: int, offset: int) -> dict:
+    page_records = records[offset : offset + limit]
+    next_offset = offset + len(page_records)
+    has_more = next_offset < len(records)
+    return {
+        "resource": "installed_modules",
+        "records": page_records,
+        "limit": limit,
+        "offset": offset,
+        "returned_count": len(page_records),
+        "has_more": has_more,
+        "next_offset": next_offset if has_more else None,
+    }
 
 
 def _require_live_module(
@@ -510,20 +605,70 @@ def request_modules(
     if _membership(db, user, tenant_id) is None:
         raise HTTPException(status_code=404, detail="Tenant not found")
     require_service_scope(db, user, tenant_id, "administrative")
-    page = _live_modules(db, user, tenant_id, search=search, limit=limit, offset=offset)
+    if search:
+        needle = search.casefold()
+        records = [
+            record
+            for record in _all_live_modules(db, user, tenant_id, apply_user_scope=True)
+            if needle in str(record.get("name", "")).casefold()
+            or needle in str(record.get("shortdesc", "")).casefold()
+        ]
+        page = _paginate_module_records(records, limit=limit, offset=offset)
+    else:
+        page = _live_modules(db, user, tenant_id, limit=limit, offset=offset)
     for record in page.get("records", []):
         module = record.get("name")
-        matching = [workflow for workflow in CATALOG if workflow.required_odoo_module == module]
-        record["capabilities"] = {
-            "installed": True,
-            "accepts_requests": bool(matching),
-            "read_supported": module in set(RESOURCE_MODULES.values()),
-            "execution_supported": any(
-                bool(effective_config(db, tenant_id, workflow.key)["enabled"])
-                and all(step.executor_available for step in workflow.steps)
-                for workflow in matching
-            ),
-        }
+        record["capabilities"] = _module_capabilities(db, tenant_id, module)
+    return page
+
+
+@router.get("/modules/inventory")
+def installed_module_inventory(
+    tenant_id: uuid.UUID,
+    search: str | None = Query(default=None, min_length=1, max_length=100),
+    limit: int = Query(default=50, ge=1, le=50),
+    offset: int = Query(default=0, ge=0, le=MAX_INVENTORY_OFFSET),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    membership = _membership(db, user, tenant_id)
+    if membership is None:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    if not user.is_superuser and membership.role not in MANAGER_ROLES:
+        raise HTTPException(status_code=403, detail="Manager membership required")
+    require_service_scope(db, user, tenant_id, "administrative")
+
+    allowed_modules = allowed_odoo_modules(db, user, tenant_id)
+    records = _all_live_modules(db, user, tenant_id, apply_user_scope=False)
+    for record in records:
+        module = str(record.get("name", ""))
+        record["capabilities"] = _module_capabilities(db, tenant_id, module)
+        record["authorized"] = allowed_modules is None or module in allowed_modules
+    if search:
+        needle = search.casefold()
+        filtered = [
+            record
+            for record in records
+            if needle in str(record.get("name", "")).casefold()
+            or needle in str(record.get("shortdesc", "")).casefold()
+        ]
+    else:
+        filtered = records
+    page = _paginate_module_records(filtered, limit=limit, offset=offset)
+    connection = _module_connection(db, tenant_id)
+    page["connection"] = {"id": str(connection.id), "name": connection.name}
+    page["summary"] = {
+        "installed": len(records),
+        "applications": sum(bool(record.get("application")) for record in records),
+        "technical": sum(not bool(record.get("application")) for record in records),
+        "visible_to_user": sum(bool(record["authorized"]) for record in records),
+        "read_supported": sum(
+            bool(record["capabilities"]["read_supported"]) for record in records
+        ),
+        "execution_supported": sum(
+            bool(record["capabilities"]["execution_supported"]) for record in records
+        ),
+    }
     return page
 
 

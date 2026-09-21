@@ -3,6 +3,8 @@
 import uuid
 from types import SimpleNamespace
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.api import service_requests as service_requests_api
@@ -372,3 +374,235 @@ def test_dispatch_rejects_customer_unknown_unavailable_and_missing_module(seed, 
         headers=_csrf(employee),
     )
     assert missing.status_code == 409
+
+
+@pytest.mark.parametrize("total", [10, 50, 51, 137])
+def test_complete_module_inventory_paginates_deduplicates_and_keeps_custom_technical(
+    seed, monkeypatch, total
+):
+    _service_seed(seed)
+    source = [
+        {
+            "id": index + 1,
+            "name": (
+                "modeem_custom"
+                if total == 137 and index == 136
+                else f"module_{index:03d}"
+            ),
+            "shortdesc": (
+                "Custom Construction"
+                if total == 137 and index == 136
+                else f"Module {index}"
+            ),
+            "installed_version": "18.0",
+            "application": index % 3 == 0,
+            "category_id": False,
+        }
+        for index in range(total)
+    ]
+    offsets: list[int] = []
+
+    def live_modules(
+        _db,
+        _user,
+        _tenant_id,
+        *,
+        search=None,
+        limit=50,
+        offset=0,
+        apply_user_scope=True,
+    ):
+        assert search is None
+        offsets.append(offset)
+        records = source[offset : offset + limit]
+        if offset == 50 and total > 50:
+            records = [source[49], *records]
+        next_offset = min(offset + limit, len(source))
+        return {
+            "resource": "installed_modules",
+            "records": records,
+            "returned_count": len(records),
+            "limit": limit,
+            "offset": offset,
+            "has_more": next_offset < len(source),
+            "next_offset": next_offset if next_offset < len(source) else None,
+        }
+
+    monkeypatch.setattr(service_requests_api, "_live_modules", live_modules)
+    db = TestingSession()
+    user = db.query(User).filter(User.email == "a@example.com").one()
+    records = service_requests_api._all_live_modules(
+        db, user, seed["tenant_a"], apply_user_scope=False
+    )
+    db.close()
+
+    assert offsets == list(range(0, total, 50))
+    assert len(records) == total
+    assert len({record["name"] for record in records}) == total
+    if total == 137:
+        custom = next(record for record in records if record["name"] == "modeem_custom")
+        assert custom["application"] is False
+
+
+def test_module_inventory_rejects_non_advancing_pagination(seed, monkeypatch):
+    _service_seed(seed)
+
+    monkeypatch.setattr(
+        service_requests_api,
+        "_live_modules",
+        lambda *_args, **_kwargs: {
+            "records": [{"id": 1, "name": "base"}],
+            "offset": 0,
+            "returned_count": 1,
+            "has_more": True,
+            "next_offset": 0,
+        },
+    )
+    db = TestingSession()
+    user = db.query(User).filter(User.email == "a@example.com").one()
+    with pytest.raises(HTTPException) as exc:
+        service_requests_api._all_live_modules(
+            db, user, seed["tenant_a"], apply_user_scope=False
+        )
+    db.close()
+    assert exc.value.status_code == 502
+
+
+def test_manager_inventory_summary_search_and_customer_denial(seed, monkeypatch):
+    _service_seed(seed)
+    records = [
+        {
+            "id": 1,
+            "name": "account",
+            "shortdesc": "Accounting",
+            "installed_version": "18.0",
+            "application": True,
+            "category_id": [1, "Finance"],
+        },
+        {
+            "id": 2,
+            "name": "modeem_custom",
+            "shortdesc": "Custom Construction",
+            "installed_version": "18.0.1",
+            "application": False,
+            "category_id": False,
+        },
+    ]
+
+    monkeypatch.setattr(
+        service_requests_api,
+        "_all_live_modules",
+        lambda *_args, **_kwargs: [dict(record) for record in records],
+    )
+    monkeypatch.setattr(
+        service_requests_api,
+        "_module_connection",
+        lambda *_args, **_kwargs: type(
+            "SafeConnection", (), {"id": uuid.uuid4(), "name": "Primary Odoo"}
+        )(),
+    )
+
+    manager = _client("a@example.com")
+    response = manager.get(
+        f"/api/v1/service-requests/modules/inventory?tenant_id={seed['tenant_a']}"
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["summary"]["installed"] == 2
+    assert body["summary"]["applications"] == 1
+    assert body["summary"]["technical"] == 1
+    assert body["connection"]["name"] == "Primary Odoo"
+    assert {record["name"] for record in body["records"]} == {
+        "account",
+        "modeem_custom",
+    }
+
+    searched = manager.get(
+        f"/api/v1/service-requests/modules/inventory"
+        f"?tenant_id={seed['tenant_a']}&search=construction"
+    )
+    assert searched.status_code == 200
+    assert [record["name"] for record in searched.json()["records"]] == [
+        "modeem_custom"
+    ]
+
+    customer = _client("customer@example.com")
+    denied = customer.get(
+        f"/api/v1/service-requests/modules/inventory?tenant_id={seed['tenant_a']}"
+    )
+    assert denied.status_code == 403
+
+
+def test_module_search_preserves_explicit_scope_and_tenant_isolation(seed, monkeypatch):
+    _service_seed(seed)
+    db = TestingSession()
+    membership = (
+        db.query(TenantMembership)
+        .join(User, User.id == TenantMembership.user_id)
+        .filter(
+            User.email == "customer@example.com",
+            TenantMembership.tenant_id == seed["tenant_a"],
+        )
+        .one()
+    )
+    membership.odoo_module_scope_json = '["account"]'
+    db.commit()
+    db.close()
+
+    captured_filters: list[list[dict]] = []
+
+    def read_page(_connection, *, filters, limit, offset, **_kwargs):
+        captured_filters.append(filters)
+        records = [
+            {
+                "id": 1,
+                "name": "account",
+                "shortdesc": "Accounting",
+                "installed_version": "18.0",
+                "application": True,
+                "category_id": False,
+            }
+        ]
+        return {
+            "resource": "installed_modules",
+            "records": records[offset : offset + limit],
+            "returned_count": len(records[offset : offset + limit]),
+            "limit": limit,
+            "offset": offset,
+            "has_more": False,
+            "next_offset": None,
+        }
+
+    monkeypatch.setattr(service_requests_api, "_operations_read_page", read_page)
+    monkeypatch.setattr(
+        service_requests_api,
+        "_module_connection",
+        lambda *_args, **_kwargs: SimpleNamespace(id=uuid.uuid4(), name="Primary"),
+    )
+
+    customer = _client("customer@example.com")
+    searched = customer.get(
+        f"/api/v1/service-requests/modules"
+        f"?tenant_id={seed['tenant_a']}&search=custom"
+    )
+    assert searched.status_code == 200
+    assert searched.json()["records"] == []
+    assert any(
+        item == {"field": "name", "operator": "in", "value": ["account"]}
+        for item in captured_filters[0]
+    )
+
+    cross_tenant = customer.get(
+        f"/api/v1/service-requests/modules?tenant_id={seed['tenant_b']}"
+    )
+    assert cross_tenant.status_code == 404
+
+
+def test_installed_module_policy_includes_technical_modules_and_excludes_uninstalled():
+    from app.integrations.odoo.read_policies import get_policy
+
+    policy = get_policy("installed_modules")
+    assert policy is not None
+    assert policy.base_domain == (("state", "=", "installed"),)
+    assert "application" in policy.fields
+    assert ("application", "=", True) not in policy.base_domain

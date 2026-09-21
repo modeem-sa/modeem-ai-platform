@@ -8,7 +8,7 @@ import {
   RequestAssignee,
   fetchServiceRequests,
   fetchServiceRequest,
-  fetchRequestModules,
+  fetchAllRequestModules,
   fetchRequestAssignees,
   addServiceRequestMessage,
   uploadServiceRequestAttachment,
@@ -84,17 +84,28 @@ export function useServiceRequest(requestId: string | undefined) {
 export function useRequestModules(tenantId: string | undefined) {
   const [modules, setModules] = useState<RequestModule[]>([]);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<Error | null>(null);
 
-  useEffect(() => {
+  const reload = useCallback(async () => {
     if (!tenantId) return;
     setLoading(true);
-    fetchRequestModules(tenantId)
-      .then((res) => setModules(res.records))
-      .catch(console.error)
-      .finally(() => setLoading(false));
+    try {
+      const records = await fetchAllRequestModules(tenantId);
+      setModules(records.filter((record) => record.capabilities.accepts_requests));
+      setError(null);
+    } catch (err) {
+      setModules([]);
+      setError(err instanceof Error ? err : new Error(String(err)));
+    } finally {
+      setLoading(false);
+    }
   }, [tenantId]);
 
-  return { modules, loading };
+  useEffect(() => {
+    void reload();
+  }, [reload]);
+
+  return { modules, loading, error, reload };
 }
 
 export function useRequestAssignees(tenantId: string | undefined, enabled = true) {

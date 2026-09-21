@@ -1,4 +1,5 @@
 import { apiDownload, apiFetch } from "./api";
+import { collectAllModulePages } from "./module-pagination";
 
 export type ServiceRequestPriority = "low" | "medium" | "high" | "urgent";
 export type ServiceRequestStatus =
@@ -113,6 +114,7 @@ export interface RequestModule {
     read_supported: boolean;
     execution_supported: boolean;
   };
+  authorized?: boolean;
 }
 
 export interface RequestModulePage {
@@ -122,6 +124,26 @@ export interface RequestModulePage {
   returned_count: number;
   has_more: boolean;
   next_offset: number | null;
+}
+
+export interface ModuleInventorySummary {
+  installed: number;
+  applications: number;
+  technical: number;
+  visible_to_user: number;
+  read_supported: number;
+  execution_supported: number;
+}
+
+export interface ModuleInventoryPage extends RequestModulePage {
+  summary: ModuleInventorySummary;
+  connection: { id: string; name: string };
+}
+
+export interface ModuleInventory {
+  records: RequestModule[];
+  summary: ModuleInventorySummary;
+  connection: { id: string; name: string };
 }
 
 export interface RequestAssignee {
@@ -202,12 +224,62 @@ export function createServiceRequest(payload: {
 export function fetchRequestModules(
   tenantId: string,
   search?: string,
+  limit = 50,
+  offset = 0,
 ): Promise<RequestModulePage> {
-  const query = new URLSearchParams({ tenant_id: tenantId, limit: "50" });
+  const query = new URLSearchParams({
+    tenant_id: tenantId,
+    limit: String(limit),
+    offset: String(offset),
+  });
   if (search) query.set("search", search);
   return apiFetch<RequestModulePage>(
     `/api/v1/service-requests/modules?${query.toString()}`,
   );
+}
+
+export function fetchAllRequestModules(
+  tenantId: string,
+  search?: string,
+): Promise<RequestModule[]> {
+  return collectAllModulePages((offset) =>
+    fetchRequestModules(tenantId, search, 50, offset),
+  );
+}
+
+export function fetchModuleInventoryPage(
+  tenantId: string,
+  search?: string,
+  limit = 50,
+  offset = 0,
+): Promise<ModuleInventoryPage> {
+  const query = new URLSearchParams({
+    tenant_id: tenantId,
+    limit: String(limit),
+    offset: String(offset),
+  });
+  if (search) query.set("search", search);
+  return apiFetch<ModuleInventoryPage>(
+    `/api/v1/service-requests/modules/inventory?${query.toString()}`,
+  );
+}
+
+export async function fetchAllModuleInventory(
+  tenantId: string,
+  search?: string,
+): Promise<ModuleInventory> {
+  let metadata: Pick<ModuleInventory, "summary" | "connection"> | null = null;
+  const records = await collectAllModulePages(async (offset) => {
+    const page = await fetchModuleInventoryPage(tenantId, search, 50, offset);
+    metadata ??= { summary: page.summary, connection: page.connection };
+    return page;
+  });
+  if (!metadata) throw new Error("Module inventory metadata is missing");
+  const resolvedMetadata = metadata as Pick<
+    ModuleInventory,
+    "summary" | "connection"
+  >;
+  return { records, ...resolvedMetadata };
 }
 
 export function fetchRequestAssignees(

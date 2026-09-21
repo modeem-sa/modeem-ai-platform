@@ -6,6 +6,7 @@ import { useServiceRequests } from "@/hooks/use-service-requests";
 import { ServiceRequestList } from "@/components/service-requests/request-list";
 import { Header } from "@/components/header";
 import { useState } from "react";
+import { ModuleInventory } from "@/components/service-requests/module-inventory";
 
 export default function ServiceInboxPage() {
   const { user } = useAuth();
@@ -66,6 +67,7 @@ export default function ServiceInboxPage() {
             loading={loading} 
             basePath="/service-inbox" 
           />
+          {canViewAll && tenantId && <ModuleInventory tenantId={tenantId} />}
         </div>
       </main>
     </div>

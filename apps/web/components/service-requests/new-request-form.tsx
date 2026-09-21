@@ -15,14 +15,28 @@ export function NewRequestForm({
   onSuccess: (id: string) => void;
   onCancel: () => void;
 }) {
-  const { t } = useLocale();
+  const { t, locale } = useLocale();
   const [subject, setSubject] = useState("");
   const [description, setDescription] = useState("");
   const [requestedModule, setRequestedModule] = useState("");
+  const [moduleSearch, setModuleSearch] = useState("");
   const [priority, setPriority] = useState<ServiceRequestPriority>("medium");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const { modules, loading: modulesLoading } = useRequestModules(tenantId);
+  const {
+    modules,
+    loading: modulesLoading,
+    error: modulesError,
+    reload: reloadModules,
+  } = useRequestModules(tenantId);
+  const moduleNeedle = moduleSearch.trim().toLocaleLowerCase(locale);
+  const visibleModules = modules
+    .filter((module) =>
+      !moduleNeedle
+      || module.name.toLocaleLowerCase(locale).includes(moduleNeedle)
+      || module.shortdesc.toLocaleLowerCase(locale).includes(moduleNeedle),
+    )
+    .slice(0, 100);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -82,7 +96,24 @@ export function NewRequestForm({
         </div>
 
         <div>
-          <label className="block text-sm font-medium text-slate-300 mb-2">{t("reqModule")}</label>
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <label className="block text-sm font-medium text-slate-300">{t("reqModule")}</label>
+            <button
+              type="button"
+              onClick={() => void reloadModules()}
+              disabled={modulesLoading}
+              className="text-xs text-emerald-400 hover:text-emerald-300 disabled:opacity-50"
+            >
+              {locale === "ar" ? "تحديث الموديولات" : "Refresh Modules"}
+            </button>
+          </div>
+          <input
+            type="search"
+            value={moduleSearch}
+            onChange={(event) => setModuleSearch(event.target.value)}
+            placeholder={locale === "ar" ? "ابحث بالاسم أو الوصف" : "Search by name or description"}
+            className="mb-2 w-full rounded-lg border border-slate-700 bg-slate-900 px-4 py-2 text-sm text-slate-200 focus:border-emerald-500 focus:outline-none"
+          />
           <select
             data-testid="new-request-module"
             value={requestedModule}
@@ -91,12 +122,22 @@ export function NewRequestForm({
             className="w-full bg-slate-900 border border-slate-700 rounded-lg px-4 py-2.5 text-slate-200 focus:outline-none focus:border-emerald-500 transition-colors disabled:opacity-50"
           >
             <option value="">{t("reqModuleOptional")}</option>
-            {modules.map((module) => (
+            {visibleModules.map((module) => (
               <option key={module.name} value={module.name}>
-                {module.shortdesc || module.name}
+                {module.shortdesc || module.name} — {module.name}
               </option>
             ))}
           </select>
+          {modulesError && (
+            <p className="mt-2 text-xs text-rose-400">
+              {locale === "ar" ? "تعذر قراءة موديولات Odoo." : "Could not read Odoo modules."}
+            </p>
+          )}
+          {!modulesLoading && moduleNeedle && visibleModules.length === 0 && (
+            <p className="mt-2 text-xs text-slate-500">
+              {locale === "ar" ? "لا توجد نتائج مطابقة." : "No matching modules."}
+            </p>
+          )}
         </div>
 
         <div>
