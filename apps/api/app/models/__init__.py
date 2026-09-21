@@ -20,6 +20,7 @@ from app.models.tenant_membership import TenantMembership
 from app.models.user import User
 from app.models.workflow import Workflow
 from app.models.service_request import ServiceRequest, ServiceRequestMessage, ServiceRequestAttachment, ServiceRequestEvent
+from app.models.agent import AgentMessage, AgentSession
 
 __all__ = [
     "AuditLog",
@@ -46,4 +47,6 @@ __all__ = [
     "ServiceRequestMessage",
     "ServiceRequestAttachment",
     "ServiceRequestEvent",
+    "AgentSession",
+    "AgentMessage",
 ]

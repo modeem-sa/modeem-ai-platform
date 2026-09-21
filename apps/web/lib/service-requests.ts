@@ -60,6 +60,45 @@ export interface ServiceRequest {
   events?: ServiceRequestEvent[];
 }
 
+export interface AgentMessage {
+  id: string;
+  role: "user" | "assistant" | "system";
+  content: string;
+  analysis: RequestAnalysis | null;
+  created_at: string;
+}
+
+export interface RequestAnalysis {
+  request_summary: string;
+  customer_goal: string;
+  service_category: string;
+  required_information: string[];
+  missing_information: string[];
+  suggested_steps: string[];
+  potential_risks: string[];
+  data_sources_needed: string[];
+  approval_likely_required: boolean;
+}
+
+export interface AgentSession {
+  id: string;
+  request_id: string;
+  tenant_id: string;
+  employee_user_id: string;
+  status: "active" | "completed" | "failed";
+  provider_model: string | null;
+  prompt_version: string | null;
+  analysis: RequestAnalysis | null;
+  last_error: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentSessionResponse {
+  session: AgentSession | null;
+  messages: AgentMessage[];
+}
+
 export interface RequestModule {
   id: number;
   name: string;
@@ -106,6 +145,43 @@ export function fetchServiceRequests(
 export function fetchServiceRequest(requestId: string): Promise<ServiceRequest> {
   return apiFetch<ServiceRequest>(
     `/api/v1/service-requests/${encodeURIComponent(requestId)}`,
+  );
+}
+
+export function fetchAgentSession(requestId: string): Promise<AgentSessionResponse> {
+  return apiFetch<AgentSessionResponse>(
+    `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/session`,
+  );
+}
+
+export function startAgentSession(
+  requestId: string,
+  locale: "ar" | "en",
+): Promise<AgentSessionResponse> {
+  return apiFetch<AgentSessionResponse>(
+    `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/session`,
+    { method: "POST", body: JSON.stringify({ locale }) },
+  );
+}
+
+export function analyzeServiceRequest(
+  requestId: string,
+  locale: "ar" | "en",
+): Promise<AgentSessionResponse> {
+  return apiFetch<AgentSessionResponse>(
+    `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/analyze`,
+    { method: "POST", body: JSON.stringify({ locale }) },
+  );
+}
+
+export function sendAgentMessage(
+  requestId: string,
+  content: string,
+  locale: "ar" | "en",
+): Promise<AgentSessionResponse> {
+  return apiFetch<AgentSessionResponse>(
+    `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/messages`,
+    { method: "POST", body: JSON.stringify({ content, locale }) },
   );
 }
 

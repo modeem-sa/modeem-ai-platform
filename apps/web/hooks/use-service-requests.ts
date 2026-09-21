@@ -16,6 +16,11 @@ import {
   assignServiceRequest,
   classifyServiceRequest,
   dispatchServiceRequest,
+  AgentSessionResponse,
+  fetchAgentSession,
+  startAgentSession,
+  analyzeServiceRequest,
+  sendAgentMessage,
 } from "@/lib/service-requests";
 
 export function useServiceRequests(tenantId: string | undefined, employeeInbox = false, includeAll = false) {
@@ -106,6 +111,53 @@ export function useRequestAssignees(tenantId: string | undefined, enabled = true
   }, [tenantId, enabled]);
 
   return { assignees, loading };
+}
+
+export function useRequestWorkbench(requestId: string | undefined, locale: "ar" | "en", enabled = true) {
+  const [workbench, setWorkbench] = useState<AgentSessionResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<Error | null>(null);
+
+  const reload = useCallback(async () => {
+    if (!requestId || !enabled) return;
+    setLoading(true);
+    try {
+      setWorkbench(await fetchAgentSession(requestId));
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err : new Error(String(err)));
+    } finally {
+      setLoading(false);
+    }
+  }, [requestId, enabled]);
+
+  useEffect(() => { void reload(); }, [reload]);
+
+  const run = useCallback(async (action: () => Promise<AgentSessionResponse>) => {
+    setLoading(true);
+    try {
+      const result = await action();
+      setWorkbench(result);
+      setError(null);
+      return result;
+    } catch (err) {
+      const next = err instanceof Error ? err : new Error(String(err));
+      setError(next);
+      throw next;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  return {
+    workbench,
+    loading,
+    error,
+    reload,
+    start: () => run(() => startAgentSession(requestId!, locale)),
+    analyze: () => run(() => analyzeServiceRequest(requestId!, locale)),
+    send: (content: string) => run(() => sendAgentMessage(requestId!, content, locale)),
+  };
 }
 
 // Simple mutation wrappers that handle throwing expected_version errors

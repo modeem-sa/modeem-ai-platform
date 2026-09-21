@@ -10,11 +10,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.auth import router as auth_router
 from app.api.connections import router as connections_router
 from app.api.content_manager import router as content_manager_router
-from app.api.operations import router as operations_router
 from app.api.invoices import router as invoices_router
+from app.api.operations import router as operations_router
 from app.api.permissions import router as permissions_router
 from app.api.service_requests import router as service_requests_router
 from app.api.v1 import router as v1_router
+from app.api.workbench import router as workbench_router
 from app.core.config import get_settings
 
 
@@ -39,6 +40,7 @@ def create_app() -> FastAPI:
     app.include_router(invoices_router)
     app.include_router(permissions_router)
     app.include_router(service_requests_router)
+    app.include_router(workbench_router)
     return app
 
 

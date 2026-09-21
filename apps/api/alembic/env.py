@@ -13,6 +13,8 @@ from app.models import (  # noqa: F401 — register models
     Execution,
     Tenant,
     Workflow,
+    AgentSession,
+    AgentMessage,
 )
 
 config = context.config

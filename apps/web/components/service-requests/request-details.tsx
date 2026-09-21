@@ -12,6 +12,7 @@ import { getPriorityLabel, getPriorityColor, getStatusLabel, getStatusColor, for
 import { useRequestMutations } from "@/hooks/use-service-requests";
 import { useState } from "react";
 import { IconAlertCircle } from "@/components/icons";
+import { RequestWorkbench } from "./request-workbench";
 
 export function RequestDetails({ 
   request, 
@@ -190,6 +191,8 @@ export function RequestDetails({
           </div>
         </div>
       )}
+
+      {isEmployee && <RequestWorkbench requestId={request.id} />}
 
       {/* Reopen Action for Customer */}
       {!isEmployee && (request.status === "closed" || request.status === "resolved") && (
