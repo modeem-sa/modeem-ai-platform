@@ -1,3 +1,4 @@
+from app.models.agent import AgentMessage, AgentSession, AgentToolCall
 from app.models.audit_log import AuditLog
 from app.models.automation_workflow_override import AutomationWorkflowOverride
 from app.models.connection import Connection
@@ -15,14 +16,21 @@ from app.models.operation_task import (
     RecurringTaskTemplate,
 )
 from app.models.operations_task import OperationsTask
+from app.models.service_request import (
+    ServiceRequest,
+    ServiceRequestAttachment,
+    ServiceRequestEvent,
+    ServiceRequestMessage,
+)
 from app.models.tenant import Tenant
 from app.models.tenant_membership import TenantMembership
 from app.models.user import User
 from app.models.workflow import Workflow
-from app.models.service_request import ServiceRequest, ServiceRequestMessage, ServiceRequestAttachment, ServiceRequestEvent
-from app.models.agent import AgentMessage, AgentSession
 
 __all__ = [
+    "AgentMessage",
+    "AgentSession",
+    "AgentToolCall",
     "AuditLog",
     "AutomationWorkflowOverride",
     "CollectionMessage",
@@ -39,14 +47,12 @@ __all__ = [
     "OperationsTask",
     "RecurringTaskOccurrence",
     "RecurringTaskTemplate",
+    "ServiceRequest",
+    "ServiceRequestAttachment",
+    "ServiceRequestEvent",
+    "ServiceRequestMessage",
     "Tenant",
     "TenantMembership",
     "User",
     "Workflow",
-    "ServiceRequest",
-    "ServiceRequestMessage",
-    "ServiceRequestAttachment",
-    "ServiceRequestEvent",
-    "AgentSession",
-    "AgentMessage",
 ]

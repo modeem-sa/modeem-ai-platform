@@ -70,6 +70,56 @@ export interface AgentMessage {
   created_at: string;
 }
 
+export interface FinanceToolCall {
+  id: string;
+  tool_key: "finance.get_overdue_customer_invoices";
+  mode: "read";
+  status: "started" | "completed" | "failed";
+  input: {
+    minimum_days_overdue: number;
+    max_records: number;
+  };
+  result: {
+    source: "Odoo";
+    connection_name: string;
+    as_of: string;
+    minimum_days_overdue: number;
+    complete: boolean;
+    result_truncated: boolean;
+    needs_narrower_filter: boolean;
+    returned_count: number;
+    returned_customer_count: number;
+    invoices?: Array<{
+      id: number;
+      customer_id: number;
+      customer: string;
+      invoice_number: string;
+      invoice_date: string | null;
+      due_date: string;
+      days_overdue: number;
+      currency_id: number;
+      currency: string;
+      total_amount: string;
+      remaining_amount: string;
+    }>;
+    totals_by_currency: Array<{
+      currency_id: number;
+      currency: string;
+      invoice_count: number;
+      outstanding_amount: string;
+      aging: {
+        days_0_30: string;
+        days_31_60: string;
+        days_61_90: string;
+        over_90_days: string;
+      };
+    }>;
+  } | null;
+  error_code: string | null;
+  started_at: string;
+  finished_at: string | null;
+}
+
 export interface RequestAnalysis {
   request_summary: string;
   customer_goal: string;
@@ -99,6 +149,7 @@ export interface AgentSession {
 export interface AgentSessionResponse {
   session: AgentSession | null;
   messages: AgentMessage[];
+  tool_calls: FinanceToolCall[];
 }
 
 export interface RequestModule {
@@ -205,6 +256,27 @@ export function sendAgentMessage(
   return apiFetch<AgentSessionResponse>(
     `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/messages`,
     { method: "POST", body: JSON.stringify({ content, locale }) },
+  );
+}
+
+export function executeOverdueInvoiceTool(
+  requestId: string,
+  locale: "ar" | "en",
+  minimumDaysOverdue = 30,
+): Promise<AgentSessionResponse> {
+  return apiFetch<AgentSessionResponse>(
+    `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/tools/execute`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        tool_key: "finance.get_overdue_customer_invoices",
+        input: {
+          minimum_days_overdue: minimumDaysOverdue,
+          max_records: 100,
+        },
+        locale,
+      }),
+    },
   );
 }
 

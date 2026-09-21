@@ -1,5 +1,9 @@
 """Request-bound AI Workbench authorization and persistence tests."""
 
+from datetime import UTC, date, datetime, timedelta
+
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from app.api import workbench as workbench_api
@@ -9,11 +13,17 @@ from app.main import app
 from app.models import (
     AgentMessage,
     AgentSession,
+    AgentToolCall,
     AuditLog,
     Connection,
     ServiceRequest,
     TenantMembership,
     User,
+)
+from app.operations.workbench_tools import (
+    OverdueInvoicesInput,
+    execute_overdue_customer_invoices,
+    finance_tool_input_from_instruction,
 )
 from tests.test_auth_security import PASSWORD, TestingSession
 
@@ -56,6 +66,9 @@ def _fixture(seed):
                 status="configured",
                 is_active=True,
                 last_test_status="success",
+                odoo_company_id=1,
+                encrypted_credentials=b"encrypted-test-value",
+                encryption_version=1,
             ),
         ]
     )
@@ -103,6 +116,59 @@ def _analysis():
         "data_sources_needed": ["نظام المحاسبة"],
         "approval_likely_required": False,
     }
+
+
+def _enable_finance_connection(seed):
+    db = TestingSession()
+    connection = (
+        db.query(Connection)
+        .filter(Connection.tenant_id == seed["tenant_a"], Connection.provider == "odoo")
+        .order_by(Connection.created_at.desc())
+        .first()
+    )
+    connection.odoo_company_id = 1
+    db.commit()
+    db.close()
+
+
+def _invoice(
+    invoice_id: int,
+    *,
+    due_date: date,
+    residual: float,
+    currency_id: int = 1,
+    currency: str = "SAR",
+    customer_id: int = 10,
+):
+    return {
+        "id": invoice_id,
+        "name": f"INV/{invoice_id:04d}",
+        "move_type": "out_invoice",
+        "state": "posted",
+        "invoice_date": (due_date - timedelta(days=10)).isoformat(),
+        "invoice_date_due": due_date.isoformat(),
+        "partner_id": [customer_id, f"Customer {customer_id}"],
+        "currency_id": [currency_id, currency],
+        "company_id": [1, "Main Company"],
+        "amount_total": residual + 100,
+        "amount_residual": residual,
+        "payment_state": "partial",
+    }
+
+
+def _single_page(records):
+    def read_page(_connection, *, limit, offset, filters, **_kwargs):
+        page_records = records[offset : offset + limit]
+        next_offset = offset + len(page_records)
+        return {
+            "records": page_records,
+            "offset": offset,
+            "returned_count": len(page_records),
+            "has_more": next_offset < len(records),
+            "next_offset": next_offset if next_offset < len(records) else None,
+        }
+
+    return read_page
 
 
 def test_customer_cannot_create_or_read_workbench_session(seed):
@@ -416,3 +482,304 @@ def test_successful_employee_message_audits_without_raw_content(seed, monkeypatc
     assert all("هذه تعليمات داخلية سرية" not in str(row.metadata_json) for row in audit)
     assert all("message_id" in row.metadata_json for row in audit)
     db.close()
+
+
+def test_overdue_tool_calculates_threshold_aging_and_currency_totals(seed):
+    data = _fixture(seed)
+    _enable_finance_connection(seed)
+    as_of = date(2026, 9, 21)
+    records = [
+        _invoice(6, due_date=as_of, residual=999),
+        _invoice(1, due_date=as_of - timedelta(days=30), residual=100),
+        _invoice(2, due_date=as_of - timedelta(days=31), residual=200),
+        _invoice(3, due_date=as_of - timedelta(days=61), residual=300),
+        _invoice(4, due_date=as_of - timedelta(days=91), residual=400),
+        _invoice(
+            5,
+            due_date=as_of - timedelta(days=45),
+            residual=50,
+            currency_id=2,
+            currency="USD",
+        ),
+    ]
+    db = TestingSession()
+    actor = db.get(User, data["employee"])
+    request = db.get(ServiceRequest, data["request"])
+    connection = (
+        db.query(Connection)
+        .filter(Connection.tenant_id == seed["tenant_a"], Connection.provider == "odoo")
+        .first()
+    )
+    result = execute_overdue_customer_invoices(
+        db=db,
+        actor=actor,
+        request=request,
+        connection=connection,
+        tool_input=OverdueInvoicesInput(minimum_days_overdue=30, max_records=100),
+        read_page=_single_page(records),
+        today=as_of,
+    )
+    db.close()
+
+    assert [item.days_overdue for item in result.invoices] == [30, 31, 61, 91, 45]
+    assert result.returned_count == 5
+    assert result.complete is True
+    totals = {item.currency: item for item in result.totals_by_currency}
+    assert totals["SAR"].outstanding_amount == "1000.00"
+    assert totals["SAR"].aging.model_dump() == {
+        "days_0_30": "100.00",
+        "days_31_60": "200.00",
+        "days_61_90": "300.00",
+        "over_90_days": "400.00",
+    }
+    assert totals["USD"].outstanding_amount == "50.00"
+    assert len(result.totals_by_currency) == 2
+
+
+def test_finance_tool_threshold_extraction_is_bounded_and_deterministic():
+    assert (
+        finance_tool_input_from_instruction("اعرض الفواتير المتأخرة أكثر من 60 يومًا")
+        .minimum_days_overdue
+        == 60
+    )
+    assert (
+        finance_tool_input_from_instruction("Show invoices overdue 45 days")
+        .minimum_days_overdue
+        == 45
+    )
+    assert finance_tool_input_from_instruction("فواتير متأخرة").minimum_days_overdue == 30
+    with pytest.raises(HTTPException) as exc:
+        finance_tool_input_from_instruction("فواتير متأخرة 0 يوم")
+    assert exc.value.status_code == 422
+
+
+def test_overdue_tool_paginates_and_marks_incomplete_totals(seed):
+    data = _fixture(seed)
+    _enable_finance_connection(seed)
+    as_of = date(2026, 9, 21)
+    records = [
+        _invoice(index, due_date=as_of - timedelta(days=40), residual=10)
+        for index in range(1, 122)
+    ]
+    offsets = []
+
+    def read_page(_connection, *, limit, offset, **_kwargs):
+        offsets.append(offset)
+        page_records = records[offset : offset + limit]
+        next_offset = offset + len(page_records)
+        return {
+            "records": page_records,
+            "offset": offset,
+            "returned_count": len(page_records),
+            "has_more": next_offset < len(records),
+            "next_offset": next_offset if next_offset < len(records) else None,
+        }
+
+    db = TestingSession()
+    result = execute_overdue_customer_invoices(
+        db=db,
+        actor=db.get(User, data["employee"]),
+        request=db.get(ServiceRequest, data["request"]),
+        connection=db.query(Connection).filter_by(tenant_id=seed["tenant_a"]).first(),
+        tool_input=OverdueInvoicesInput(minimum_days_overdue=30, max_records=100),
+        read_page=read_page,
+        today=as_of,
+    )
+    db.close()
+
+    assert offsets == [0, 50]
+    assert result.returned_count == 100
+    assert result.result_truncated is True
+    assert result.needs_narrower_filter is True
+    assert result.complete is False
+    assert result.totals_by_currency == []
+
+
+def test_employee_message_selects_read_only_finance_tool_and_audits(seed, monkeypatch):
+    data = _fixture(seed)
+    _enable_finance_connection(seed)
+    as_of = datetime.now(UTC).date()
+    seen = {}
+
+    def read_page(connection, **kwargs):
+        seen["connection_id"] = connection.id
+        seen["kwargs"] = kwargs
+        return _single_page(
+            [_invoice(1, due_date=as_of - timedelta(days=40), residual=245000)]
+        )(connection, **kwargs)
+
+    monkeypatch.setattr(workbench_api, "_operations_read_page", read_page)
+    monkeypatch.setattr(
+        workbench_api.OpenAICompatibleProvider,
+        "from_environment",
+        staticmethod(lambda: (_ for _ in ()).throw(AssertionError("provider must not select tools"))),
+    )
+    client = _client("workbench-employee@example.com")
+    response = client.post(
+        f"/api/v1/service-requests/{data['request']}/agent/messages",
+        json={"content": "نفذ تحليل الفواتير المتأخرة.", "locale": "ar"},
+        headers=_csrf(client),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["tool_calls"][0]["tool_key"] == "finance.get_overdue_customer_invoices"
+    assert body["tool_calls"][0]["mode"] == "read"
+    assert body["tool_calls"][0]["result"]["returned_count"] == 1
+    assert body["tool_calls"][0]["result"]["connection_name"] == "Test Odoo"
+    assert seen["kwargs"]["resource"] == "invoices"
+    assert seen["kwargs"]["company_scoped"] is True
+    assert seen["kwargs"]["order_by"] == "id"
+    assert seen["kwargs"]["order_direction"] == "asc"
+    assert {item["field"] for item in seen["kwargs"]["filters"]} == {
+        "move_type",
+        "state",
+        "payment_state",
+        "invoice_date_due",
+        "amount_residual",
+    }
+
+    db = TestingSession()
+    call = db.query(AgentToolCall).one()
+    assert call.status == "completed"
+    assert call.mode == "read"
+    assert "Customer 10" not in call.safe_result_summary_json
+    assert "INV/0001" not in call.safe_result_summary_json
+    assert '"invoices"' not in call.safe_result_summary_json
+    audits = db.query(AuditLog).filter(AuditLog.resource_id == str(call.id)).all()
+    assert {row.action for row in audits} == {
+        "agent_tool_started",
+        "agent_tool_completed",
+    }
+    assert all("245000" not in str(row.metadata_json) for row in audits)
+    db.close()
+
+
+def test_finance_tool_body_cannot_inject_tenant_connection_or_unknown_tool(seed):
+    data = _fixture(seed)
+    _enable_finance_connection(seed)
+    client = _client("workbench-employee@example.com")
+    path = f"/api/v1/service-requests/{data['request']}/agent/tools/execute"
+    injected = client.post(
+        path,
+        json={
+            "tool_key": "finance.get_overdue_customer_invoices",
+            "input": {"minimum_days_overdue": 30, "max_records": 50},
+            "tenant_id": str(seed["tenant_b"]),
+            "connection_id": "attacker",
+        },
+        headers=_csrf(client),
+    )
+    assert injected.status_code == 422
+    invented = client.post(
+        path,
+        json={"tool_key": "finance.raw_odoo_query", "input": {}},
+        headers=_csrf(client),
+    )
+    assert invented.status_code == 422
+
+
+def test_customer_and_cross_tenant_employee_cannot_execute_finance_tool(seed):
+    data = _fixture(seed)
+    path = f"/api/v1/service-requests/{data['request']}/agent/tools/execute"
+    customer = _client("workbench-customer@example.com")
+    assert customer.post(path, json={}, headers=_csrf(customer)).status_code == 404
+    other_employee = _client("b@example.com")
+    assert (
+        other_employee.post(path, json={}, headers=_csrf(other_employee)).status_code
+        == 404
+    )
+
+
+def test_finance_tool_enforces_module_and_service_scopes(seed, monkeypatch):
+    data = _fixture(seed)
+    _enable_finance_connection(seed)
+    monkeypatch.setattr(
+        workbench_api,
+        "_operations_read_page",
+        _single_page([]),
+    )
+    client = _client("workbench-employee@example.com")
+    path = f"/api/v1/service-requests/{data['request']}/agent/tools/execute"
+    db = TestingSession()
+    membership = (
+        db.query(TenantMembership)
+        .filter_by(tenant_id=seed["tenant_a"], user_id=data["employee"])
+        .one()
+    )
+    membership.odoo_module_scope_json = '["hr"]'
+    db.commit()
+    db.close()
+    assert client.post(path, json={}, headers=_csrf(client)).status_code == 403
+
+    db = TestingSession()
+    membership = (
+        db.query(TenantMembership)
+        .filter_by(tenant_id=seed["tenant_a"], user_id=data["employee"])
+        .one()
+    )
+    membership.odoo_module_scope_json = '["account"]'
+    membership.service_scope_json = '["administrative"]'
+    db.commit()
+    db.close()
+    assert client.post(path, json={}, headers=_csrf(client)).status_code == 403
+
+
+def test_finance_tool_permission_rejects_non_worker_role(seed):
+    data = _fixture(seed)
+    _enable_finance_connection(seed)
+    db = TestingSession()
+    membership = (
+        db.query(TenantMembership)
+        .filter_by(tenant_id=seed["tenant_a"], user_id=data["employee"])
+        .one()
+    )
+    membership.role = "viewer"
+    db.commit()
+    with pytest.raises(HTTPException) as exc:
+        execute_overdue_customer_invoices(
+            db=db,
+            actor=db.get(User, data["employee"]),
+            request=db.get(ServiceRequest, data["request"]),
+            connection=db.query(Connection).filter_by(tenant_id=seed["tenant_a"]).first(),
+            tool_input=OverdueInvoicesInput(),
+            read_page=_single_page([]),
+        )
+    db.close()
+    assert exc.value.status_code == 403
+    assert exc.value.detail == "Finance tool permission denied"
+
+
+def test_finance_tool_failure_is_safe_and_internal(seed, monkeypatch):
+    data = _fixture(seed)
+    _enable_finance_connection(seed)
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("credential-secret-must-not-leak")
+
+    monkeypatch.setattr(workbench_api, "_operations_read_page", fail)
+    employee = _client("workbench-employee@example.com")
+    response = employee.post(
+        f"/api/v1/service-requests/{data['request']}/agent/tools/execute",
+        json={},
+        headers=_csrf(employee),
+    )
+    assert response.status_code == 502
+    assert "credential-secret" not in response.text
+
+    db = TestingSession()
+    call = db.query(AgentToolCall).one()
+    assert call.status == "failed"
+    assert call.error_code == "tool_execution_failed"
+    assert call.safe_result_summary_json is None
+    assert any(
+        row.action == "agent_tool_failed"
+        and "credential-secret" not in str(row.metadata_json)
+        for row in db.query(AuditLog).all()
+    )
+    db.close()
+
+    customer = _client("workbench-customer@example.com")
+    detail = customer.get(f"/api/v1/service-requests/{data['request']}")
+    assert detail.status_code == 200
+    assert "tool_calls" not in detail.json()
+    assert all("finance.get_" not in message["body"] for message in detail.json()["messages"])

@@ -9,7 +9,6 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.api.csrf import require_csrf
@@ -33,8 +32,8 @@ from app.integrations.odoo.invoice_chatter_collection import (
     CollectionMessagePolicyError,
     read_invoice_collection_target,
 )
-from app.integrations.odoo.reader import ReadPolicyError, ResourceUnavailableError, read_page
 from app.integrations.odoo.read_policies import MAX_INVENTORY_OFFSET, MAX_PREVIEW_OFFSET
+from app.integrations.odoo.reader import ReadPolicyError, ResourceUnavailableError, read_page
 from app.models import (
     AutomationWorkflowOverride,
     CollectionMessage,
@@ -327,6 +326,8 @@ def _operations_read_page(
     filters: list[dict] | None = None,
     fields: list[str] | None = None,
     company_scoped: bool = True,
+    order_by: str | None = None,
+    order_direction: str = "asc",
 ) -> dict:
     """Read a fixed policy resource with short-lived decrypted auth."""
     try:
@@ -349,20 +350,23 @@ def _operations_read_page(
     finally:
         del credentials
     try:
-        read_kwargs = dict(
-            base_url=connection.base_url,
-            database=connection.database_name,
-            transport=connection.selected_transport,
-            login=auth.login,
-            secret=auth.secret,
-            environment=get_settings().environment,
-            resource=resource,
-            filters=filters,
-            limit=limit,
-            offset=offset,
+        read_kwargs = {
+            "base_url": connection.base_url,
+            "database": connection.database_name,
+            "transport": connection.selected_transport,
+            "login": auth.login,
+            "secret": auth.secret,
+            "environment": get_settings().environment,
+            "resource": resource,
+            "filters": filters,
+            "limit": limit,
+            "offset": offset,
             # Never accept a company scope from the request.
-            company_id=connection.odoo_company_id if company_scoped else None,
-        )
+            "company_id": connection.odoo_company_id if company_scoped else None,
+        }
+        if order_by is not None:
+            read_kwargs["order_by"] = order_by
+            read_kwargs["order_direction"] = order_direction
         if fields is not None:
             read_kwargs["fields"] = fields
         return read_page(**read_kwargs)

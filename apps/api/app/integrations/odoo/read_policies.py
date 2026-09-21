@@ -270,7 +270,16 @@ _INVOICES = ReadPolicy(
         "payment_state",
     ),
     allowed_filter_fields=frozenset(
-        {"id", "name", "move_type", "state", "invoice_date", "payment_state"}
+        {
+            "id",
+            "name",
+            "move_type",
+            "state",
+            "invoice_date",
+            "invoice_date_due",
+            "amount_residual",
+            "payment_state",
+        }
     ),
     allowed_filter_operators=SAFE_OPERATORS,
     allowed_order_fields=frozenset({"id", "name", "invoice_date", "amount_total"}),

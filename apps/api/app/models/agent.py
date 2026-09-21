@@ -81,3 +81,41 @@ class AgentMessage(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     analysis_json: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
+
+
+class AgentToolCall(Base):
+    __tablename__ = "agent_tool_calls"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('started','completed','failed')",
+            name="ck_agent_tool_calls_status",
+        ),
+        CheckConstraint("mode = 'read'", name="ck_agent_tool_calls_read_only"),
+        Index("ix_agent_tool_calls_session_started", "session_id", "started_at"),
+        Index("ix_agent_tool_calls_tenant_request", "tenant_id", "service_request_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("agent_sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
+    )
+    service_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("service_requests.id", ondelete="CASCADE"), nullable=False
+    )
+    employee_user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    connection_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("connections.id", ondelete="SET NULL"), nullable=True
+    )
+    tool_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    mode: Mapped[str] = mapped_column(String(8), nullable=False, default="read")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="started")
+    safe_input_json: Mapped[str] = mapped_column(Text, nullable=False)
+    safe_result_summary_json: Mapped[str | None] = mapped_column(Text)
+    error_code: Mapped[str | None] = mapped_column(String(64))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
