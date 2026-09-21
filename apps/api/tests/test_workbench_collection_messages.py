@@ -20,6 +20,8 @@ from app.models import (
 from app.operations.workbench_collection_message import (
     EditWorkbenchCommunicationInput,
     PrepareWorkbenchCommunicationInput,
+    QueueWorkbenchCommunicationInput,
+    RetryWorkbenchCommunicationInput,
     _same_live_record,
     canonical_grouped_source_identity,
 )
@@ -720,6 +722,55 @@ def test_http_manager_approval_binds_exact_message_and_grouped_source(
         "approved",
     }
     db.close()
+
+
+def test_queue_requires_exact_approval_evidence_and_never_delivers(
+    seed, monkeypatch
+):
+    _data, path, employee, manager, approved = _succeeded_action(seed, monkeypatch)
+    draft = _communication_prepare(employee, path, str(approved["id"])).json()["messages"][0]
+    submitted = employee.post(
+        f"{path}/agent/communications/{draft['id']}/submit",
+        json=_submit_body(draft),
+        headers=_csrf(employee),
+    ).json()["message"]
+    approved_message = manager.post(
+        f"{path}/agent/communications/{draft['id']}/approve",
+        json=_approve_body(submitted),
+        headers=_csrf(manager),
+    ).json()["message"]
+    calls = []
+    monkeypatch.setattr(
+        chatter, "deliver_invoice_collection_message", lambda **kwargs: calls.append(kwargs)
+    )
+    queued = manager.post(
+        f"{path}/agent/communications/{draft['id']}/queue",
+        json={
+            "expected_message_version": approved_message["version"],
+            "expected_approved_hash": approved_message["approved_hash"],
+            "expected_approved_source_hash": approved_message["approved_source_hash"],
+        },
+        headers=_csrf(manager),
+    )
+    assert queued.status_code == 200, queued.text
+    assert queued.json()["message"]["status"] == "queued"
+    assert calls == []
+    assert QueueWorkbenchCommunicationInput.model_validate(
+        {
+            "expected_message_version": approved_message["version"],
+            "expected_approved_hash": approved_message["approved_hash"],
+            "expected_approved_source_hash": approved_message["approved_source_hash"],
+        }
+    )
+    with pytest.raises(ValidationError):
+        RetryWorkbenchCommunicationInput.model_validate(
+            {
+                "expected_message_version": 1,
+                "expected_approved_hash": "a" * 64,
+                "expected_approved_source_hash": "b" * 64,
+                "partner_id": 55,
+            }
+        )
 
 
 def test_http_member_and_preparer_cannot_approve_and_body_is_identity_free(

@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { communicationActions, communicationCardIsEditable, getWorkbenchStatusLabel, hasVerifiedExecutionSuccess } from "../lib/workbench-presentation.ts";
-import { approveWorkbenchCommunication, rejectWorkbenchCommunication } from "../lib/service-requests.ts";
+import { communicationActions, communicationCardIsEditable, getCommunicationStatusLabel, getWorkbenchStatusLabel, hasVerifiedCommunicationDeliverySuccess, hasVerifiedExecutionSuccess } from "../lib/workbench-presentation.ts";
+import { approveWorkbenchCommunication, queueWorkbenchCommunication, rejectWorkbenchCommunication, retryWorkbenchCommunication } from "../lib/service-requests.ts";
 import type { WorkbenchAction, WorkbenchCommunication } from "../lib/service-requests.ts";
 
 const action = (overrides: Partial<WorkbenchAction> = {}): WorkbenchAction => ({
@@ -41,6 +41,8 @@ const communication = (overrides: Partial<WorkbenchCommunication> = {}): Workben
   can_submit: true,
   can_approve: false,
   can_reject: false,
+  can_queue_delivery: false,
+  can_retry_delivery: false,
   ...overrides,
 });
 
@@ -74,7 +76,7 @@ describe("Workbench execution presentation", () => {
   it("makes submitted cards non-editable and exposes no send action", () => {
     const submitted = communication({ status: "awaiting_approval", can_edit: false, can_submit: false, submitted_at: "2026-01-01T00:00:00Z" });
     assert.strictEqual(communicationCardIsEditable(submitted), false);
-    assert.deepStrictEqual(communicationActions(submitted), { canEdit: false, canSubmit: false, canApprove: false, canReject: false, canSend: false });
+    assert.deepStrictEqual(communicationActions(submitted), { canEdit: false, canSubmit: false, canApprove: false, canReject: false, canQueueDelivery: false, canRetryDelivery: false, canSend: false });
   });
 
   it("uses only server-issued communication approval capabilities", () => {
@@ -91,6 +93,8 @@ describe("Workbench execution presentation", () => {
       canSubmit: false,
       canApprove: true,
       canReject: true,
+      canQueueDelivery: false,
+      canRetryDelivery: false,
       canSend: false,
     });
     assert.deepStrictEqual(communicationActions({
@@ -102,6 +106,8 @@ describe("Workbench execution presentation", () => {
       canSubmit: false,
       canApprove: false,
       canReject: false,
+      canQueueDelivery: false,
+      canRetryDelivery: false,
       canSend: false,
     });
   });
@@ -119,6 +125,33 @@ describe("Workbench execution presentation", () => {
     assert.strictEqual(communicationActions(approved).canSend, false);
     assert.strictEqual(communicationActions(approved).canApprove, false);
     assert.strictEqual(communicationActions(approved).canReject, false);
+  });
+
+  it("derives delivery controls only from server capabilities and status", () => {
+    const approved = communication({
+      status: "approved",
+      can_edit: false,
+      can_submit: false,
+      can_queue_delivery: true,
+    });
+    assert.strictEqual(communicationActions(approved).canQueueDelivery, true);
+    assert.strictEqual(communicationActions({ ...approved, can_queue_delivery: false }).canQueueDelivery, false);
+    assert.strictEqual(communicationActions({ ...approved, status: "queued" }).canQueueDelivery, false);
+    assert.strictEqual(communicationActions({ ...approved, status: "failed", can_retry_delivery: true }).canRetryDelivery, true);
+  });
+
+  it("shows delivery states bilingually and guards success with receipt verification", () => {
+    assert.strictEqual(getCommunicationStatusLabel("queued", "en"), "Queued for delivery");
+    assert.strictEqual(getCommunicationStatusLabel("sending", "ar"), "جارٍ الإرسال");
+    const succeeded = communication({
+      status: "succeeded",
+      external_message_id: 81,
+      verified_at: "2026-01-01T00:00:00Z",
+    });
+    assert.strictEqual(hasVerifiedCommunicationDeliverySuccess(succeeded), true);
+    assert.strictEqual(hasVerifiedCommunicationDeliverySuccess({ ...succeeded, external_message_id: null }), false);
+    assert.strictEqual(hasVerifiedCommunicationDeliverySuccess({ ...succeeded, verified_at: null }), false);
+    assert.strictEqual(hasVerifiedCommunicationDeliverySuccess({ ...succeeded, status: "sending" }), false);
   });
 
   it("sends only optimistic-concurrency evidence for approval and rejection", async () => {
@@ -159,6 +192,30 @@ describe("Workbench execution presentation", () => {
         method: "POST",
         body: { ...evidence, rejection_reason: "Please revise the tone." },
       },
+    ]);
+  });
+
+  it("sends only exact approval evidence for queue and retry", async () => {
+    const originalFetch = globalThis.fetch;
+    const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+    globalThis.fetch = async (input, init) => {
+      requests.push({ url: String(input), body: JSON.parse(String(init?.body)) });
+      return new Response(JSON.stringify({ message: {} }), { status: 200, headers: { "Content-Type": "application/json" } });
+    };
+    const evidence = {
+      expected_message_version: 4,
+      expected_approved_hash: "c".repeat(64),
+      expected_approved_source_hash: "d".repeat(64),
+    };
+    try {
+      await queueWorkbenchCommunication("request/1", "message/1", evidence);
+      await retryWorkbenchCommunication("request/1", "message/1", evidence);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+    assert.deepStrictEqual(requests, [
+      { url: "/backend/api/v1/service-requests/request%2F1/agent/communications/message%2F1/queue", body: evidence },
+      { url: "/backend/api/v1/service-requests/request%2F1/agent/communications/message%2F1/retry", body: evidence },
     ]);
   });
 

@@ -1,199 +1,4 @@
-"""Dedicated polling worker; external writes are never made in request handlers."""
-
-import json
-import time
-import uuid
-from datetime import UTC, datetime, timedelta
-from hashlib import sha256
-
-from pydantic import ValidationError
-from sqlalchemy import and_, or_, text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-
-from app.content_manager.provider import (
-    OpenAICompatibleProvider,
-    ProviderFailureError,
-    ProviderUnavailableError,
-)
-from app.core.config import get_settings
-from app.db.base import get_session_factory
-from app.integrations.odoo.activity_writer import (
-    ActivityWritePolicyError,
-    create_invoice_activity,
-    preflight_invoice_collection_targets,
-    reconcile_invoice_activity,
-    resolve_standard_todo_activity_type,
-)
-from app.integrations.odoo.errors import ConnectorError
-from app.integrations.odoo.invoice_chatter_collection import (
-    CollectionMessagePolicyError,
-    deliver_invoice_collection_message,
-    read_invoice_collection_target,
-)
-from app.models import (
-    CollectionMessage,
-    CollectionMessageEvent,
-    Connection,
-    OperationAction,
-    OperationActionExecutionItem,
-    OperationActionHistory,
-    OperationTask,
-    User,
-)
-from app.operations.ai_proposal import (
-    InvoiceActivityProposal,
-    canonical_proposal,
-    executable_invoice_activity_proposal,
-)
-from app.operations.automation_catalog import effective_config
-from app.operations.collection_message import (
-    canonical_collection_message,
-    canonical_collection_source_identity,
-)
-from app.operations.odoo_sync import scan_overdue_invoices
-from app.operations.proposals import (
-    OperationsProposalService,
-    invoice_summary_from_snapshot,
-)
-from app.operations.recurring import generate_occurrences
-from app.operations.workbench_actions import CollectionProposal, canonical_collection_proposal
-from app.services.audit import record_audit
-from app.services.connection_auth import AuthMaterialError, resolve_auth_material
-from app.services.credential_crypto import (
-    CredentialDecryptionError,
-    EncryptionConfigError,
-    decrypt_credentials,
-)
-
-_AI_AUTOMATION_RETRY_AFTER = 0.0
-PHASE4B_POLICY_ID = "internal_invoice_activity_v1"
-PHASE4B_DEADLINE_DAYS = 7
-
-
-def generate_missing_ai_proposals_once() -> int:
-    """Prepare and submit bounded AI proposals for new overdue-invoice tasks."""
-    global _AI_AUTOMATION_RETRY_AFTER
-
-    if time.monotonic() < _AI_AUTOMATION_RETRY_AFTER:
-        return 0
-    session = get_session_factory()()
-    generated = 0
-    try:
-        if (
-            session.bind
-            and session.bind.dialect.name == "postgresql"
-            and not session.execute(text("SELECT pg_try_advisory_xact_lock(810006)")).scalar()
-        ):
-            return 0
-        tasks = (
-            session.query(OperationTask)
-            .outerjoin(
-                OperationAction,
-                (OperationAction.task_id == OperationTask.id)
-                & (OperationAction.tenant_id == OperationTask.tenant_id),
-            )
-            .filter(
-                OperationTask.source_type == "odoo",
-                OperationTask.source_signal == "overdue_customer_invoice",
-                OperationTask.source_record_id.is_not(None),
-                OperationTask.source_snapshot_json.is_not(None),
-                OperationAction.id.is_(None),
-            )
-            .order_by(OperationTask.created_at.asc(), OperationTask.id.asc())
-            .limit(10)
-            .all()
-        )
-        if not tasks:
-            return 0
-        eligible_tasks: list[tuple[OperationTask, dict[str, object]]] = []
-        for task in tasks:
-            config = effective_config(
-                session, task.tenant_id, "finance.overdue_invoice_followup"
-            )
-            modes = config["step_modes"]
-            assert isinstance(modes, dict)
-            if not config["enabled"] or modes["prepare_draft"] == "manual":
-                continue
-            eligible_tasks.append((task, config))
-        if not eligible_tasks:
-            return 0
-        try:
-            provider = OpenAICompatibleProvider.from_environment()
-        except ProviderUnavailableError:
-            _AI_AUTOMATION_RETRY_AFTER = time.monotonic() + 300
-            return 0
-        service = OperationsProposalService(provider)
-        for task, config in eligible_tasks:
-            modes = config["step_modes"]
-            assert isinstance(modes, dict)
-            try:
-                snapshot = json.loads(task.source_snapshot_json or "")
-                summary, company_id, activity_type_id = invoice_summary_from_snapshot(
-                    tenant_id=task.tenant_id,
-                    snapshot=snapshot,
-                    as_of_date=datetime.now(UTC).date(),
-                )
-                draft = service.propose(tenant_id=task.tenant_id, summary=summary)
-                proposal = executable_invoice_activity_proposal(
-                    draft,
-                    company_id=company_id,
-                    invoice_id=task.source_record_id,
-                    activity_type_id=activity_type_id,
-                )
-                payload, digest = canonical_proposal(proposal)
-            except ProviderFailureError:
-                _AI_AUTOMATION_RETRY_AFTER = time.monotonic() + 300
-                break
-            except (ValidationError, ValueError, TypeError, json.JSONDecodeError):
-                continue
-
-            action = OperationAction(
-                tenant_id=task.tenant_id,
-                task_id=task.id,
-                proposal_json=payload,
-                proposal_hash=digest,
-                status="proposed",
-                version=1,
-                idempotency_marker=uuid.uuid4().hex,
-                workflow_key="finance.overdue_invoice_followup",
-                workflow_config_version=config["version"],
-            )
-            try:
-                with session.begin_nested():
-                    session.add(action)
-                    session.flush()
-            except IntegrityError:
-                # The API or another safe generator won the race. The unique
-                # task constraint remains the final idempotency boundary.
-                continue
-            session.add(
-                OperationActionHistory(
-                    action_id=action.id,
-                    task_id=task.id,
-                    tenant_id=task.tenant_id,
-                    actor_type="system",
-                    actor_id="operations-automation",
-                    event="generated",
-                    version=action.version,
-                    status=action.status,
-                    proposal_hash=action.proposal_hash,
-                    detail="automatic",
-                )
-            )
-            if modes["submit_for_approval"] == "automatic":
-                action.status = "awaiting_approval"
-                action.version += 1
-                session.add(
-                    OperationActionHistory(
-                        action_id=action.id,
-                        task_id=task.id,
-                        tenant_id=task.tenant_id,
-                        actor_type="system",
-                        actor_id="operations-automation",
-                        event="submitted",
-                        version=action.version,
-                        status=action.status,
-                        proposal_hash=action.proposal_hash,
+ction.proposal_hash,
                         detail="automatic",
                     )
                 )
@@ -856,6 +661,516 @@ def run_queued_collection_messages_once() -> int:
         session.close()
 
 
+def _record_workbench_message_event(
+    session, message: WorkbenchCollectionMessage, event: str, detail: str | None = None
+) -> None:
+    session.add(
+        WorkbenchCollectionMessageEvent(
+            message_id=message.id, tenant_id=message.tenant_id,
+            service_request_id=message.service_request_id,
+            actor_type="worker", actor_id="workbench-collection-delivery-worker",
+            event=event, version=message.version,
+            content_hash=message.approved_hash or message.draft_hash,
+            source_hash=message.approved_source_hash or message.source_hash,
+            detail=detail[:64] if detail else None,
+        )
+    )
+    record_audit(
+        session, action=f"workbench_collection_message_{event}",
+        actor_type="worker", actor_id="workbench-collection-delivery-worker",
+        tenant_id=message.tenant_id, resource_type="workbench_collection_message",
+        resource_id=str(message.id),
+        metadata={"action_id": str(message.action_id), "partner_id": message.approved_partner_id,
+                  "anchor_invoice_id": message.delivery_anchor_invoice_id,
+                  "attempt_count": message.attempt_count,
+                  **({"error_code": detail} if detail else {})},
+    )
+
+
+def _fail_workbench_message(
+    session, message: WorkbenchCollectionMessage, code: str, *, token: str | None = None
+) -> None:
+    token = token or message.claim_token
+    if not token:
+        return
+    changed = session.execute(
+        update(WorkbenchCollectionMessage).execution_options(synchronize_session=False)
+        .where(
+            WorkbenchCollectionMessage.id == message.id,
+            WorkbenchCollectionMessage.claim_token == token,
+            WorkbenchCollectionMessage.status.in_(("sending", "verifying")),
+        )
+        .values(
+            status="failed", delivery_error_code=code, lease_expires_at=None,
+            claimed_at=None, claim_token=None,
+            version=WorkbenchCollectionMessage.version + 1,
+        )
+    )
+    if changed.rowcount != 1:
+        session.rollback()
+        return
+    current = session.get(WorkbenchCollectionMessage, message.id)
+    _record_workbench_message_event(session, current, "failed", code)
+
+
+def _requeue_workbench_message(
+    session, message: WorkbenchCollectionMessage, code: str, *, token: str | None = None
+) -> None:
+    token = token or message.claim_token
+    if not token:
+        return
+    changed = session.execute(
+        update(WorkbenchCollectionMessage).execution_options(synchronize_session=False)
+        .where(
+            WorkbenchCollectionMessage.id == message.id,
+            WorkbenchCollectionMessage.claim_token == token,
+            WorkbenchCollectionMessage.status.in_(("sending", "verifying")),
+        )
+        .values(
+            status="queued", delivery_error_code=code, lease_expires_at=None,
+            claimed_at=None, claim_token=None,
+            next_attempt_at=datetime.now(UTC) + timedelta(seconds=30),
+            version=WorkbenchCollectionMessage.version + 1,
+        )
+    )
+    if changed.rowcount != 1:
+        session.rollback()
+        return
+    current = session.get(WorkbenchCollectionMessage, message.id)
+    _record_workbench_message_event(session, current, "retry_queued", code)
+
+
+def _lease_is_expired(lease_expires_at: datetime | None, now: datetime) -> bool:
+    """Compare SQLite's naive timestamps and PostgreSQL's aware timestamps uniformly."""
+    if lease_expires_at is None:
+        return True
+    if lease_expires_at.tzinfo is None:
+        lease_expires_at = lease_expires_at.replace(tzinfo=UTC)
+    return lease_expires_at <= now
+
+
+def run_queued_workbench_collection_messages_once() -> int:
+    """Deliver approved Workbench messages through the fixed Odoo adapter only."""
+    session = get_session_factory()()
+    delivered = 0
+    acquired = False
+    try:
+        if session.bind and session.bind.dialect.name == "postgresql":
+            acquired = bool(session.execute(text("SELECT pg_try_advisory_xact_lock(810061)")).scalar())
+            if not acquired:
+                return 0
+        now = datetime.now(UTC)
+        processed = 0
+        while processed < 20:
+            now = datetime.now(UTC)
+            message = (
+                session.query(WorkbenchCollectionMessage)
+                .filter(
+                    or_(
+                        and_(
+                            WorkbenchCollectionMessage.status == "queued",
+                            WorkbenchCollectionMessage.attempt_count < 3,
+                            or_(
+                                WorkbenchCollectionMessage.next_attempt_at.is_(None),
+                                WorkbenchCollectionMessage.next_attempt_at <= now,
+                            ),
+                        ),
+                        and_(
+                            WorkbenchCollectionMessage.status.in_(("sending", "verifying")),
+                            WorkbenchCollectionMessage.lease_expires_at < now,
+                        ),
+                    )
+                )
+                .with_for_update(skip_locked=True)
+                .first()
+            )
+            if message is None:
+                break
+            processed += 1
+            claim_token = uuid.uuid4().hex
+            prior_status = message.status
+            claim_filter = [
+                WorkbenchCollectionMessage.id == message.id,
+                WorkbenchCollectionMessage.status == prior_status,
+            ]
+            if prior_status == "queued":
+                claim_filter.extend(
+                    [
+                        WorkbenchCollectionMessage.claim_token.is_(None),
+                        or_(
+                            WorkbenchCollectionMessage.next_attempt_at.is_(None),
+                            WorkbenchCollectionMessage.next_attempt_at <= now,
+                        ),
+                    ]
+                )
+            else:
+                claim_filter.extend(
+                    [
+                        WorkbenchCollectionMessage.claim_token == message.claim_token,
+                        WorkbenchCollectionMessage.lease_expires_at < now,
+                    ]
+                )
+            claimed = session.execute(
+                update(WorkbenchCollectionMessage).execution_options(synchronize_session=False)
+                .where(*claim_filter)
+                .values(
+                    status="sending",
+                    claimed_at=now,
+                    lease_expires_at=now + timedelta(minutes=5),
+                    claim_token=claim_token,
+                    delivery_started_at=now,
+                    version=WorkbenchCollectionMessage.version + 1,
+                )
+            )
+            if claimed.rowcount != 1:
+                session.rollback()
+                continue
+            session.refresh(message)
+            _record_workbench_message_event(session, message, "sending")
+            session.commit()
+            message = session.get(WorkbenchCollectionMessage, message.id)
+            if message is None:
+                continue
+            if message.attempt_count < 3:
+                charged = session.execute(
+                    update(WorkbenchCollectionMessage).execution_options(synchronize_session=False)
+                    .where(
+                        WorkbenchCollectionMessage.id == message.id,
+                        WorkbenchCollectionMessage.claim_token == claim_token,
+                        WorkbenchCollectionMessage.status == "sending",
+                    )
+                    .values(
+                        attempt_count=WorkbenchCollectionMessage.attempt_count + 1,
+                        version=WorkbenchCollectionMessage.version + 1,
+                    )
+                )
+                if charged.rowcount != 1:
+                    session.rollback()
+                    continue
+                session.commit()
+                message = session.get(WorkbenchCollectionMessage, message.id)
+                if message is None or message.claim_token != claim_token:
+                    session.rollback()
+                    continue
+            delivery_call_started = False
+            try:
+                approved_content, digest = canonical_collection_message(
+                    message.approved_content or "", message.approved_draft_version or 0
+                )
+                if (
+                    digest != message.approved_hash or digest != message.draft_hash
+                    or message.approved_draft_version != message.draft_version
+                    or message.approved_source_hash != message.source_hash
+                    or message.approved_source_version != message.source_version
+                    or message.approved_partner_id != message.partner_id
+                ):
+                    _fail_workbench_message(session, message, "approval_invalid", token=claim_token)
+                    session.commit()
+                    continue
+                action = session.query(OperationAction).filter_by(
+                    id=message.action_id, tenant_id=message.tenant_id
+                ).one_or_none()
+                task = (
+                    session.query(OperationTask)
+                    .filter(OperationTask.tenant_id == message.tenant_id,
+                            OperationTask.source_type == "agent_workbench",
+                            OperationTask.source_reference == str(message.service_request_id),
+                            OperationTask.source_signal == "finance.prepare_collection_followup",
+                            OperationTask.id == (action.task_id if action else uuid.uuid4()))
+                    .one_or_none()
+                )
+                connection = session.query(Connection).filter_by(
+                    id=message.connection_id, tenant_id=message.tenant_id, provider="odoo"
+                ).with_for_update().one_or_none()
+                if (
+                    action is None or task is None or connection is None
+                    or not connection.is_active or connection.status != "configured"
+                    or connection.last_test_status != "success"
+                    or connection.selected_transport not in ("xmlrpc", "json2")
+                    or connection.odoo_company_id != message.company_id
+                    or connection.encrypted_credentials is None
+                    or connection.encryption_version is None
+                ):
+                    _fail_workbench_message(
+                        session, message, "source_changed_requires_reapproval", token=claim_token
+                    )
+                    session.commit()
+                    continue
+                payload = json.loads(message.source_evidence_json)
+                invoice_ids = [int(value) for value in json.loads(message.invoice_ids_json)]
+                records = payload["records"]
+                items = session.query(OperationActionExecutionItem).filter_by(
+                    action_id=action.id, task_id=task.id, tenant_id=message.tenant_id
+                ).all()
+                item_by_invoice = {item.invoice_id: item for item in items}
+                target_items = [item_by_invoice.get(invoice_id) for invoice_id in invoice_ids]
+                if (
+                    len(invoice_ids) != len(set(invoice_ids))
+                    or len(items) < len(invoice_ids)
+                    or any(item is None or item.status != "succeeded"
+                           or item.external_activity_id is None or item.verified_at is None
+                           for item in target_items)
+                ):
+                    _fail_workbench_message(
+                        session, message, "source_changed_requires_reapproval", token=claim_token
+                    )
+                    session.commit()
+                    continue
+                current_evidence = [
+                    {"item_id": str(item_by_invoice[i].id), "invoice_id": i,
+                     "external_activity_id": item_by_invoice[i].external_activity_id,
+                     "verified_at": item_by_invoice[i].verified_at.isoformat()}
+                    for i in sorted(invoice_ids)
+                ]
+                stored_evidence = sorted(payload["evidence"],
+                                         key=lambda item: (int(item["invoice_id"]), str(item["item_id"])))
+                if stored_evidence != current_evidence:
+                    _fail_workbench_message(
+                        session, message, "source_changed_requires_reapproval", token=claim_token
+                    )
+                    session.commit()
+                    continue
+                credentials = decrypt_credentials(
+                    connection.encrypted_credentials, tenant_id=connection.tenant_id,
+                    connection_id=connection.id, encryption_version=connection.encryption_version,
+                )
+                auth = resolve_auth_material(connection.username, credentials)
+                live_records = []
+                for record in records:
+                    live = read_invoice_collection_snapshot(
+                        base_url=connection.base_url, database=connection.database_name,
+                        transport=connection.selected_transport, login=auth.login, secret=auth.secret,
+                        environment=get_settings().environment, company_id=connection.odoo_company_id,
+                        invoice_id=int(record["invoice_id"]), as_of_date=datetime.now(UTC).date(),
+                        now=datetime.now(UTC),
+                    )
+                    if int(live["partner_id"]) != message.approved_partner_id or not _same_live_record(
+                        record, live, message.company_id, payload.get("source_as_of")
+                    ):
+                        _fail_workbench_message(
+                            session, message, "source_changed_requires_reapproval", token=claim_token
+                        )
+                        session.commit()
+                        break
+                    live_records.append({**record, "live_snapshot": live})
+                else:
+                    source_hash = canonical_grouped_source_identity(
+                        tenant_id=message.tenant_id, service_request_id=message.service_request_id,
+                        action_id=message.action_id, approved_proposal_hash=action.approved_hash or "",
+                        connection_id=message.connection_id, company_id=message.company_id,
+                        partner_id=message.approved_partner_id, invoice_records=live_records,
+                        execution_evidence=current_evidence,
+                        source_version=message.approved_source_version,
+                    )
+                    if source_hash != message.approved_source_hash:
+                        _fail_workbench_message(
+                            session, message, "source_changed_requires_reapproval", token=claim_token
+                        )
+                        session.commit()
+                        continue
+                    anchor = message.delivery_anchor_invoice_id or min(invoice_ids)
+                    if anchor not in invoice_ids:
+                        _fail_workbench_message(
+                            session, message, "source_changed_requires_reapproval", token=claim_token
+                        )
+                        session.commit()
+                        continue
+                    anchored = session.execute(
+                        update(WorkbenchCollectionMessage).execution_options(synchronize_session=False)
+                        .where(
+                            WorkbenchCollectionMessage.id == message.id,
+                            WorkbenchCollectionMessage.claim_token == claim_token,
+                            WorkbenchCollectionMessage.status == "sending",
+                        )
+                        .values(
+                            delivery_anchor_invoice_id=anchor,
+                            version=WorkbenchCollectionMessage.version + 1,
+                        )
+                    )
+                    if anchored.rowcount != 1:
+                        session.rollback()
+                        continue
+                    current = session.get(WorkbenchCollectionMessage, message.id)
+                    _record_workbench_message_event(session, current, "policy_checked", "allowed")
+                    # Persist the deterministic anchor and attempt before any
+                    # network operation. A connector rollback must not erase
+                    # either safety invariant.
+                    session.commit()
+                    message = session.get(WorkbenchCollectionMessage, message.id)
+                    if (
+                        message is None
+                        or message.claim_token != claim_token
+                        or message.status != "sending"
+                        or message.lease_expires_at is None
+                        or _lease_is_expired(message.lease_expires_at, datetime.now(UTC))
+                    ):
+                        continue
+                    connection = session.query(Connection).filter_by(
+                        id=message.connection_id,
+                        tenant_id=message.tenant_id,
+                        provider="odoo",
+                    ).with_for_update().one_or_none()
+                    if (
+                        connection is None
+                        or not connection.is_active
+                        or connection.status != "configured"
+                        or connection.last_test_status != "success"
+                        or connection.selected_transport not in ("xmlrpc", "json2")
+                        or connection.odoo_company_id != message.company_id
+                        or connection.encrypted_credentials is None
+                        or connection.encryption_version is None
+                    ):
+                        _fail_workbench_message(
+                            session, message, "connection_changed_requires_reapproval", token=claim_token
+                        )
+                        session.commit()
+                        continue
+                    credentials = decrypt_credentials(
+                        connection.encrypted_credentials,
+                        tenant_id=connection.tenant_id,
+                        connection_id=connection.id,
+                        encryption_version=connection.encryption_version,
+                    )
+                    auth = resolve_auth_material(connection.username, credentials)
+                    delivery_call_started = True
+                    receipt = deliver_invoice_collection_message(
+                        base_url=connection.base_url, database=connection.database_name,
+                        transport=connection.selected_transport, login=auth.login, secret=auth.secret,
+                        environment=get_settings().environment, company_id=connection.odoo_company_id,
+                        invoice_id=anchor, content=approved_content,
+                        idempotency_marker=message.idempotency_marker,
+                        expected_partner_id=message.approved_partner_id,
+                        as_of_date=datetime.now(UTC).date(), now=datetime.now(UTC),
+                    )
+                    current = session.get(WorkbenchCollectionMessage, message.id)
+                    if (
+                        current is None
+                        or current.claim_token != claim_token
+                        or current.status != "sending"
+                    ):
+                        session.rollback()
+                        continue
+                    message = current
+                    if receipt.get("verified") is not True or not receipt.get("message_id"):
+                        raise ConnectorError("unsupported_response", "message not verified")
+                    changed = session.execute(
+                        update(WorkbenchCollectionMessage).execution_options(synchronize_session=False)
+                        .where(
+                            WorkbenchCollectionMessage.id == message.id,
+                            WorkbenchCollectionMessage.claim_token == claim_token,
+                            WorkbenchCollectionMessage.status == "sending",
+                        )
+                        .values(
+                            status="verifying",
+                            external_message_id=receipt.get("message_id"),
+                            version=WorkbenchCollectionMessage.version + 1,
+                        )
+                    )
+                    if changed.rowcount != 1:
+                        session.rollback()
+                        continue
+                    current = session.get(WorkbenchCollectionMessage, message.id)
+                    _record_workbench_message_event(session, current, "verifying")
+                    changed = session.execute(
+                        update(WorkbenchCollectionMessage).execution_options(synchronize_session=False)
+                        .where(
+                            WorkbenchCollectionMessage.id == message.id,
+                            WorkbenchCollectionMessage.claim_token == claim_token,
+                            WorkbenchCollectionMessage.status == "verifying",
+                        )
+                        .values(
+                            status="succeeded",
+                            external_message_id=receipt.get("message_id"),
+                            verified_at=datetime.now(UTC),
+                            last_delivery_at=datetime.now(UTC),
+                            delivery_error_code=None,
+                            lease_expires_at=None,
+                            claimed_at=None,
+                            claim_token=None,
+                            version=WorkbenchCollectionMessage.version + 1,
+                        )
+                    )
+                    if changed.rowcount != 1:
+                        session.rollback()
+                        continue
+                    current = session.get(WorkbenchCollectionMessage, message.id)
+                    _record_workbench_message_event(session, current, "verified")
+                    _record_workbench_message_event(session, current, "succeeded")
+                    delivered += 1
+                    session.commit()
+            except CollectionMessagePolicyError as exc:
+                session.rollback()
+                message = session.get(WorkbenchCollectionMessage, message.id)
+                if message is None:
+                    continue
+                if exc.code == "outside_contact_hours":
+                    changed = session.execute(
+                        update(WorkbenchCollectionMessage).execution_options(synchronize_session=False)
+                        .where(
+                            WorkbenchCollectionMessage.id == message.id,
+                            WorkbenchCollectionMessage.claim_token == claim_token,
+                            WorkbenchCollectionMessage.status == "sending",
+                            WorkbenchCollectionMessage.attempt_count > 0,
+                        )
+                        .values(
+                            status="queued",
+                            attempt_count=WorkbenchCollectionMessage.attempt_count - 1,
+                            delivery_error_code=exc.code,
+                            claimed_at=None,
+                            lease_expires_at=None,
+                            claim_token=None,
+                            next_attempt_at=datetime.now(UTC) + timedelta(minutes=15),
+                            version=WorkbenchCollectionMessage.version + 1,
+                        )
+                    )
+                    if changed.rowcount == 1:
+                        current = session.get(WorkbenchCollectionMessage, message.id)
+                        _record_workbench_message_event(session, current, "policy_blocked", exc.code)
+                else:
+                    _fail_workbench_message(
+                        session, message, exc.code or "policy_unavailable", token=claim_token
+                    )
+                session.commit()
+            except ConnectorError as exc:
+                session.rollback()
+                message = session.get(WorkbenchCollectionMessage, message.id)
+                if message is None:
+                    continue
+                retryable_codes = {
+                    "dns_resolution_failed", "connection_timeout",
+                    "server_unreachable", "tls_error", "internal_connector_error",
+                }
+                if delivery_call_started and exc.code == "unsupported_response":
+                    retryable_codes.add("unsupported_response")
+                if exc.code in retryable_codes and message.attempt_count < 3:
+                    _requeue_workbench_message(
+                        session,
+                        message,
+                        "reconciliation_uncertain" if exc.code == "unsupported_response"
+                        else "temporary_odoo_failure",
+                        token=claim_token,
+                    )
+                else:
+                    _fail_workbench_message(session, message, "delivery_failed", token=claim_token)
+                session.commit()
+            except (CredentialDecryptionError, EncryptionConfigError, AuthMaterialError,
+                    ValidationError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                session.rollback()
+                message = session.get(WorkbenchCollectionMessage, message.id)
+                if message is None:
+                    continue
+                _fail_workbench_message(session, message, "delivery_invalid", token=claim_token)
+                session.commit()
+        return delivered
+    finally:
+        if acquired:
+            try:
+                session.execute(text("SELECT pg_advisory_unlock(810061)"))
+            except SQLAlchemyError:
+                session.rollback()
+        session.close()
+
+
 def _record_message_worker_event(
     session,
     message: CollectionMessage,
@@ -944,6 +1259,7 @@ def main() -> None:
         generate_missing_ai_proposals_once()
         run_queued_actions_once()
         run_queued_workbench_actions_once()
+        run_queued_workbench_collection_messages_once()
         run_queued_collection_messages_once()
         scan_connections_once()
         session = get_session_factory()()

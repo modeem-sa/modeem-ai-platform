@@ -32,6 +32,8 @@ import {
   submitWorkbenchCommunication,
   approveWorkbenchCommunication,
   rejectWorkbenchCommunication,
+  queueWorkbenchCommunication,
+  retryWorkbenchCommunication,
   prepareWorkbenchAction,
   updateWorkbenchAction,
   submitWorkbenchAction,
@@ -265,6 +267,17 @@ export function useRequestWorkbench(requestId: string | undefined, locale: "ar" 
     }
   }, []);
 
+  const deliveryEvidence = (message: WorkbenchCommunication) => {
+    if (!message.approved_hash || !message.approved_source_hash) {
+      throw new Error("Approved delivery evidence is unavailable");
+    }
+    return {
+      expected_message_version: message.version,
+      expected_approved_hash: message.approved_hash,
+      expected_approved_source_hash: message.approved_source_hash,
+    };
+  };
+
   const prepareCommunicationsForAction = useCallback(async (action: WorkbenchAction) => {
     if (!requestId) throw new Error("Request is unavailable");
     setCommunicationLoading(true);
@@ -352,6 +365,10 @@ export function useRequestWorkbench(requestId: string | undefined, locale: "ar" 
         expected_source_hash: message.source_hash,
         ...(rejectionReason?.trim() ? { rejection_reason: rejectionReason.trim() } : {}),
       })),
+    queueCommunication: (message: WorkbenchCommunication) =>
+      runCommunication(() => queueWorkbenchCommunication(requestId!, message.id, deliveryEvidence(message))),
+    retryCommunication: (message: WorkbenchCommunication) =>
+      runCommunication(() => retryWorkbenchCommunication(requestId!, message.id, deliveryEvidence(message))),
   };
 }
 

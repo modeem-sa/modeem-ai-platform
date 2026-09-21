@@ -243,7 +243,15 @@ export interface WorkbenchCommunicationInvoice {
   [key: string]: unknown;
 }
 
-export type WorkbenchCommunicationStatus = "draft" | "awaiting_approval" | "approved";
+export type WorkbenchCommunicationStatus =
+  | "draft"
+  | "awaiting_approval"
+  | "approved"
+  | "queued"
+  | "sending"
+  | "verifying"
+  | "succeeded"
+  | "failed";
 
 export interface WorkbenchCommunication {
   id: string;
@@ -272,6 +280,8 @@ export interface WorkbenchCommunication {
   can_submit: boolean;
   can_approve: boolean;
   can_reject: boolean;
+  can_queue_delivery: boolean;
+  can_retry_delivery: boolean;
   approved_content?: string | null;
   approved_hash?: string | null;
   approved_draft_version?: number | null;
@@ -281,6 +291,17 @@ export interface WorkbenchCommunication {
   approved_by?: string | null;
   approved_at?: string | null;
   rejection_reason?: string | null;
+  queued_by_user_id?: string | null;
+  queued_at?: string | null;
+  attempt_count?: number;
+  delivery_anchor_invoice_id?: number | null;
+  external_message_id?: number | string | null;
+  delivery_error_code?: string | null;
+  delivery_started_at?: string | null;
+  verified_at?: string | null;
+  last_delivery_at?: string | null;
+  claimed_at?: string | null;
+  lease_expires_at?: string | null;
 }
 
 export interface RequestModule {
@@ -555,6 +576,12 @@ type WorkbenchCommunicationDecisionEvidence = {
   expected_source_hash: string;
 };
 
+type WorkbenchCommunicationDeliveryEvidence = {
+  expected_message_version: number;
+  expected_approved_hash: string;
+  expected_approved_source_hash: string;
+};
+
 export function approveWorkbenchCommunication(
   requestId: string,
   messageId: string,
@@ -573,6 +600,28 @@ export function rejectWorkbenchCommunication(
 ): Promise<{ message: WorkbenchCommunication }> {
   return apiFetch<{ message: WorkbenchCommunication }>(
     `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/communications/${encodeURIComponent(messageId)}/reject`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+}
+
+export function queueWorkbenchCommunication(
+  requestId: string,
+  messageId: string,
+  body: WorkbenchCommunicationDeliveryEvidence,
+): Promise<{ message: WorkbenchCommunication }> {
+  return apiFetch<{ message: WorkbenchCommunication }>(
+    `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/communications/${encodeURIComponent(messageId)}/queue`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+}
+
+export function retryWorkbenchCommunication(
+  requestId: string,
+  messageId: string,
+  body: WorkbenchCommunicationDeliveryEvidence,
+): Promise<{ message: WorkbenchCommunication }> {
+  return apiFetch<{ message: WorkbenchCommunication }>(
+    `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/communications/${encodeURIComponent(messageId)}/retry`,
     { method: "POST", body: JSON.stringify(body) },
   );
 }

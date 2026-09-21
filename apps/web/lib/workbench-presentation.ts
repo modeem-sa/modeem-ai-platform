@@ -12,6 +12,17 @@ export const workbenchStatusLabels: Record<string, { en: string; ar: string }> =
   failed: { en: "Failed", ar: "فشل التنفيذ" },
 };
 
+export const communicationStatusLabels: Record<string, { en: string; ar: string }> = {
+  draft: { en: "Draft", ar: "مسودة" },
+  awaiting_approval: { en: "Awaiting communication approval", ar: "بانتظار موافقة التواصل" },
+  approved: { en: "Approved · not queued", ar: "تمت الموافقة · لم يُدرج في قائمة التنفيذ" },
+  queued: { en: "Queued for delivery", ar: "بانتظار الإرسال" },
+  sending: { en: "Sending", ar: "جارٍ الإرسال" },
+  verifying: { en: "Verifying delivery", ar: "جارٍ التحقق من الإرسال" },
+  succeeded: { en: "Sent and verified", ar: "تم الإرسال والتحقق" },
+  failed: { en: "Delivery failed", ar: "فشل الإرسال" },
+};
+
 export function getWorkbenchStatusLabel(status: WorkbenchAction["status"], locale: "ar" | "en") {
   return workbenchStatusLabels[status][locale];
 }
@@ -38,6 +49,18 @@ export function communicationActions(message: WorkbenchCommunication) {
     canSubmit: message.status === "draft" && message.can_submit,
     canApprove: message.status === "awaiting_approval" && message.can_approve,
     canReject: message.status === "awaiting_approval" && message.can_reject,
+    canQueueDelivery: message.status === "approved" && message.can_queue_delivery,
+    canRetryDelivery: message.status === "failed" && message.can_retry_delivery,
     canSend: false as const,
   };
+}
+
+export function getCommunicationStatusLabel(status: WorkbenchCommunication["status"], locale: "ar" | "en") {
+  return communicationStatusLabels[status][locale];
+}
+
+export function hasVerifiedCommunicationDeliverySuccess(message: WorkbenchCommunication) {
+  return message.status === "succeeded"
+    && message.external_message_id != null
+    && Boolean(message.verified_at);
 }

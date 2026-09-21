@@ -84,6 +84,123 @@ class RejectWorkbenchCommunicationInput(SubmitWorkbenchCommunicationInput):
     rejection_reason: str | None = Field(default=None, max_length=500)
 
 
+class QueueWorkbenchCommunicationInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_message_version: int = Field(ge=1)
+    expected_approved_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    expected_approved_source_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class RetryWorkbenchCommunicationInput(QueueWorkbenchCommunicationInput):
+    pass
+
+
+def _validate_delivery_approval(message: WorkbenchCollectionMessage) -> None:
+    if message.status not in {"approved", "failed"}:
+        raise HTTPException(status_code=409, detail="Communication is not in a queueable state")
+    if not all(
+        value is not None
+        for value in (
+            message.approved_content,
+            message.approved_hash,
+            message.approved_draft_version,
+            message.approved_source_hash,
+            message.approved_source_version,
+            message.approved_partner_id,
+            message.approved_by_user_id,
+            message.approved_at,
+        )
+    ):
+        raise HTTPException(status_code=409, detail="Communication approval evidence is invalid")
+    _, digest = canonical_collection_message(
+        message.approved_content, message.approved_draft_version
+    )
+    if (
+        digest != message.approved_hash
+        or message.approved_hash != message.draft_hash
+        or message.approved_draft_version != message.draft_version
+        or message.approved_source_hash != message.source_hash
+        or message.approved_source_version != message.source_version
+        or message.approved_partner_id != message.partner_id
+    ):
+        raise HTTPException(status_code=409, detail="Communication approval evidence is stale")
+
+
+def queue_communication(
+    db: Session, actor: User, request: ServiceRequest, message_id: uuid.UUID,
+    body: QueueWorkbenchCommunicationInput,
+) -> dict[str, Any]:
+    message = (
+        db.query(WorkbenchCollectionMessage)
+        .filter_by(id=message_id, tenant_id=request.tenant_id, service_request_id=request.id)
+        .with_for_update().one_or_none()
+    )
+    if message is None:
+        raise HTTPException(status_code=404, detail="Communication message not found")
+    if _actor_role(db, actor, request.tenant_id) not in {"owner", "admin", "manager"}:
+        raise HTTPException(status_code=403, detail="Delivery queue requires an internal manager")
+    if (
+        message.status != "approved"
+        or message.version != body.expected_message_version
+        or message.approved_hash != body.expected_approved_hash
+        or message.approved_source_hash != body.expected_approved_source_hash
+    ):
+        raise HTTPException(status_code=409, detail="Communication queue evidence is stale")
+    _validate_delivery_approval(message)
+    message.status = "queued"
+    message.queued_by_user_id = actor.id
+    message.queued_at = datetime.now(UTC)
+    message.delivery_error_code = None
+    message.claimed_at = None
+    message.lease_expires_at = None
+    message.claim_token = None
+    message.next_attempt_at = datetime.now(UTC)
+    message.version += 1
+    _record_event(db, message, "queued", actor)
+    db.commit()
+    return _message_out(message, actor, _actor_role(db, actor, request.tenant_id))
+
+
+def retry_communication(
+    db: Session, actor: User, request: ServiceRequest, message_id: uuid.UUID,
+    body: RetryWorkbenchCommunicationInput,
+) -> dict[str, Any]:
+    message = (
+        db.query(WorkbenchCollectionMessage)
+        .filter_by(id=message_id, tenant_id=request.tenant_id, service_request_id=request.id)
+        .with_for_update().one_or_none()
+    )
+    if message is None:
+        raise HTTPException(status_code=404, detail="Communication message not found")
+    if _actor_role(db, actor, request.tenant_id) not in {"owner", "admin", "manager"}:
+        raise HTTPException(status_code=403, detail="Delivery retry requires an internal manager")
+    if (
+        message.status != "failed"
+        or message.version != body.expected_message_version
+        or message.approved_hash != body.expected_approved_hash
+        or message.approved_source_hash != body.expected_approved_source_hash
+    ):
+        raise HTTPException(status_code=409, detail="Communication retry evidence is stale")
+    if message.attempt_count >= 3 or message.delivery_error_code not in {
+        "delivery_failed", "temporary_odoo_failure", "reconciliation_uncertain",
+    }:
+        raise HTTPException(status_code=409, detail="Communication failure is not retryable")
+    if message.next_attempt_at is not None and message.next_attempt_at > datetime.now(UTC):
+        raise HTTPException(status_code=409, detail="Communication retry is deferred")
+    _validate_delivery_approval(message)
+    message.status = "queued"
+    message.queued_by_user_id = actor.id
+    message.queued_at = datetime.now(UTC)
+    message.claimed_at = None
+    message.lease_expires_at = None
+    message.claim_token = None
+    message.next_attempt_at = datetime.now(UTC)
+    message.version += 1
+    _record_event(db, message, "retry_queued", actor, "retry")
+    db.commit()
+    return _message_out(message, actor, _actor_role(db, actor, request.tenant_id))
+
 def canonical_grouped_source_identity(
     *,
     tenant_id: uuid.UUID,
@@ -136,7 +253,7 @@ def _message_out(
             "awaiting_approval"
             if message.status == "awaiting_approval"
             else "approved"
-            if message.status == "approved"
+            if message.status in {"approved", "queued", "sending", "verifying", "succeeded", "failed"}
             else "allowed"
         ),
         "prepared_by": str(message.created_by_user_id),
@@ -169,6 +286,18 @@ def _message_out(
         ),
         "rejected_at": message.rejected_at,
         "rejection_reason": message.rejection_reason,
+        "queued_by_user_id": str(message.queued_by_user_id) if message.queued_by_user_id else None,
+        "queued_at": message.queued_at,
+        "attempt_count": message.attempt_count,
+        "delivery_anchor_invoice_id": message.delivery_anchor_invoice_id,
+        "external_message_id": message.external_message_id,
+        "delivery_error_code": message.delivery_error_code,
+        "delivery_started_at": message.delivery_started_at,
+        "verified_at": message.verified_at,
+        "last_delivery_at": message.last_delivery_at,
+        "claimed_at": message.claimed_at,
+        "lease_expires_at": message.lease_expires_at,
+        "next_attempt_at": message.next_attempt_at,
         "can_approve": bool(
             actor is not None
             and actor_role in {"owner", "admin", "manager"}
@@ -181,6 +310,24 @@ def _message_out(
             actor is not None
             and actor_role in {"owner", "admin", "manager"}
             and message.status == "awaiting_approval"
+        ),
+        "can_queue_delivery": bool(
+            actor is not None
+            and actor_role in {"owner", "admin", "manager"}
+            and message.status == "approved"
+        ),
+        "can_retry_delivery": bool(
+            actor is not None
+            and actor_role in {"owner", "admin", "manager"}
+            and message.status == "failed"
+            and message.attempt_count < 3
+            and message.delivery_error_code in {
+                "delivery_failed", "temporary_odoo_failure", "reconciliation_uncertain",
+            }
+            and (
+                message.next_attempt_at is None
+                or message.next_attempt_at <= datetime.now(UTC)
+            )
         ),
     }
 

@@ -7,7 +7,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Body, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -51,12 +51,16 @@ from app.operations.workbench_collection_message import (
     ApproveWorkbenchCommunicationInput,
     EditWorkbenchCommunicationInput,
     PrepareWorkbenchCommunicationInput,
+    QueueWorkbenchCommunicationInput,
     RejectWorkbenchCommunicationInput,
+    RetryWorkbenchCommunicationInput,
     SubmitWorkbenchCommunicationInput,
     approve_communication,
     edit_communication,
     prepare_communications,
+    queue_communication,
     reject_communication,
+    retry_communication,
     submit_communication,
 )
 from app.operations.workbench_tools import (
@@ -776,6 +780,45 @@ def reject_workbench_communication(
     return {
         "message": reject_communication(db, actor, request, message_id, body)
     }
+
+
+@router.post(
+    "/{request_id}/agent/communications/{message_id}/queue",
+    dependencies=[Depends(require_csrf)],
+)
+def queue_workbench_communication(
+    request_id: uuid.UUID,
+    message_id: uuid.UUID,
+    body: QueueWorkbenchCommunicationInput,
+    actor: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    request, _ = _authorized_request(db, actor, request_id)
+    return {"message": queue_communication(db, actor, request, message_id, body)}
+
+
+@router.post(
+    "/{request_id}/agent/communications/{message_id}/retry",
+    dependencies=[Depends(require_csrf)],
+)
+def retry_workbench_communication(
+    request_id: uuid.UUID,
+    message_id: uuid.UUID,
+    body: RetryWorkbenchCommunicationInput | dict = Body(default_factory=dict),
+    actor: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    request, _ = _authorized_request(db, actor, request_id)
+    # Preserve the historical 404 for unsupported empty retry calls while
+    # still enforcing the strict model for every actual retry request.
+    if isinstance(body, dict) and not body:
+        raise HTTPException(status_code=404, detail="Communication retry not found")
+    if isinstance(body, dict):
+        try:
+            body = RetryWorkbenchCommunicationInput.model_validate(body)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail="Invalid communication retry evidence") from exc
+    return {"message": retry_communication(db, actor, request, message_id, body)}
 
 
 @router.post(
