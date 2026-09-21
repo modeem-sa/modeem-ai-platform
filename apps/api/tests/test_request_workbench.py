@@ -21,9 +21,20 @@ from app.models import (
     User,
 )
 from app.operations.workbench_tools import (
+    CUSTOMER_INVOICES_TOOL_KEY,
+    FINANCE_TOOLS,
+    RECEIVABLES_TOOL_KEY,
+    RECENT_PAYMENTS_TOOL_KEY,
+    VENDOR_BILLS_TOOL_KEY,
+    InvoiceLookupInput,
     OverdueInvoicesInput,
+    ReceivablesInput,
+    RecentPaymentsInput,
+    VendorBillsInput,
+    execute_finance_tool,
     execute_overdue_customer_invoices,
     finance_tool_input_from_instruction,
+    select_finance_tool,
 )
 from tests.test_auth_security import PASSWORD, TestingSession
 
@@ -783,3 +794,252 @@ def test_finance_tool_failure_is_safe_and_internal(seed, monkeypatch):
     assert detail.status_code == 200
     assert "tool_calls" not in detail.json()
     assert all("finance.get_" not in message["body"] for message in detail.json()["messages"])
+
+
+def test_phase3b_registry_routing_and_approved_date_phrases_are_deterministic():
+    assert set(FINANCE_TOOLS) == {
+        "finance.get_overdue_customer_invoices",
+        CUSTOMER_INVOICES_TOOL_KEY,
+        RECEIVABLES_TOOL_KEY,
+        VENDOR_BILLS_TOOL_KEY,
+        RECENT_PAYMENTS_TOOL_KEY,
+    }
+    assert all(tool.mode == "read" for tool in FINANCE_TOOLS.values())
+    assert select_finance_tool("اعرض فواتير العميل شركة النور") == CUSTOMER_INVOICES_TOOL_KEY
+    assert select_finance_tool("ملخص الذمم المستحقة على العملاء") == RECEIVABLES_TOOL_KEY
+    assert select_finance_tool("unpaid vendor bills") == VENDOR_BILLS_TOOL_KEY
+    assert select_finance_tool("incoming payments last 30 days") == RECENT_PAYMENTS_TOOL_KEY
+    current = date(2026, 9, 21)
+    parsed = finance_tool_input_from_instruction(
+        "فواتير العميل شركة النور غير المسدد هذا الشهر",
+        CUSTOMER_INVOICES_TOOL_KEY,
+        today=current,
+    )
+    assert parsed.customer == "شركة النور"
+    assert parsed.payment_status == "not_paid"
+    assert parsed.date_from == date(2026, 9, 1)
+    assert parsed.date_to == current
+    assert InvoiceLookupInput.model_validate(
+        {"date_from": "2026-09-01", "date_to": "2026-09-21"}
+    ).date_from == date(2026, 9, 1)
+    with pytest.raises(HTTPException) as exc:
+        finance_tool_input_from_instruction(
+            "show payments yesterday",
+            RECENT_PAYMENTS_TOOL_KEY,
+            today=current,
+        )
+    assert exc.value.status_code == 422
+
+
+def test_customer_invoice_tool_resolves_server_side_partner_and_rejects_ambiguity(seed):
+    data = _fixture(seed)
+    db = TestingSession()
+    actor = db.get(User, data["employee"])
+    request = db.get(ServiceRequest, data["request"])
+    connection = db.query(Connection).filter_by(tenant_id=seed["tenant_a"]).first()
+    as_of = date(2026, 9, 21)
+    calls = []
+
+    def read_page(_connection, *, resource, filters, limit, offset, **_kwargs):
+        calls.append((resource, filters))
+        records = (
+            [{"id": 81, "name": "شركة النور"}]
+            if resource == "finance_customers"
+            else [_invoice(7, due_date=as_of, residual=250, customer_id=81)]
+        )
+        return {
+            "records": records[offset : offset + limit],
+            "offset": offset,
+            "returned_count": len(records[offset : offset + limit]),
+            "has_more": False,
+            "next_offset": None,
+        }
+
+    result = execute_finance_tool(
+        db=db,
+        actor=actor,
+        request=request,
+        connection=connection,
+        tool_key=CUSTOMER_INVOICES_TOOL_KEY,
+        tool_input=InvoiceLookupInput(customer="النور", payment_status="not_paid"),
+        read_page=read_page,
+        today=as_of,
+    )
+    assert result.returned_count == 1
+    assert result.invoices[0]["party_id"] == 81
+    invoice_filters = calls[-1][1]
+    assert {"field": "partner_id", "operator": "=", "value": 81} in invoice_filters
+    assert result.totals_by_currency[0]["outstanding_amount"] == "250.00"
+    assert calls[0][0] == "finance_customers"
+
+    def ambiguous(_connection, *, resource, **_kwargs):
+        assert resource == "finance_customers"
+        return {
+            "records": [{"id": 1, "name": "Al Noor"}, {"id": 2, "name": "Al Noor Trading"}],
+            "offset": 0,
+            "returned_count": 2,
+            "has_more": False,
+            "next_offset": None,
+        }
+
+    with pytest.raises(HTTPException) as exc:
+        execute_finance_tool(
+            db=db,
+            actor=actor,
+            request=request,
+            connection=connection,
+            tool_key=CUSTOMER_INVOICES_TOOL_KEY,
+            tool_input=InvoiceLookupInput(customer="Al Noor"),
+            read_page=ambiguous,
+            today=as_of,
+        )
+    db.close()
+    assert exc.value.status_code == 409
+
+
+def test_receivables_summary_uses_decimal_currency_aging_and_omits_truncated_totals(seed):
+    data = _fixture(seed)
+    db = TestingSession()
+    as_of = date(2026, 9, 21)
+    records = [
+        _invoice(1, due_date=as_of - timedelta(days=5), residual=100.10),
+        _invoice(2, due_date=as_of - timedelta(days=45), residual=200.20),
+        _invoice(3, due_date=as_of + timedelta(days=5), residual=50.30),
+        _invoice(4, due_date=as_of - timedelta(days=95), residual=9.40, currency_id=2, currency="USD"),
+    ]
+    common = {
+        "db": db,
+        "actor": db.get(User, data["employee"]),
+        "request": db.get(ServiceRequest, data["request"]),
+        "connection": db.query(Connection).filter_by(tenant_id=seed["tenant_a"]).first(),
+        "tool_key": RECEIVABLES_TOOL_KEY,
+        "today": as_of,
+    }
+    result = execute_finance_tool(
+        **common,
+        tool_input=ReceivablesInput(max_records=200),
+        read_page=_single_page(records),
+    )
+    totals = {item["currency"]: item for item in result.totals_by_currency}
+    assert totals["SAR"]["open_receivables_total"] == "350.60"
+    assert totals["SAR"]["overdue_receivables_total"] == "300.30"
+    assert totals["SAR"]["aging"]["days_0_30"] == "100.10"
+    assert totals["SAR"]["aging"]["days_31_60"] == "200.20"
+    assert totals["USD"]["aging"]["over_90_days"] == "9.40"
+
+    many = [_invoice(index, due_date=as_of - timedelta(days=40), residual=1) for index in range(1, 102)]
+    truncated = execute_finance_tool(
+        **common,
+        tool_input=ReceivablesInput(max_records=100),
+        read_page=_single_page(many),
+    )
+    db.close()
+    assert truncated.result_truncated is True
+    assert truncated.totals_by_currency == []
+
+
+def test_vendor_bill_and_payment_tools_use_only_bounded_approved_filters(seed):
+    data = _fixture(seed)
+    db = TestingSession()
+    as_of = date(2026, 9, 21)
+    common = {
+        "db": db,
+        "actor": db.get(User, data["employee"]),
+        "request": db.get(ServiceRequest, data["request"]),
+        "connection": db.query(Connection).filter_by(tenant_id=seed["tenant_a"]).first(),
+        "read_page": None,
+        "today": as_of,
+    }
+    bill = _invoice(1, due_date=as_of - timedelta(days=10), residual=75)
+    bill["move_type"] = "in_invoice"
+    bill["partner_id"] = [90, "Vendor 90"]
+    observed = {}
+
+    def bill_page(connection, **kwargs):
+        observed["bill"] = kwargs
+        return _single_page([bill])(connection, **kwargs)
+
+    common["read_page"] = bill_page
+    bills = execute_finance_tool(
+        **common,
+        tool_key=VENDOR_BILLS_TOOL_KEY,
+        tool_input=VendorBillsInput(
+            state="posted",
+            payment_status="not_paid",
+            due_status="overdue",
+        ),
+    )
+    assert bills.bills[0]["party"] == "Vendor 90"
+    assert {item["field"] for item in observed["bill"]["filters"]} == {
+        "state",
+        "payment_state",
+        "invoice_date_due",
+    }
+    payment = {
+        "id": 10,
+        "name": "PAY/0010",
+        "date": as_of.isoformat(),
+        "amount": 88.25,
+        "payment_type": "inbound",
+        "partner_type": "customer",
+        "partner_id": [10, "Customer 10"],
+        "currency_id": [1, "SAR"],
+        "company_id": [1, "Main Company"],
+        "state": "posted",
+    }
+
+    def payment_page(connection, **kwargs):
+        observed["payment"] = kwargs
+        return _single_page([payment])(connection, **kwargs)
+
+    common["read_page"] = payment_page
+    payments = execute_finance_tool(
+        **common,
+        tool_key=RECENT_PAYMENTS_TOOL_KEY,
+        tool_input=RecentPaymentsInput(
+            date_from=as_of - timedelta(days=29),
+            date_to=as_of,
+            direction="incoming",
+        ),
+    )
+    db.close()
+    assert payments.payments[0]["amount"] == "88.25"
+    assert {"field": "payment_type", "operator": "=", "value": "inbound"} in observed["payment"]["filters"]
+    assert payments.totals_by_currency[0]["total_amount"] == "88.25"
+
+
+def test_new_tool_rows_are_transient_and_unknown_input_is_rejected(seed, monkeypatch):
+    data = _fixture(seed)
+    _enable_finance_connection(seed)
+    as_of = datetime.now(UTC).date()
+    bill = _invoice(1, due_date=as_of - timedelta(days=10), residual=75)
+    bill["move_type"] = "in_invoice"
+    bill["partner_id"] = [90, "Sensitive Vendor Name"]
+    monkeypatch.setattr(workbench_api, "_operations_read_page", _single_page([bill]))
+    client = _client("workbench-employee@example.com")
+    path = f"/api/v1/service-requests/{data['request']}/agent/tools/execute"
+    response = client.post(
+        path,
+        json={
+            "tool_key": VENDOR_BILLS_TOOL_KEY,
+            "input": {"state": "posted", "max_records": 100},
+            "locale": "en",
+        },
+        headers=_csrf(client),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["tool_calls"][0]["result"]["bills"][0]["party"] == "Sensitive Vendor Name"
+    persisted = client.get(
+        f"/api/v1/service-requests/{data['request']}/agent/session"
+    ).json()["tool_calls"][0]["result"]
+    assert "bills" not in persisted
+    assert "Sensitive Vendor Name" not in str(persisted)
+    injected = client.post(
+        path,
+        json={
+            "tool_key": VENDOR_BILLS_TOOL_KEY,
+            "input": {"domain": [["id", ">", 0]], "max_records": 100},
+        },
+        headers=_csrf(client),
+    )
+    assert injected.status_code == 422

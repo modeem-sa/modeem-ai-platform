@@ -70,51 +70,52 @@ export interface AgentMessage {
   created_at: string;
 }
 
+export type FinanceToolKey =
+  | "finance.get_overdue_customer_invoices"
+  | "finance.get_customer_invoices"
+  | "finance.get_receivables_summary"
+  | "finance.get_vendor_bills"
+  | "finance.get_recent_payments";
+
+export interface FinanceCurrencyTotal {
+  currency_id?: number;
+  currency: string;
+  invoice_count?: number;
+  bill_count?: number;
+  payment_count?: number;
+  outstanding_amount?: string;
+  total_amount?: string;
+  amount?: string;
+  open_receivables_total?: string;
+  overdue_receivables_total?: string;
+  overdue_invoice_count?: number;
+  aging?: Record<string, string>;
+}
+
+export interface FinanceResult {
+  source: string;
+  connection_name: string;
+  as_of: string;
+  filters_used?: Array<{ field: string; operator: string; value?: unknown }>;
+  complete?: boolean;
+  result_truncated?: boolean;
+  needs_narrower_filter?: boolean;
+  returned_count?: number;
+  returned_customer_count?: number;
+  totals_by_currency?: FinanceCurrencyTotal[];
+  invoices?: Array<Record<string, unknown>>;
+  bills?: Array<Record<string, unknown>>;
+  payments?: Array<Record<string, unknown>>;
+  [key: string]: unknown;
+}
+
 export interface FinanceToolCall {
   id: string;
-  tool_key: "finance.get_overdue_customer_invoices";
+  tool_key: FinanceToolKey;
   mode: "read";
   status: "started" | "completed" | "failed";
-  input: {
-    minimum_days_overdue: number;
-    max_records: number;
-  };
-  result: {
-    source: "Odoo";
-    connection_name: string;
-    as_of: string;
-    minimum_days_overdue: number;
-    complete: boolean;
-    result_truncated: boolean;
-    needs_narrower_filter: boolean;
-    returned_count: number;
-    returned_customer_count: number;
-    invoices?: Array<{
-      id: number;
-      customer_id: number;
-      customer: string;
-      invoice_number: string;
-      invoice_date: string | null;
-      due_date: string;
-      days_overdue: number;
-      currency_id: number;
-      currency: string;
-      total_amount: string;
-      remaining_amount: string;
-    }>;
-    totals_by_currency: Array<{
-      currency_id: number;
-      currency: string;
-      invoice_count: number;
-      outstanding_amount: string;
-      aging: {
-        days_0_30: string;
-        days_31_60: string;
-        days_61_90: string;
-        over_90_days: string;
-      };
-    }>;
-  } | null;
+  input: Record<string, unknown>;
+  result: FinanceResult | null;
   error_code: string | null;
   started_at: string;
   finished_at: string | null;
@@ -276,6 +277,21 @@ export function executeOverdueInvoiceTool(
         },
         locale,
       }),
+    },
+  );
+}
+
+export function executeFinanceTool(
+  requestId: string,
+  locale: "ar" | "en",
+  toolKey: FinanceToolKey,
+  input: Record<string, unknown> = {},
+): Promise<AgentSessionResponse> {
+  return apiFetch<AgentSessionResponse>(
+    `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/tools/execute`,
+    {
+      method: "POST",
+      body: JSON.stringify({ tool_key: toolKey, input, locale }),
     },
   );
 }

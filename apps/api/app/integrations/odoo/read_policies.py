@@ -219,6 +219,57 @@ _CUSTOMERS = ReadPolicy(
     max_page_size=ABSOLUTE_MAX_PAGE_SIZE,
 )
 
+# Finance Workbench partner resolution. These narrow resources expose only a
+# company-bound identifier and display name, and keep customer/vendor ranking
+# in server-owned domains. Browser callers never supply the resulting IDs.
+_FINANCE_CUSTOMERS = ReadPolicy(
+    resource_key="finance_customers",
+    odoo_model="res.partner",
+    fields=_fields(
+        ReadFieldPolicy(name="id", value_type="integer", nullable=False),
+        ReadFieldPolicy(
+            name="name",
+            value_type="string",
+            nullable=False,
+            max_length=255,
+            pattern=r"[^\x00-\x1f\x7f%_\\]{1,255}",
+        ),
+        ReadFieldPolicy(name="customer_rank", value_type="integer", nullable=False, min_value=0),
+        ReadFieldPolicy(name="company_id", value_type="many2one", nullable=False),
+    ),
+    default_fields=("id", "name"),
+    allowed_filter_fields=frozenset({"id", "name"}),
+    allowed_filter_operators=SAFE_OPERATORS,
+    allowed_order_fields=frozenset({"id", "name"}),
+    base_domain=(("customer_rank", ">", 0),),
+    required_module="account",
+    requires_company_scope=True,
+)
+
+_FINANCE_VENDORS = ReadPolicy(
+    resource_key="finance_vendors",
+    odoo_model="res.partner",
+    fields=_fields(
+        ReadFieldPolicy(name="id", value_type="integer", nullable=False),
+        ReadFieldPolicy(
+            name="name",
+            value_type="string",
+            nullable=False,
+            max_length=255,
+            pattern=r"[^\x00-\x1f\x7f%_\\]{1,255}",
+        ),
+        ReadFieldPolicy(name="supplier_rank", value_type="integer", nullable=False, min_value=0),
+        ReadFieldPolicy(name="company_id", value_type="many2one", nullable=False),
+    ),
+    default_fields=("id", "name"),
+    allowed_filter_fields=frozenset({"id", "name"}),
+    allowed_filter_operators=SAFE_OPERATORS,
+    allowed_order_fields=frozenset({"id", "name"}),
+    base_domain=(("supplier_rank", ">", 0),),
+    required_module="account",
+    requires_company_scope=True,
+)
+
 # Read-only customer invoice summary. Vendor bills, journal entries, lines,
 # attachments and free-text narration are outside this resource.
 _INVOICES = ReadPolicy(
@@ -277,6 +328,7 @@ _INVOICES = ReadPolicy(
             "state",
             "invoice_date",
             "invoice_date_due",
+            "partner_id",
             "amount_residual",
             "payment_state",
         }
@@ -512,7 +564,15 @@ _VENDOR_BILLS = ReadPolicy(
         "payment_state",
     ),
     allowed_filter_fields=frozenset(
-        {"id", "name", "state", "invoice_date", "payment_state"}
+        {
+            "id",
+            "name",
+            "state",
+            "invoice_date",
+            "invoice_date_due",
+            "partner_id",
+            "payment_state",
+        }
     ),
     allowed_filter_operators=SAFE_OPERATORS,
     allowed_order_fields=frozenset({"id", "name", "invoice_date", "amount_total"}),
@@ -541,7 +601,15 @@ _PAYMENTS_SUMMARY = ReadPolicy(
         "partner_id", "currency_id", "company_id", "state",
     ),
     allowed_filter_fields=frozenset(
-        {"id", "name", "date", "payment_type", "partner_type", "state"}
+        {
+            "id",
+            "name",
+            "date",
+            "payment_type",
+            "partner_type",
+            "partner_id",
+            "state",
+        }
     ),
     allowed_filter_operators=FINANCIAL_SAFE_OPERATORS,
     allowed_order_fields=frozenset({"id", "name", "date", "amount"}),
@@ -701,6 +769,8 @@ READ_POLICIES: dict[str, ReadPolicy] = {
     _COUNTRIES.resource_key: _COUNTRIES,
     _BENEFICIARIES_SUMMARY.resource_key: _BENEFICIARIES_SUMMARY,
     _CUSTOMERS.resource_key: _CUSTOMERS,
+    _FINANCE_CUSTOMERS.resource_key: _FINANCE_CUSTOMERS,
+    _FINANCE_VENDORS.resource_key: _FINANCE_VENDORS,
     _INVOICES.resource_key: _INVOICES,
     _INSTALLED_MODULES.resource_key: _INSTALLED_MODULES,
     _COMPANIES.resource_key: _COMPANIES,

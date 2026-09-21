@@ -22,6 +22,8 @@ import {
   analyzeServiceRequest,
   sendAgentMessage,
   executeOverdueInvoiceTool,
+  executeFinanceTool,
+  FinanceToolKey,
 } from "@/lib/service-requests";
 
 export function useServiceRequests(tenantId: string | undefined, employeeInbox = false, includeAll = false) {
@@ -171,6 +173,8 @@ export function useRequestWorkbench(requestId: string | undefined, locale: "ar" 
     send: (content: string) => run(() => sendAgentMessage(requestId!, content, locale)),
     runOverdueInvoices: (minimumDaysOverdue = 30) =>
       run(() => executeOverdueInvoiceTool(requestId!, locale, minimumDaysOverdue)),
+    runFinanceTool: (toolKey: FinanceToolKey, input: Record<string, unknown> = {}) =>
+      run(() => executeFinanceTool(requestId!, locale, toolKey, input)),
   };
 }
 

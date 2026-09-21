@@ -30,10 +30,12 @@ from app.models import (
     User,
 )
 from app.operations.workbench_tools import (
+    FINANCE_TOOLS,
+    RECEIVABLES_TOOL_KEY,
     TOOL_KEY,
-    OverdueInvoicesInput,
-    execute_overdue_customer_invoices,
+    execute_finance_tool,
     finance_tool_input_from_instruction,
+    parse_finance_tool_input,
     select_finance_tool,
 )
 from app.services.audit import record_audit
@@ -76,8 +78,14 @@ class MessageInput(BaseModel):
 class ToolExecutionInput(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    tool_key: Literal["finance.get_overdue_customer_invoices"] = TOOL_KEY
-    input: OverdueInvoicesInput = Field(default_factory=OverdueInvoicesInput)
+    tool_key: Literal[
+        "finance.get_overdue_customer_invoices",
+        "finance.get_customer_invoices",
+        "finance.get_receivables_summary",
+        "finance.get_vendor_bills",
+        "finance.get_recent_payments",
+    ] = TOOL_KEY
+    input: dict = Field(default_factory=dict)
     locale: Literal["ar", "en"] = "ar"
 
 
@@ -333,6 +341,28 @@ def _tool_summary(result: dict, locale: str) -> str:
             else f"Returned {result['returned_count']} invoices. The result is incomplete; "
             "narrow the request before relying on totals."
         )
+    if result["tool_key"] == RECEIVABLES_TOOL_KEY:
+        if not result["totals_by_currency"]:
+            return (
+                "لا توجد إجماليات مكتملة للذمم المدينة ضمن النطاق."
+                if locale == "ar"
+                else "No complete receivables totals are available for this scope."
+            )
+        totals = "، ".join(
+            f"{item['open_receivables_total']} {item['currency']}"
+            for item in result["totals_by_currency"]
+        )
+        return (
+            f"إجمالي الذمم المدينة حسب العملة: {totals}."
+            if locale == "ar"
+            else f"Open receivables by currency: {totals}."
+        )
+    if result["tool_key"] != TOOL_KEY:
+        return (
+            f"تمت قراءة {result['returned_count']} سجل مالي من Odoo."
+            if locale == "ar"
+            else f"Read {result['returned_count']} financial records from Odoo."
+        )
     if not result["totals_by_currency"]:
         return (
             "لم يتم العثور على فواتير عملاء متأخرة ضمن الحد المحدد."
@@ -360,7 +390,8 @@ def _execute_finance_tool(
     actor: User,
     session: AgentSession,
     connection: Connection,
-    tool_input: OverdueInvoicesInput,
+    tool_key: str,
+    tool_input: BaseModel,
     locale: str,
 ) -> tuple[uuid.UUID, dict]:
     call = AgentToolCall(
@@ -369,7 +400,7 @@ def _execute_finance_tool(
         service_request_id=request.id,
         employee_user_id=actor.id,
         connection_id=connection.id,
-        tool_key=TOOL_KEY,
+        tool_key=tool_key,
         mode="read",
         status="started",
         safe_input_json=json.dumps(tool_input.model_dump(), sort_keys=True),
@@ -387,16 +418,17 @@ def _execute_finance_tool(
         metadata={
             "service_request_id": str(request.id),
             "agent_session_id": str(session.id),
-            "tool_key": TOOL_KEY,
+            "tool_key": tool_key,
             "mode": "read",
         },
     )
     try:
-        result_model = execute_overdue_customer_invoices(
+        result_model = execute_finance_tool(
             db=db,
             actor=actor,
             request=request,
             connection=connection,
+            tool_key=tool_key,
             tool_input=tool_input,
             read_page=_operations_read_page,
         )
@@ -416,7 +448,7 @@ def _execute_finance_tool(
             metadata={
                 "service_request_id": str(request.id),
                 "agent_session_id": str(session.id),
-                "tool_key": TOOL_KEY,
+                "tool_key": tool_key,
                 "error_code": call.error_code,
             },
         )
@@ -438,7 +470,7 @@ def _execute_finance_tool(
             metadata={
                 "service_request_id": str(request.id),
                 "agent_session_id": str(session.id),
-                "tool_key": TOOL_KEY,
+                "tool_key": tool_key,
                 "error_code": call.error_code,
             },
         )
@@ -453,7 +485,7 @@ def _execute_finance_tool(
     result_summary = {
         key: value
         for key, value in result.items()
-        if key != "invoices"
+        if key not in {"invoices", "bills", "payments", "filters_used"}
     }
     call.status = "completed"
     call.safe_result_summary_json = json.dumps(
@@ -482,7 +514,7 @@ def _execute_finance_tool(
         metadata={
             "service_request_id": str(request.id),
             "agent_session_id": str(session.id),
-            "tool_key": TOOL_KEY,
+            "tool_key": tool_key,
             "result_count": result["returned_count"],
             "result_truncated": result["result_truncated"],
         },
@@ -554,13 +586,15 @@ def execute_agent_tool(
 ) -> dict:
     request, _ = _authorized_request(db, actor, request_id)
     session, connection = _ensure_session(db, request, actor)
+    tool_input = parse_finance_tool_input(body.tool_key, body.input)
     call_id, result = _execute_finance_tool(
         db,
         request,
         actor,
         session,
         connection,
-        body.input,
+        body.tool_key,
+        tool_input,
         body.locale,
     )
     return _session_out(db, session, {call_id: result})
@@ -668,14 +702,15 @@ def post_agent_message(
     db.flush()
     _audit_agent_message(db, request, actor, user_message)
     selected_tool = select_finance_tool(body.content)
-    if selected_tool == TOOL_KEY:
+    if selected_tool in FINANCE_TOOLS:
         call_id, result = _execute_finance_tool(
             db,
             request,
             actor,
             session,
             connection,
-            finance_tool_input_from_instruction(body.content),
+            selected_tool,
+            finance_tool_input_from_instruction(body.content, selected_tool),
             body.locale,
         )
         return _session_out(db, session, {call_id: result})
