@@ -3,7 +3,17 @@
 import uuid
 from datetime import UTC, datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, Uuid
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+)
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -17,6 +27,12 @@ class AgentSession(Base):
     __tablename__ = "agent_sessions"
     __table_args__ = (
         CheckConstraint("status IN ('active','completed','failed')", name="ck_agent_sessions_status"),
+        UniqueConstraint(
+            "tenant_id",
+            "service_request_id",
+            "employee_user_id",
+            name="uq_agent_sessions_tenant_request_employee",
+        ),
         Index("ix_agent_sessions_tenant_request", "tenant_id", "service_request_id"),
         Index("ix_agent_sessions_employee_status", "employee_user_id", "status"),
     )

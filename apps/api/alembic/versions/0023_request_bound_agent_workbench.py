@@ -31,6 +31,12 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["employee_user_id"], ["users.id"], ondelete="RESTRICT"),
         sa.ForeignKeyConstraint(["connection_id"], ["connections.id"], ondelete="SET NULL"),
         sa.CheckConstraint("status IN ('active','completed','failed')", name="ck_agent_sessions_status"),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "service_request_id",
+            "employee_user_id",
+            name="uq_agent_sessions_tenant_request_employee",
+        ),
     )
     op.create_index(
         "ix_agent_sessions_tenant_request", "agent_sessions", ["tenant_id", "service_request_id"]
@@ -40,7 +46,7 @@ def upgrade() -> None:
     )
     op.create_table(
         "agent_messages",
-        sa.Column("id", sa.String(length=36), primary_key=True),
+        sa.Column("id", sa.Uuid(), primary_key=True),
         sa.Column("session_id", sa.Uuid(), nullable=False),
         sa.Column("tenant_id", sa.Uuid(), nullable=False),
         sa.Column("role", sa.String(length=16), nullable=False),

@@ -25,10 +25,11 @@ from app.api.deps import (
 )
 from app.api.operations import _operations_read_page
 from app.core.config import get_settings
+from app.integrations.odoo.read_policies import MAX_INVENTORY_OFFSET
 from app.models import (
+    Connection,
     OperationTask,
     OperationTaskHistory,
-    Connection,
     ServiceRequest,
     ServiceRequestAttachment,
     ServiceRequestEvent,
@@ -37,7 +38,6 @@ from app.models import (
     User,
 )
 from app.operations.automation_catalog import CATALOG, effective_config, get_workflow
-from app.integrations.odoo.read_policies import MAX_INVENTORY_OFFSET
 from app.services.audit import record_audit
 
 router = APIRouter(prefix="/api/v1/service-requests", tags=["service-requests"])
@@ -171,7 +171,13 @@ def _json(value: str | None):
         return None
 
 
-def _request_out(db: Session, request: ServiceRequest, *, include_events: bool = False) -> dict:
+def _request_out(
+    db: Session,
+    request: ServiceRequest,
+    *,
+    include_events: bool = False,
+    can_use_workbench: bool = False,
+) -> dict:
     message_rows = (
         db.query(ServiceRequestMessage, User)
         .join(User, User.id == ServiceRequestMessage.author_id)
@@ -209,6 +215,7 @@ def _request_out(db: Session, request: ServiceRequest, *, include_events: bool =
         "version": request.version,
         "created_at": request.created_at,
         "updated_at": request.updated_at,
+        "can_use_workbench": can_use_workbench,
         "messages": [
             {
                 "id": str(message.id),
@@ -561,7 +568,12 @@ def request_detail(
     db: Session = Depends(get_db),
 ) -> dict:
     request, membership = _request_for_user(db, user, request_id)
-    return _request_out(db, request, include_events=membership.role != "customer")
+    return _request_out(
+        db,
+        request,
+        include_events=membership.role != "customer",
+        can_use_workbench=membership.role in WORKER_ROLES,
+    )
 
 
 @router.post("/{request_id}/messages", dependencies=[Depends(require_csrf)])

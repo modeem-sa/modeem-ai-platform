@@ -8,6 +8,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.api.csrf import require_csrf
@@ -25,6 +26,8 @@ router = APIRouter(prefix="/api/v1/service-requests", tags=["request-workbench"]
 PROMPT_VERSION = "request-workbench-v1"
 PROMPT_PATH = Path(__file__).parents[1] / "prompts" / "operations" / "request_workbench.md"
 MAX_TEXT = 1200
+MAX_CONTEXT_TURNS = 8
+MAX_CONTEXT_CHARS = 6000
 
 
 class AnalysisResult(BaseModel):
@@ -42,10 +45,14 @@ class AnalysisResult(BaseModel):
 
 
 class SessionInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     locale: Literal["ar", "en"] = "ar"
 
 
 class MessageInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
     content: str = Field(min_length=1, max_length=4000)
     locale: Literal["ar", "en"] = "ar"
 
@@ -129,7 +136,6 @@ def _get_session(db: Session, request: ServiceRequest, actor: User) -> AgentSess
             AgentSession.service_request_id == request.id,
             AgentSession.tenant_id == request.tenant_id,
             AgentSession.employee_user_id == actor.id,
-            AgentSession.status.in_(("active", "failed")),
         )
         .order_by(AgentSession.updated_at.desc())
         .first()
@@ -149,7 +155,23 @@ def _ensure_session(db: Session, request: ServiceRequest, actor: User) -> tuple[
             prompt_version=PROMPT_VERSION,
         )
         db.add(session)
-        db.flush()
+        try:
+            db.flush()
+        except IntegrityError:
+            # A concurrent start may win the unique request/employee slot.
+            # Roll back only this attempted insert, then safely resume the
+            # already-persisted session instead of creating a duplicate.
+            db.rollback()
+            session = _get_session(db, request, actor)
+            if session is None:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Could not safely resume the request workbench session.",
+                )
+            session.connection_id = connection.id
+            session.status = "active"
+            session.last_error = None
+            return session, connection
         record_audit(
             db,
             action="agent_session_created",
@@ -186,6 +208,55 @@ def _analysis_payload(request: ServiceRequest, connection: Connection, locale: s
             "company_configured": connection.odoo_company_id is not None,
         },
     }
+
+
+def _conversation_context(
+    db: Session, session: AgentSession, current_message_id: uuid.UUID
+) -> list[dict[str, str]]:
+    rows = (
+        db.query(AgentMessage)
+        .filter(
+            AgentMessage.session_id == session.id,
+            AgentMessage.tenant_id == session.tenant_id,
+            AgentMessage.id != current_message_id,
+            AgentMessage.role.in_(("user", "assistant", "system")),
+        )
+        .order_by(AgentMessage.created_at.desc(), AgentMessage.id.desc())
+        .limit(MAX_CONTEXT_TURNS)
+        .all()
+    )
+    reverse_context: list[dict[str, str]] = []
+    used_chars = 0
+    for item in rows:
+        content = _safe_text(item.content, MAX_TEXT)
+        remaining = MAX_CONTEXT_CHARS - used_chars
+        if remaining <= 0:
+            break
+        content = content[:remaining]
+        if not content:
+            continue
+        reverse_context.append({"role": item.role, "content": content})
+        used_chars += len(content)
+    return list(reversed(reverse_context))
+
+
+def _audit_agent_message(
+    db: Session, request: ServiceRequest, actor: User, message: AgentMessage
+) -> None:
+    record_audit(
+        db,
+        action="agent_message_created",
+        actor_type="user",
+        actor_id=str(actor.id),
+        tenant_id=request.tenant_id,
+        resource_type="agent_message",
+        resource_id=str(message.id),
+        metadata={
+            "service_request_id": str(request.id),
+            "message_id": str(message.id),
+            "message_role": message.role,
+        },
+    )
 
 
 def _provider_analysis(request: ServiceRequest, connection: Connection, locale: str) -> tuple[AnalysisResult, str]:
@@ -291,6 +362,8 @@ def analyze_request(
         analysis_json=json.dumps(payload, ensure_ascii=False),
     )
     db.add(message)
+    db.flush()
+    _audit_agent_message(db, request, actor, message)
     record_audit(
         db,
         action="agent_analysis_completed",
@@ -334,8 +407,11 @@ def post_agent_message(
         content=_safe_text(body.content, 4000),
     )
     db.add(user_message)
+    db.flush()
+    _audit_agent_message(db, request, actor, user_message)
     prompt = PROMPT_PATH.read_text(encoding="utf-8").strip()
     payload = _analysis_payload(request, connection, body.locale)
+    payload["conversation"] = _conversation_context(db, session, user_message.id)
     payload["employee_instruction"] = _safe_text(body.content, 4000)
     try:
         provider = OpenAICompatibleProvider.from_environment()
@@ -347,33 +423,44 @@ def post_agent_message(
     except ProviderUnavailableError as exc:
         session.status = "failed"
         session.last_error = "AI provider is not configured."
+        record_audit(
+            db,
+            action="agent_provider_failed",
+            actor_type="user",
+            actor_id=str(actor.id),
+            tenant_id=request.tenant_id,
+            resource_type="agent_session",
+            resource_id=str(session.id),
+            metadata={"service_request_id": str(request.id), "status_code": 503},
+        )
         db.commit()
         raise HTTPException(status_code=503, detail=session.last_error) from exc
     except (ProviderFailureError, ValueError, TypeError) as exc:
         session.status = "failed"
         session.last_error = "AI provider returned an unusable response."
+        record_audit(
+            db,
+            action="agent_provider_failed",
+            actor_type="user",
+            actor_id=str(actor.id),
+            tenant_id=request.tenant_id,
+            resource_type="agent_session",
+            resource_id=str(session.id),
+            metadata={"service_request_id": str(request.id), "status_code": 502},
+        )
         db.commit()
         raise HTTPException(status_code=502, detail=session.last_error) from exc
     response_payload = result.model_dump()
-    db.add(
-        AgentMessage(
-            session_id=session.id,
-            tenant_id=request.tenant_id,
-            role="assistant",
-            content=result.request_summary,
-            analysis_json=json.dumps(response_payload, ensure_ascii=False),
-        )
-    )
-    record_audit(
-        db,
-        action="agent_message_created",
-        actor_type="user",
-        actor_id=str(actor.id),
+    assistant_message = AgentMessage(
+        session_id=session.id,
         tenant_id=request.tenant_id,
-        resource_type="agent_session",
-        resource_id=str(session.id),
-        metadata={"service_request_id": str(request.id)},
+        role="assistant",
+        content=result.request_summary,
+        analysis_json=json.dumps(response_payload, ensure_ascii=False),
     )
+    db.add(assistant_message)
+    db.flush()
+    _audit_agent_message(db, request, actor, assistant_message)
     session.status = "active"
     session.provider_model = str(getattr(provider, "model", "unknown"))
     session.last_error = None

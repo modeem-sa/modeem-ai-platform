@@ -55,6 +55,7 @@ export interface ServiceRequest {
   version: number;
   created_at: string;
   updated_at: string;
+  can_use_workbench: boolean;
   messages: ServiceRequestMessage[];
   attachments: ServiceRequestAttachment[];
   events?: ServiceRequestEvent[];

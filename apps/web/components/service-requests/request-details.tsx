@@ -192,7 +192,7 @@ export function RequestDetails({
         </div>
       )}
 
-      {isEmployee && <RequestWorkbench requestId={request.id} />}
+      {request.can_use_workbench && <RequestWorkbench requestId={request.id} />}
 
       {/* Reopen Action for Customer */}
       {!isEmployee && (request.status === "closed" || request.status === "resolved") && (
