@@ -145,6 +145,41 @@ def test_multi_tenant_assignment_and_scopes_are_persisted_and_returned(_fresh_db
     assert all(row["service_scope"] == ["financial"] for row in rows)
 
 
+def test_owner_can_create_new_requester_account(_fresh_db):
+    data = _fixture_data()
+    client = TestClient(app)
+    _login(client, "owner-permissions@example.com")
+
+    response = client.post(
+        "/api/v1/permissions",
+        json={
+            "email": "new-requester@example.com",
+            "full_name": "New Requester",
+            "password": PASSWORD,
+            "memberships": [
+                {
+                    "tenant_id": str(data["tenant_a"]),
+                    "role": "customer",
+                    "odoo_module_scope": [],
+                    "service_scope": [],
+                }
+            ],
+        },
+        headers=_csrf(client),
+    )
+
+    assert response.status_code == 201, response.text
+    db = TestingSession()
+    user = db.query(User).filter_by(email="new-requester@example.com").one()
+    membership = db.query(TenantMembership).filter_by(
+        tenant_id=data["tenant_a"], user_id=user.id
+    ).one()
+    db.close()
+    assert membership.role == "customer"
+    assert membership.odoo_module_scope_json == "[]"
+    assert membership.service_scope_json == "[]"
+
+
 def test_duplicate_membership_returns_conflict(_fresh_db):
     data = _fixture_data()
     client = TestClient(app)

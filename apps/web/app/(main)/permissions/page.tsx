@@ -17,6 +17,17 @@ type Bootstrap = { tenants: Tenant[]; memberships: Membership[]; scope_modules: 
 type Assignment = { tenant_id: string; role: string; is_active: boolean; odoo_module_scope: string[] | null; service_scope: string[] | null };
 
 const roles = ["owner", "admin", "manager", "member", "viewer", "customer"];
+const roleLabel = (role: string, ar: boolean) => {
+  const labels: Record<string, { ar: string; en: string }> = {
+    owner: { ar: "المالك", en: "Owner" },
+    admin: { ar: "مدير النظام", en: "Administrator" },
+    manager: { ar: "مدير", en: "Manager" },
+    member: { ar: "موظف", en: "Member" },
+    viewer: { ar: "مشاهد", en: "Viewer" },
+    customer: { ar: "مقدم طلب", en: "Requester" },
+  };
+  return labels[role]?.[ar ? "ar" : "en"] ?? role;
+};
 const csrfHeaders = (): Record<string, string> => {
   const token = document.cookie.match(/(?:^|;\s*)modeem_csrf=([^;]+)/)?.[1];
   return token ? { "X-CSRF-Token": decodeURIComponent(token) } : {};
@@ -122,7 +133,21 @@ export default function PermissionsPage() {
         <p className="mt-1 text-sm text-slate-400">{ar ? "يمكن منح الحساب عضوية في جمعية واحدة أو أكثر." : "Assign the account to one or more associations."}</p>
         <form onSubmit={create} className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           <div className="flex gap-3 sm:col-span-2 lg:col-span-3"><label><input type="radio" checked={accountMode === "new"} onChange={() => setAccountMode("new")} /> {ar ? "حساب جديد" : "New account"}</label><label><input type="radio" checked={accountMode === "existing"} onChange={() => setAccountMode("existing")} /> {ar ? "حساب موجود" : "Existing account"}</label></div>
-          {accountMode === "new" ? <><input required value={name} onChange={(e) => setName(e.target.value)} placeholder={ar ? "الاسم الكامل" : "Full name"} className="rounded border border-slate-700 bg-slate-950 p-2" /><input required type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder={ar ? "البريد الإلكتروني" : "Email"} className="rounded border border-slate-700 bg-slate-950 p-2" /><input required minLength={8} type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={ar ? "كلمة المرور" : "Password"} className="rounded border border-slate-700 bg-slate-950 p-2" /></> : <select required value={existingUserId} onChange={(e) => setExistingUserId(e.target.value)} className="rounded border border-slate-700 bg-slate-950 p-2 sm:col-span-2 lg:col-span-3"><option value="">{ar ? "اختر حساباً" : "Select an account"}</option>{data?.users.map((u) => <option key={u.id} value={u.id}>{u.full_name} · {u.email}</option>)}</select>}
+          {accountMode === "new" ? <>
+            <label className="grid gap-1 text-sm text-slate-300">
+              <span>{ar ? "الاسم الكامل" : "Full name"}</span>
+              <input required value={name} onChange={(e) => setName(e.target.value)} placeholder={ar ? "مثال: أحمد محمد" : "Example: Ahmed Mohammed"} className="rounded border border-slate-700 bg-slate-950 p-2" />
+            </label>
+            <label className="grid gap-1 text-sm text-slate-300">
+              <span>{ar ? "البريد الإلكتروني" : "Email address"}</span>
+              <input required type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@example.com" className="rounded border border-slate-700 bg-slate-950 p-2" />
+              <span className="text-xs text-slate-500">{ar ? "يجب إدخال بريد كامل، وليس اسم مستخدم مثل admin." : "Enter a complete email address, not a username such as admin."}</span>
+            </label>
+            <label className="grid gap-1 text-sm text-slate-300">
+              <span>{ar ? "كلمة المرور" : "Password"}</span>
+              <input required minLength={8} type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder={ar ? "8 أحرف على الأقل" : "At least 8 characters"} className="rounded border border-slate-700 bg-slate-950 p-2" />
+            </label>
+          </> : <select required value={existingUserId} onChange={(e) => setExistingUserId(e.target.value)} className="rounded border border-slate-700 bg-slate-950 p-2 sm:col-span-2 lg:col-span-3"><option value="">{ar ? "اختر حساباً" : "Select an account"}</option>{data?.users.map((u) => <option key={u.id} value={u.id}>{u.full_name} · {u.email}</option>)}</select>}
           <div className="flex gap-2 sm:col-span-2 lg:col-span-3">
             <select value={tenantToAdd} onChange={(e) => setTenantToAdd(e.target.value)} className="min-w-0 flex-1 rounded border border-slate-700 bg-slate-950 p-2">
               {data?.tenants.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
@@ -132,11 +157,11 @@ export default function PermissionsPage() {
           {assignments.map((assignment, index) => <div key={assignment.tenant_id} className="rounded border border-slate-700 p-3 sm:col-span-2 lg:col-span-3">
             <div className="flex flex-wrap items-center gap-2">
               <span className="me-auto text-sm text-white">{data?.tenants.find((t) => t.id === assignment.tenant_id)?.name}</span>
-              <select value={assignment.role} onChange={(e) => updateAssignment(index, { role: e.target.value })} className="rounded bg-slate-950 p-1 text-sm">{roleOptions.map((r) => <option key={r}>{r}</option>)}</select>
+              <select aria-label={ar ? "صلاحية الحساب" : "Account role"} value={assignment.role} onChange={(e) => updateAssignment(index, { role: e.target.value })} className="rounded bg-slate-950 p-1 text-sm">{roleOptions.map((r) => <option key={r} value={r}>{roleLabel(r, ar)}</option>)}</select>
               <button type="button" onClick={() => setAssignments((old) => old.filter((_, i) => i !== index))} className="text-sm text-rose-300">{ar ? "إزالة" : "Remove"}</button>
             </div>
             <ScopeEditor assignment={assignment} modules={moduleOptions} services={serviceOptions} onChange={(change) => updateAssignment(index, change)} ar={ar} allowUnrestricted={!delegatedManager} />
-            {assignment.role === "customer" && <p className="mt-2 text-xs text-amber-300">{ar ? "حساب عميل: سيقتصر الوصول على بوابة طلبات الخدمة." : "Customer accounts are limited to the service-request portal."}</p>}
+            {assignment.role === "customer" && <p className="mt-2 text-xs text-amber-300">{ar ? "مقدم طلب: سيقتصر الوصول على بوابة طلبات الخدمة." : "Requester accounts are limited to the service-request portal."}</p>}
           </div>)}
           <button disabled={saving || !assignments.length} className="rounded bg-emerald-500 p-2 font-medium text-slate-950 disabled:opacity-60 sm:col-span-2 lg:col-span-3">{saving ? (ar ? "جارٍ الحفظ…" : "Saving…") : (ar ? "إنشاء الحساب" : "Create account")}</button>
         </form>
@@ -147,7 +172,7 @@ export default function PermissionsPage() {
         {data === null ? <p className="text-slate-400">{ar ? "جارٍ التحميل…" : "Loading…"}</p> : visible.length === 0 ? <p className="rounded border border-dashed border-slate-700 p-8 text-center text-slate-400">{ar ? "لا توجد عضويات." : "No memberships found."}</p> :
           <div className="grid gap-3 md:grid-cols-2">{visible.map((m) => <article key={m.id} className="rounded-lg border border-slate-800 bg-slate-900/40 p-4">
              <div className="flex items-start justify-between gap-2"><div><h3 className="font-medium text-white">{m.full_name}</h3><p className="text-sm text-slate-500">{m.email} · {m.tenant_name}</p></div><button disabled={saving || (delegatedManager && ["owner", "admin"].includes(m.role))} onClick={() => void patch(m, { is_active: !m.is_active })} className={m.is_active ? "text-emerald-400 disabled:opacity-50" : "text-slate-500 disabled:opacity-50"}>{m.is_active ? (ar ? "نشط" : "Active") : (ar ? "معطل" : "Inactive")}</button></div>
-             <div className="mt-3 flex flex-wrap gap-2"><select disabled={saving || (delegatedManager && ["owner", "admin"].includes(m.role))} value={m.role} onChange={(e) => void patch(m, { role: e.target.value })} className="rounded bg-slate-950 p-1 text-sm">{(delegatedManager && ["owner", "admin"].includes(m.role) ? [m.role] : roleOptions).map((r) => <option key={r}>{r}</option>)}</select>{m.role === "customer" && <span className="text-xs text-amber-300">{ar ? "عميل — وصول محدود" : "Customer — limited access"}</span>}</div>
+              <div className="mt-3 flex flex-wrap gap-2"><select aria-label={ar ? "صلاحية الحساب" : "Account role"} disabled={saving || (delegatedManager && ["owner", "admin"].includes(m.role))} value={m.role} onChange={(e) => void patch(m, { role: e.target.value })} className="rounded bg-slate-950 p-1 text-sm">{(delegatedManager && ["owner", "admin"].includes(m.role) ? [m.role] : roleOptions).map((r) => <option key={r} value={r}>{roleLabel(r, ar)}</option>)}</select>{m.role === "customer" && <span className="text-xs text-amber-300">{ar ? "مقدم طلب — وصول محدود" : "Requester — limited access"}</span>}</div>
              {delegatedManager && ["owner", "admin"].includes(m.role) ? <p className="mt-3 rounded bg-slate-800 p-2 text-xs text-slate-400">{ar ? "عضوية بصلاحيات أعلى — للعرض فقط." : "Elevated membership — read only."}</p> : <ScopeEditor assignment={{ tenant_id: m.tenant_id, role: m.role, is_active: m.is_active, odoo_module_scope: m.odoo_module_scope, service_scope: m.service_scope }} modules={moduleOptions} services={serviceOptions} ar={ar} allowUnrestricted={!delegatedManager} onChange={(change) => void patch(m, change)} />}
           </article>)}</div>}
       </section>
