@@ -36,6 +36,8 @@ export function communicationActions(message: WorkbenchCommunication) {
   return {
     canEdit: communicationCardIsEditable(message),
     canSubmit: message.status === "draft" && message.can_submit,
+    canApprove: message.status === "awaiting_approval" && message.can_approve,
+    canReject: message.status === "awaiting_approval" && message.can_reject,
     canSend: false as const,
   };
 }

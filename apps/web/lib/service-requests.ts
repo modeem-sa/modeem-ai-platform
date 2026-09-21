@@ -1,5 +1,5 @@
-import { apiDownload, apiFetch } from "./api";
-import { collectAllModulePages } from "./module-pagination";
+import { apiDownload, apiFetch } from "./api.ts";
+import { collectAllModulePages } from "./module-pagination.ts";
 
 export type ServiceRequestPriority = "low" | "medium" | "high" | "urgent";
 export type ServiceRequestStatus =
@@ -243,7 +243,7 @@ export interface WorkbenchCommunicationInvoice {
   [key: string]: unknown;
 }
 
-export type WorkbenchCommunicationStatus = "draft" | "awaiting_approval";
+export type WorkbenchCommunicationStatus = "draft" | "awaiting_approval" | "approved";
 
 export interface WorkbenchCommunication {
   id: string;
@@ -270,6 +270,17 @@ export interface WorkbenchCommunication {
   updated_at: string;
   can_edit: boolean;
   can_submit: boolean;
+  can_approve: boolean;
+  can_reject: boolean;
+  approved_content?: string | null;
+  approved_hash?: string | null;
+  approved_draft_version?: number | null;
+  approved_source_hash?: string | null;
+  approved_source_version?: number | null;
+  approved_partner_id?: number | null;
+  approved_by?: string | null;
+  approved_at?: string | null;
+  rejection_reason?: string | null;
 }
 
 export interface RequestModule {
@@ -532,6 +543,36 @@ export function submitWorkbenchCommunication(
 ): Promise<{ message: WorkbenchCommunication }> {
   return apiFetch<{ message: WorkbenchCommunication }>(
     `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/communications/${encodeURIComponent(messageId)}/submit`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+}
+
+type WorkbenchCommunicationDecisionEvidence = {
+  expected_message_version: number;
+  expected_draft_version: number;
+  expected_draft_hash: string;
+  expected_source_version: number;
+  expected_source_hash: string;
+};
+
+export function approveWorkbenchCommunication(
+  requestId: string,
+  messageId: string,
+  body: WorkbenchCommunicationDecisionEvidence,
+): Promise<{ message: WorkbenchCommunication }> {
+  return apiFetch<{ message: WorkbenchCommunication }>(
+    `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/communications/${encodeURIComponent(messageId)}/approve`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+}
+
+export function rejectWorkbenchCommunication(
+  requestId: string,
+  messageId: string,
+  body: WorkbenchCommunicationDecisionEvidence & { rejection_reason?: string },
+): Promise<{ message: WorkbenchCommunication }> {
+  return apiFetch<{ message: WorkbenchCommunication }>(
+    `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/communications/${encodeURIComponent(messageId)}/reject`,
     { method: "POST", body: JSON.stringify(body) },
   );
 }

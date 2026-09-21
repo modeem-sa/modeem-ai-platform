@@ -48,11 +48,15 @@ from app.operations.workbench_actions import (
     prepare_collection_followup,
 )
 from app.operations.workbench_collection_message import (
+    ApproveWorkbenchCommunicationInput,
     EditWorkbenchCommunicationInput,
     PrepareWorkbenchCommunicationInput,
+    RejectWorkbenchCommunicationInput,
     SubmitWorkbenchCommunicationInput,
+    approve_communication,
     edit_communication,
     prepare_communications,
+    reject_communication,
     submit_communication,
 )
 from app.operations.workbench_tools import (
@@ -671,7 +675,7 @@ def list_workbench_communications(
     actor: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    request, _ = _authorized_request(db, actor, request_id)
+    request, membership = _authorized_request(db, actor, request_id)
     _task, action = _action_for_request(db, request, action_id)
     from app.models import WorkbenchCollectionMessage
 
@@ -687,7 +691,11 @@ def list_workbench_communications(
     )
     from app.operations.workbench_collection_message import _message_out
 
-    return {"messages": [_message_out(message) for message in messages]}
+    return {
+        "messages": [
+            _message_out(message, actor, membership.role) for message in messages
+        ]
+    }
 
 
 @router.post(
@@ -734,6 +742,40 @@ def submit_workbench_communication(
 ) -> dict:
     request, _ = _authorized_request(db, actor, request_id)
     return {"message": submit_communication(db, actor, request, message_id, body)}
+
+
+@router.post(
+    "/{request_id}/agent/communications/{message_id}/approve",
+    dependencies=[Depends(require_csrf)],
+)
+def approve_workbench_communication(
+    request_id: uuid.UUID,
+    message_id: uuid.UUID,
+    body: ApproveWorkbenchCommunicationInput,
+    actor: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    request, _ = _authorized_request(db, actor, request_id)
+    return {
+        "message": approve_communication(db, actor, request, message_id, body)
+    }
+
+
+@router.post(
+    "/{request_id}/agent/communications/{message_id}/reject",
+    dependencies=[Depends(require_csrf)],
+)
+def reject_workbench_communication(
+    request_id: uuid.UUID,
+    message_id: uuid.UUID,
+    body: RejectWorkbenchCommunicationInput,
+    actor: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    request, _ = _authorized_request(db, actor, request_id)
+    return {
+        "message": reject_communication(db, actor, request, message_id, body)
+    }
 
 
 @router.post(

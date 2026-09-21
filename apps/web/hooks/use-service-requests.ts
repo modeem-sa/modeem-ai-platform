@@ -30,6 +30,8 @@ import {
   prepareWorkbenchCommunications,
   updateWorkbenchCommunication,
   submitWorkbenchCommunication,
+  approveWorkbenchCommunication,
+  rejectWorkbenchCommunication,
   prepareWorkbenchAction,
   updateWorkbenchAction,
   submitWorkbenchAction,
@@ -332,6 +334,23 @@ export function useRequestWorkbench(requestId: string | undefined, locale: "ar" 
         expected_draft_hash: message.draft_hash,
         expected_source_version: message.source_version,
         expected_source_hash: message.source_hash,
+      })),
+    approveCommunication: (message: WorkbenchCommunication) =>
+      runCommunication(() => approveWorkbenchCommunication(requestId!, message.id, {
+        expected_message_version: message.version,
+        expected_draft_version: message.draft_version,
+        expected_draft_hash: message.draft_hash,
+        expected_source_version: message.source_version,
+        expected_source_hash: message.source_hash,
+      })),
+    rejectCommunication: (message: WorkbenchCommunication, rejectionReason?: string) =>
+      runCommunication(() => rejectWorkbenchCommunication(requestId!, message.id, {
+        expected_message_version: message.version,
+        expected_draft_version: message.draft_version,
+        expected_draft_hash: message.draft_hash,
+        expected_source_version: message.source_version,
+        expected_source_hash: message.source_hash,
+        ...(rejectionReason?.trim() ? { rejection_reason: rejectionReason.trim() } : {}),
       })),
   };
 }

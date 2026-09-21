@@ -29,6 +29,7 @@ from app.models import (
     OperationActionExecutionItem,
     OperationTask,
     ServiceRequest,
+    TenantMembership,
     User,
     WorkbenchCollectionMessage,
     WorkbenchCollectionMessageEvent,
@@ -75,6 +76,14 @@ class SubmitWorkbenchCommunicationInput(BaseModel):
     expected_source_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
 
+class ApproveWorkbenchCommunicationInput(SubmitWorkbenchCommunicationInput):
+    pass
+
+
+class RejectWorkbenchCommunicationInput(SubmitWorkbenchCommunicationInput):
+    rejection_reason: str | None = Field(default=None, max_length=500)
+
+
 def canonical_grouped_source_identity(
     *,
     tenant_id: uuid.UUID,
@@ -106,7 +115,11 @@ def canonical_grouped_source_identity(
     return sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _message_out(message: WorkbenchCollectionMessage) -> dict[str, Any]:
+def _message_out(
+    message: WorkbenchCollectionMessage,
+    actor: User | None = None,
+    actor_role: str | None = None,
+) -> dict[str, Any]:
     evidence = json.loads(message.source_evidence_json)
     records = evidence.get("records", [])
     return {
@@ -119,8 +132,15 @@ def _message_out(message: WorkbenchCollectionMessage) -> dict[str, Any]:
         "company_id": message.company_id,
         "invoice_ids": json.loads(message.invoice_ids_json),
         "status": message.status,
-        "policy_state": "awaiting_approval" if message.status == "awaiting_approval" else "allowed",
+        "policy_state": (
+            "awaiting_approval"
+            if message.status == "awaiting_approval"
+            else "approved"
+            if message.status == "approved"
+            else "allowed"
+        ),
         "prepared_by": str(message.created_by_user_id),
+        "draft_author_user_id": str(message.draft_author_user_id),
         "prepared_at": message.created_at,
         "source": "Verified Phase 4B Odoo execution",
         "version": message.version,
@@ -134,7 +154,44 @@ def _message_out(message: WorkbenchCollectionMessage) -> dict[str, Any]:
         "updated_at": message.updated_at,
         "can_edit": message.status == "draft",
         "can_submit": message.status == "draft",
+        "approved_content": message.approved_content,
+        "approved_hash": message.approved_hash,
+        "approved_draft_version": message.approved_draft_version,
+        "approved_source_hash": message.approved_source_hash,
+        "approved_source_version": message.approved_source_version,
+        "approved_partner_id": message.approved_partner_id,
+        "approved_by_user_id": (
+            str(message.approved_by_user_id) if message.approved_by_user_id else None
+        ),
+        "approved_at": message.approved_at,
+        "rejected_by_user_id": (
+            str(message.rejected_by_user_id) if message.rejected_by_user_id else None
+        ),
+        "rejected_at": message.rejected_at,
+        "rejection_reason": message.rejection_reason,
+        "can_approve": bool(
+            actor is not None
+            and actor_role in {"owner", "admin", "manager"}
+            and message.status == "awaiting_approval"
+            and actor.id != message.created_by_user_id
+            and actor.id != message.submitted_by_user_id
+            and actor.id != message.draft_author_user_id
+        ),
+        "can_reject": bool(
+            actor is not None
+            and actor_role in {"owner", "admin", "manager"}
+            and message.status == "awaiting_approval"
+        ),
     }
+
+
+def _actor_role(db: Session, actor: User, tenant_id: uuid.UUID) -> str | None:
+    membership = (
+        db.query(TenantMembership)
+        .filter_by(tenant_id=tenant_id, user_id=actor.id, is_active=True)
+        .one_or_none()
+    )
+    return membership.role if membership else None
 
 
 def _messages(db: Session, request: ServiceRequest, action: OperationAction) -> list[WorkbenchCollectionMessage]:
@@ -332,12 +389,16 @@ def _record_event(db: Session, message: WorkbenchCollectionMessage, event: str, 
             version=message.version,
             content_hash=message.draft_hash,
             source_hash=message.source_hash,
-            detail=detail,
+            detail=detail[:64] if detail else None,
         )
     )
     record_audit(
         db,
-        action=f"workbench_collection_message.{event}",
+        action=(
+            f"workbench_collection_message_{event}"
+            if event in {"approved", "rejected"}
+            else f"workbench_collection_message.{event}"
+        ),
         actor_type="user",
         actor_id=str(actor.id),
         tenant_id=message.tenant_id,
@@ -444,13 +505,15 @@ def prepare_communications(
             source_hash=source_hash,
             idempotency_marker=sha256(f"{action.id}:{partner_id}:phase4c".encode()).hexdigest(),
             created_by_user_id=actor.id,
+            draft_author_user_id=actor.id,
         )
         db.add(message)
         db.flush()
         _record_event(db, message, "generated", actor)
         _record_event(db, message, "policy_checked", actor, "allowed")
     db.commit()
-    return [_message_out(message) for message in _messages(db, request, action)]
+    role = _actor_role(db, actor, request.tenant_id)
+    return [_message_out(message, actor, role) for message in _messages(db, request, action)]
 
 
 def edit_communication(
@@ -477,10 +540,11 @@ def edit_communication(
     message.draft_content = content
     message.draft_hash = digest
     message.draft_version += 1
+    message.draft_author_user_id = actor.id
     message.version += 1
     _record_event(db, message, "regenerated", actor)
     db.commit()
-    return _message_out(message)
+    return _message_out(message, actor, _actor_role(db, actor, request.tenant_id))
 
 
 def submit_communication(
@@ -550,4 +614,224 @@ def submit_communication(
     message.version += 1
     _record_event(db, message, "submitted", actor)
     db.commit()
-    return _message_out(message)
+    return _message_out(message, actor, _actor_role(db, actor, request.tenant_id))
+
+
+def _approval_action(
+    db: Session, request: ServiceRequest, message: WorkbenchCollectionMessage
+) -> OperationAction:
+    action = (
+        db.query(OperationAction)
+        .join(OperationTask, OperationTask.id == OperationAction.task_id)
+        .filter(
+            OperationAction.id == message.action_id,
+            OperationAction.tenant_id == request.tenant_id,
+            OperationTask.tenant_id == request.tenant_id,
+            OperationTask.source_reference == str(request.id),
+            OperationTask.source_type == "agent_workbench",
+            OperationTask.source_signal == COLLECTION_FOLLOWUP_KEY,
+            OperationTask.source_reference == str(message.service_request_id),
+        )
+        .one_or_none()
+    )
+    if action is None:
+        raise HTTPException(status_code=404, detail="Communication source not found")
+    return action
+
+
+def _revalidate_approval_source(
+    db: Session,
+    actor: User,
+    request: ServiceRequest,
+    message: WorkbenchCollectionMessage,
+    action: OperationAction,
+) -> None:
+    _task, proposal, connection, items = _load_evidence(db, request, action)
+    try:
+        invoice_ids = json.loads(message.invoice_ids_json)
+        evidence_payload = json.loads(message.source_evidence_json)
+        records = evidence_payload["records"]
+        stored_evidence = evidence_payload["evidence"]
+        partners = _read_partner_ids(
+            connection,
+            [int(invoice_id) for invoice_id in invoice_ids],
+            as_of_date=datetime.now(UTC).date(),
+        )
+    except CollectionMessagePolicyError as exc:
+        raise _policy_blocked(db, message, actor, exc.code or "policy_unavailable")
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=409, detail="Communication source evidence is invalid") from exc
+
+    target_invoice_ids = [int(invoice_id) for invoice_id in invoice_ids]
+    if (
+        len(target_invoice_ids) != len(set(target_invoice_ids))
+        or {int(record["invoice_id"]) for record in records} != set(target_invoice_ids)
+        or {int(snapshot["partner_id"]) for snapshot in partners.values()} != {message.partner_id}
+    ):
+        raise HTTPException(status_code=409, detail="source_changed_requires_review")
+    target_items = [item for item in items if item.invoice_id in set(target_invoice_ids)]
+    if len(target_items) != len(target_invoice_ids):
+        raise HTTPException(status_code=409, detail="source_changed_requires_review")
+    target_item_by_invoice = {item.invoice_id: item for item in target_items}
+    if (
+        len(target_item_by_invoice) != len(target_invoice_ids)
+        or set(target_item_by_invoice) != set(target_invoice_ids)
+        or not all(
+            item.status == "succeeded"
+            and item.external_activity_id is not None
+            and item.verified_at is not None
+            for item in target_items
+        )
+    ):
+        raise HTTPException(status_code=409, detail="source_changed_requires_review")
+    current_evidence = [
+        {
+            "item_id": str(target_item_by_invoice[int(invoice_id)].id),
+            "invoice_id": int(invoice_id),
+            "external_activity_id": target_item_by_invoice[int(invoice_id)].external_activity_id,
+            "verified_at": target_item_by_invoice[int(invoice_id)].verified_at.isoformat(),
+        }
+        for invoice_id in sorted(target_invoice_ids)
+    ]
+    normalized_stored_evidence = sorted(
+        stored_evidence,
+        key=lambda item: (int(item["invoice_id"]), str(item["item_id"])),
+    )
+    if normalized_stored_evidence != current_evidence:
+        raise HTTPException(status_code=409, detail="source_changed_requires_review")
+    current_records = []
+    for record in records:
+        invoice_id = int(record["invoice_id"])
+        live = partners.get(invoice_id)
+        if live is None or not _same_live_record(
+            record, live, proposal.company_id, proposal.source_as_of
+        ):
+            raise HTTPException(status_code=409, detail="source_changed_requires_review")
+        current_records.append({**record, "live_snapshot": live})
+    current_hash = canonical_grouped_source_identity(
+        tenant_id=request.tenant_id,
+        service_request_id=request.id,
+        action_id=message.action_id,
+        approved_proposal_hash=action.approved_hash or "",
+        connection_id=connection.id,
+        company_id=proposal.company_id,
+        partner_id=message.partner_id,
+        invoice_records=current_records,
+        execution_evidence=current_evidence,
+        source_version=message.source_version,
+    )
+    if current_hash != message.source_hash:
+        raise HTTPException(status_code=409, detail="source_changed_requires_review")
+
+
+def approve_communication(
+    db: Session,
+    actor: User,
+    request: ServiceRequest,
+    message_id: uuid.UUID,
+    body: ApproveWorkbenchCommunicationInput,
+) -> dict[str, Any]:
+    message = (
+        db.query(WorkbenchCollectionMessage)
+        .filter_by(
+            id=message_id,
+            tenant_id=request.tenant_id,
+            service_request_id=request.id,
+        )
+        .with_for_update()
+        .one_or_none()
+    )
+    if message is None:
+        raise HTTPException(status_code=404, detail="Communication draft not found")
+    role = _actor_role(db, actor, request.tenant_id)
+    if role not in {"owner", "admin", "manager"}:
+        raise HTTPException(status_code=403, detail="Communication approval requires an internal manager")
+    if actor.id in {
+        message.created_by_user_id,
+        message.submitted_by_user_id,
+        message.draft_author_user_id,
+    }:
+        raise HTTPException(status_code=403, detail="The preparer cannot approve the same communication")
+    if (
+        message.status != "awaiting_approval"
+        or message.version != body.expected_message_version
+        or message.draft_version != body.expected_draft_version
+        or message.draft_hash != body.expected_draft_hash
+        or message.source_version != body.expected_source_version
+        or message.source_hash != body.expected_source_hash
+    ):
+        raise HTTPException(status_code=409, detail="Communication approval evidence is stale")
+
+    action = _approval_action(db, request, message)
+    _revalidate_approval_source(db, actor, request, message, action)
+    content, digest = canonical_collection_message(message.draft_content, message.draft_version)
+    if content != message.draft_content or digest != message.draft_hash:
+        raise HTTPException(status_code=409, detail="Communication draft hash is invalid")
+
+    message.approved_content = content
+    message.approved_hash = digest
+    message.approved_draft_version = message.draft_version
+    message.approved_source_hash = message.source_hash
+    message.approved_source_version = message.source_version
+    message.approved_partner_id = message.partner_id
+    message.approved_by_user_id = actor.id
+    message.approved_at = datetime.now(UTC)
+    message.rejected_by_user_id = None
+    message.rejected_at = None
+    message.rejection_reason = None
+    message.status = "approved"
+    message.version += 1
+    _record_event(db, message, "approved", actor)
+    db.commit()
+    return _message_out(message, actor, role)
+
+
+def reject_communication(
+    db: Session,
+    actor: User,
+    request: ServiceRequest,
+    message_id: uuid.UUID,
+    body: RejectWorkbenchCommunicationInput,
+) -> dict[str, Any]:
+    message = (
+        db.query(WorkbenchCollectionMessage)
+        .filter_by(
+            id=message_id,
+            tenant_id=request.tenant_id,
+            service_request_id=request.id,
+        )
+        .with_for_update()
+        .one_or_none()
+    )
+    if message is None:
+        raise HTTPException(status_code=404, detail="Communication draft not found")
+    role = _actor_role(db, actor, request.tenant_id)
+    if role not in {"owner", "admin", "manager"}:
+        raise HTTPException(status_code=403, detail="Communication rejection requires an internal manager")
+    if (
+        message.status != "awaiting_approval"
+        or message.version != body.expected_message_version
+        or message.draft_version != body.expected_draft_version
+        or message.draft_hash != body.expected_draft_hash
+        or message.source_version != body.expected_source_version
+        or message.source_hash != body.expected_source_hash
+    ):
+        raise HTTPException(status_code=409, detail="Communication rejection evidence is stale")
+    message.status = "draft"
+    message.version += 1
+    message.submitted_by_user_id = None
+    message.submitted_at = None
+    message.approved_content = None
+    message.approved_hash = None
+    message.approved_draft_version = None
+    message.approved_source_hash = None
+    message.approved_source_version = None
+    message.approved_partner_id = None
+    message.approved_by_user_id = None
+    message.approved_at = None
+    message.rejected_by_user_id = actor.id
+    message.rejected_at = datetime.now(UTC)
+    message.rejection_reason = body.rejection_reason
+    _record_event(db, message, "rejected", actor, body.rejection_reason)
+    db.commit()
+    return _message_out(message, actor, role)

@@ -553,7 +553,7 @@ class WorkbenchCollectionMessage(Base):
         UniqueConstraint("action_id", "partner_id", name="uq_workbench_collection_message_partner"),
         UniqueConstraint("idempotency_marker", name="uq_workbench_collection_message_marker"),
         CheckConstraint(
-            "status IN ('draft', 'awaiting_approval')",
+            "status IN ('draft', 'awaiting_approval', 'approved')",
             name="ck_workbench_collection_message_status",
         ),
         CheckConstraint("draft_version >= 1 AND source_version >= 1 AND version >= 1",
@@ -569,6 +569,36 @@ class WorkbenchCollectionMessage(Base):
         CheckConstraint(
             "length(draft_hash) = 64 AND length(source_hash) = 64",
             name="ck_workbench_collection_message_hash_lengths",
+        ),
+        CheckConstraint(
+            "(status = 'approved' AND approved_content IS NOT NULL "
+            "AND approved_hash IS NOT NULL AND approved_draft_version IS NOT NULL "
+            "AND approved_source_hash IS NOT NULL AND approved_source_version IS NOT NULL "
+            "AND approved_partner_id IS NOT NULL AND approved_by_user_id IS NOT NULL "
+            "AND approved_at IS NOT NULL) OR "
+            "(status <> 'approved' AND approved_content IS NULL AND approved_hash IS NULL "
+            "AND approved_draft_version IS NULL AND approved_source_hash IS NULL "
+            "AND approved_source_version IS NULL AND approved_partner_id IS NULL "
+            "AND approved_by_user_id IS NULL AND approved_at IS NULL)",
+            name="ck_workbench_collection_message_approval_complete",
+        ),
+        CheckConstraint(
+            "(rejected_by_user_id IS NULL AND rejected_at IS NULL) OR "
+            "(rejected_by_user_id IS NOT NULL AND rejected_at IS NOT NULL)",
+            name="ck_workbench_collection_message_rejection",
+        ),
+        CheckConstraint(
+            "(approved_hash IS NULL OR length(approved_hash) = 64) AND "
+            "(approved_source_hash IS NULL OR length(approved_source_hash) = 64) AND "
+            "(approved_content IS NULL OR length(approved_content) BETWEEN 1 AND 1000) AND "
+            "(approved_draft_version IS NULL OR approved_draft_version >= 1) AND "
+            "(approved_source_version IS NULL OR approved_source_version >= 1) AND "
+            "(approved_partner_id IS NULL OR approved_partner_id > 0)",
+            name="ck_workbench_collection_message_approval_values",
+        ),
+        CheckConstraint(
+            "draft_author_user_id IS NOT NULL",
+            name="ck_workbench_collection_message_draft_author",
         ),
         Index("ix_workbench_collection_message_tenant_status", "tenant_id", "status"),
     )
@@ -602,10 +632,28 @@ class WorkbenchCollectionMessage(Base):
     created_by_user_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )
+    draft_author_user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
     submitted_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid, ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
     )
     submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    approved_content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    approved_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    approved_draft_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    approved_source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    approved_source_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    approved_partner_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="RESTRICT"), nullable=True
+    )
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejection_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=_utcnow
     )
@@ -621,7 +669,7 @@ class WorkbenchCollectionMessageEvent(Base):
     __table_args__ = (
         CheckConstraint(
             "event IN ('generated', 'regenerated', 'policy_checked', "
-            "'policy_blocked', 'submitted')",
+            "'policy_blocked', 'submitted', 'approved', 'rejected')",
             name="ck_workbench_collection_message_event",
         ),
         CheckConstraint("length(content_hash) = 64",
@@ -656,9 +704,45 @@ class WorkbenchCollectionMessageEvent(Base):
     )
 
 
+_WORKBENCH_APPROVAL_FIELDS = (
+    "approved_content",
+    "approved_hash",
+    "approved_draft_version",
+    "approved_source_hash",
+    "approved_source_version",
+    "approved_partner_id",
+    "approved_by_user_id",
+    "approved_at",
+)
+
+
+def _validate_workbench_approval_state(target) -> None:
+    values = [getattr(target, name) for name in _WORKBENCH_APPROVAL_FIELDS]
+    if target.status == "approved":
+        if any(value is None for value in values):
+            raise ValueError("Approved Workbench collection message requires complete evidence")
+        if (
+            len(target.approved_hash) != 64
+            or len(target.approved_source_hash) != 64
+            or target.approved_draft_version < 1
+            or target.approved_source_version < 1
+            or target.approved_partner_id <= 0
+            or not 1 <= len(target.approved_content) <= 1000
+        ):
+            raise ValueError("Approved Workbench collection message evidence is invalid")
+    elif any(value is not None for value in values):
+        raise ValueError("Non-approved Workbench collection message cannot retain approval evidence")
+
+
+@event.listens_for(WorkbenchCollectionMessage, "before_insert")
+def _workbench_message_approval_state_on_insert(_mapper, _connection, target) -> None:
+    _validate_workbench_approval_state(target)
+
+
 @event.listens_for(WorkbenchCollectionMessage, "before_update")
 def _workbench_message_identity_cannot_change(_mapper, _connection, target) -> None:
     state = inspect(target)
+    _validate_workbench_approval_state(target)
     immutable = (
         "tenant_id", "service_request_id", "action_id", "connection_id", "company_id",
         "partner_id", "invoice_ids_json", "source_evidence_json", "source_hash",
@@ -666,6 +750,39 @@ def _workbench_message_identity_cannot_change(_mapper, _connection, target) -> N
     )
     if any(state.attrs[name].history.has_changes() for name in immutable):
         raise ValueError("Workbench collection message source identity is immutable")
+    status_history = state.attrs.status.history
+    entering_approval = (
+        target.status == "approved"
+        and "approved" in status_history.added
+        and "approved" not in status_history.deleted
+    )
+    persisted_approved = (
+        "approved" in status_history.deleted
+        or (
+            target.approved_at is not None
+            and not entering_approval
+        )
+        or (target.status == "approved" and not entering_approval)
+    )
+    if persisted_approved:
+        immutable_after_approval = (
+            "status", "draft_content", "draft_hash", "draft_version", "version",
+            "approved_content", "approved_hash", "approved_draft_version",
+            "approved_source_hash", "approved_source_version", "approved_partner_id",
+            "approved_by_user_id", "approved_at", "rejected_by_user_id",
+            "rejected_at", "rejection_reason", "draft_author_user_id",
+        )
+        if any(state.attrs[name].history.has_changes() for name in immutable_after_approval):
+            raise ValueError("Approved Workbench collection message is immutable")
+    elif entering_approval:
+        immutable_on_entry = (
+            "draft_content", "draft_hash", "draft_version", "source_hash",
+            "source_version", "source_evidence_json", "invoice_ids_json",
+            "partner_id", "company_id", "connection_id", "created_by_user_id",
+            "draft_author_user_id",
+        )
+        if any(state.attrs[name].history.has_changes() for name in immutable_on_entry):
+            raise ValueError("Approved Workbench collection message identity is immutable")
 
 
 @event.listens_for(WorkbenchCollectionMessageEvent, "before_update")
