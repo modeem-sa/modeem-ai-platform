@@ -2,7 +2,7 @@
 
 import json
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from typing import Literal
@@ -27,6 +27,7 @@ from app.models import (
     AgentToolCall,
     Connection,
     OperationAction,
+    OperationActionExecutionItem,
     OperationTask,
     ServiceRequest,
     TenantMembership,
@@ -45,6 +46,14 @@ from app.operations.workbench_actions import (
     _history,
     canonical_collection_proposal,
     prepare_collection_followup,
+)
+from app.operations.workbench_collection_message import (
+    EditWorkbenchCommunicationInput,
+    PrepareWorkbenchCommunicationInput,
+    SubmitWorkbenchCommunicationInput,
+    edit_communication,
+    prepare_communications,
+    submit_communication,
 )
 from app.operations.workbench_tools import (
     FINANCE_TOOLS,
@@ -176,7 +185,7 @@ def _session_out(
         )
         actor_role = membership.role if membership else None
     actions = [
-        _action_out(task, action, actor, actor_role)
+        _action_out(task, action, actor, actor_role, db)
         for task, action in (
             db.query(OperationTask, OperationAction)
             .join(OperationAction, OperationAction.task_id == OperationTask.id)
@@ -637,7 +646,7 @@ def list_agent_actions(
     request, membership = _authorized_request(db, actor, request_id)
     return {
         "actions": [
-            _action_out(task, action, actor, membership.role)
+            _action_out(task, action, actor, membership.role, db)
             for task, action in (
                 db.query(OperationTask, OperationAction)
                 .join(OperationAction, OperationAction.task_id == OperationTask.id)
@@ -653,6 +662,78 @@ def list_agent_actions(
             )
         ]
     }
+
+
+@router.get("/{request_id}/agent/actions/{action_id}/communications")
+def list_workbench_communications(
+    request_id: uuid.UUID,
+    action_id: uuid.UUID,
+    actor: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    request, _ = _authorized_request(db, actor, request_id)
+    _task, action = _action_for_request(db, request, action_id)
+    from app.models import WorkbenchCollectionMessage
+
+    messages = (
+        db.query(WorkbenchCollectionMessage)
+        .filter_by(
+            tenant_id=request.tenant_id,
+            service_request_id=request.id,
+            action_id=action.id,
+        )
+        .order_by(WorkbenchCollectionMessage.partner_id, WorkbenchCollectionMessage.id)
+        .all()
+    )
+    from app.operations.workbench_collection_message import _message_out
+
+    return {"messages": [_message_out(message) for message in messages]}
+
+
+@router.post(
+    "/{request_id}/agent/actions/{action_id}/communications/prepare",
+    dependencies=[Depends(require_csrf)],
+)
+def prepare_workbench_communications(
+    request_id: uuid.UUID,
+    action_id: uuid.UUID,
+    body: PrepareWorkbenchCommunicationInput,
+    actor: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    request, _ = _authorized_request(db, actor, request_id)
+    _task, action = _action_for_request(db, request, action_id)
+    return {"messages": prepare_communications(db, actor, request, action, body)}
+
+
+@router.patch(
+    "/{request_id}/agent/communications/{message_id}",
+    dependencies=[Depends(require_csrf)],
+)
+def edit_workbench_communication(
+    request_id: uuid.UUID,
+    message_id: uuid.UUID,
+    body: EditWorkbenchCommunicationInput,
+    actor: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    request, _ = _authorized_request(db, actor, request_id)
+    return {"message": edit_communication(db, actor, request, message_id, body)}
+
+
+@router.post(
+    "/{request_id}/agent/communications/{message_id}/submit",
+    dependencies=[Depends(require_csrf)],
+)
+def submit_workbench_communication(
+    request_id: uuid.UUID,
+    message_id: uuid.UUID,
+    body: SubmitWorkbenchCommunicationInput,
+    actor: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    request, _ = _authorized_request(db, actor, request_id)
+    return {"message": submit_communication(db, actor, request, message_id, body)}
 
 
 @router.post(
@@ -718,7 +799,7 @@ def update_agent_action(
     _history(db, action, actor, "regenerated", "editable_fields_updated")
     _audit(db, "agent_action_updated", actor, request, str(action.id), {"changed": "editable_fields"})
     db.commit()
-    return {"action": _action_out(task, action, actor, "member")}
+    return {"action": _action_out(task, action, actor, "member", db)}
 
 
 @router.post(
@@ -748,7 +829,7 @@ def submit_agent_action(
     _history(db, action, actor, "submitted")
     _audit(db, "agent_action_submitted_for_approval", actor, request, str(action.id))
     db.commit()
-    return {"action": _action_out(task, action, actor, "member")}
+    return {"action": _action_out(task, action, actor, "member", db)}
 
 
 @router.post(
@@ -789,8 +870,12 @@ def approve_agent_action(
     task.decision_note = None
     _history(db, action, actor, "approved")
     _audit(db, "agent_action_approved", actor, request, str(action.id), {"approval_policy": APPROVAL_POLICY})
-    db.commit()
-    return {"action": _action_out(task, action, actor, membership.role)}
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Action changed concurrently") from exc
+    return {"action": _action_out(task, action, actor, membership.role, db)}
 
 
 @router.post(
@@ -825,7 +910,170 @@ def reject_agent_action(
     _history(db, action, actor, "rejected", "manager_rejected")
     _audit(db, "agent_action_rejected", actor, request, str(action.id))
     db.commit()
-    return {"action": _action_out(task, action, actor, membership.role)}
+    return {"action": _action_out(task, action, actor, membership.role, db)}
+
+
+@router.post(
+    "/{request_id}/agent/actions/{action_id}/queue",
+    dependencies=[Depends(require_csrf)],
+)
+def queue_agent_action(
+    request_id: uuid.UUID,
+    action_id: uuid.UUID,
+    body: TransitionActionInput,
+    actor: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    request, membership = _authorized_request(db, actor, request_id)
+    task, action = _action_for_request(db, request, action_id)
+    if membership.role not in {"owner", "admin", "manager"}:
+        raise HTTPException(status_code=403, detail="Manager queueing is required")
+    if (
+        action.status != "approved"
+        or action.version != body.expected_action_version
+        or action.proposal_hash != body.expected_proposal_hash
+        or action.approved_by_user_id is None
+        or action.approved_at is None
+        or action.workflow_key != COLLECTION_FOLLOWUP_KEY
+        or action.workflow_config_version != 1
+    ):
+        raise HTTPException(status_code=409, detail="Action is not approved")
+    proposal = CollectionProposal.model_validate(json.loads(action.proposal_json), strict=False)
+    payload, digest = canonical_collection_proposal(proposal)
+    if (
+        payload != action.proposal_json
+        or digest != action.proposal_hash
+        or action.approved_hash != digest
+        or proposal.service_request_id != request.id
+        or proposal.tenant_id != request.tenant_id
+        or proposal.connection_id != task.source_connection_id
+        or proposal.company_id <= 0
+        or task.source_type != "agent_workbench"
+        or task.source_signal != COLLECTION_FOLLOWUP_KEY
+        or task.source_reference != str(request.id)
+    ):
+        raise HTTPException(status_code=409, detail="Approved action identity is invalid")
+    connection = (
+        db.query(Connection)
+        .filter(
+            Connection.id == proposal.connection_id,
+            Connection.tenant_id == request.tenant_id,
+            Connection.provider == "odoo",
+            Connection.is_active.is_(True),
+            Connection.status == "configured",
+            Connection.last_test_status == "success",
+            Connection.selected_transport.in_(("xmlrpc", "json2")),
+            Connection.encrypted_credentials.is_not(None),
+            Connection.encryption_version.is_not(None),
+            Connection.odoo_company_id == proposal.company_id,
+        )
+        .one_or_none()
+    )
+    if connection is None:
+        raise HTTPException(status_code=409, detail="Approved action connection is unavailable")
+    existing = db.query(OperationActionExecutionItem).filter_by(action_id=action.id).count()
+    if existing:
+        raise HTTPException(status_code=409, detail="Action has already been queued")
+    for target in proposal.target_records:
+        marker = sha256(
+            f"{action.id}:{target['invoice_id']}:internal_invoice_activity_v1".encode()
+        ).hexdigest()
+        db.add(OperationActionExecutionItem(
+            action_id=action.id,
+            task_id=task.id,
+            tenant_id=request.tenant_id,
+            invoice_id=target["invoice_id"],
+            idempotency_marker=marker,
+        ))
+    action.execution_deadline = (
+        datetime.now(UTC).date() + timedelta(days=7)
+    ).isoformat()
+    action.execution_policy_id = "internal_invoice_activity_v1"
+    action.status = "queued"
+    action.version += 1
+    _history(db, action, actor, "queued", "internal_invoice_activity_v1")
+    _audit(
+        db, "agent_action_queued", actor, request, str(action.id),
+        {"policy_id": action.execution_policy_id},
+    )
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Action has already been queued") from exc
+    return {"action": _action_out(task, action, actor, membership.role, db)}
+
+
+@router.post(
+    "/{request_id}/agent/actions/{action_id}/retry",
+    dependencies=[Depends(require_csrf)],
+)
+def retry_agent_action(
+    request_id: uuid.UUID,
+    action_id: uuid.UUID,
+    body: TransitionActionInput,
+    actor: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    request, membership = _authorized_request(db, actor, request_id)
+    task, action = _action_for_request(db, request, action_id)
+    if membership.role not in {"owner", "admin", "manager"}:
+        raise HTTPException(status_code=403, detail="Manager retry is required")
+    proposal = CollectionProposal.model_validate(json.loads(action.proposal_json), strict=False)
+    _, digest = canonical_collection_proposal(proposal)
+    if (
+        action.status != "failed" or action.version != body.expected_action_version
+        or action.proposal_hash != body.expected_proposal_hash
+        or digest != action.proposal_hash or action.approved_hash != digest
+        or action.approved_by_user_id is None or action.approved_at is None
+        or action.workflow_key != COLLECTION_FOLLOWUP_KEY
+        or action.workflow_config_version != 1
+        or proposal.tenant_id != request.tenant_id
+        or proposal.service_request_id != request.id
+        or proposal.connection_id != task.source_connection_id
+        or task.source_type != "agent_workbench"
+        or task.source_signal != COLLECTION_FOLLOWUP_KEY
+        or task.source_reference != str(request.id)
+        or action.execution_policy_id != "internal_invoice_activity_v1"
+        or action.execution_deadline is None
+    ):
+        raise HTTPException(status_code=409, detail="Action is not retryable")
+    connection = (
+        db.query(Connection)
+        .filter(
+            Connection.id == proposal.connection_id,
+            Connection.tenant_id == request.tenant_id,
+            Connection.provider == "odoo",
+            Connection.is_active.is_(True),
+            Connection.status == "configured",
+            Connection.last_test_status == "success",
+            Connection.selected_transport.in_(("xmlrpc", "json2")),
+            Connection.encrypted_credentials.is_not(None),
+            Connection.encryption_version.is_not(None),
+            Connection.odoo_company_id == proposal.company_id,
+        )
+        .one_or_none()
+    )
+    if connection is None:
+        raise HTTPException(status_code=409, detail="Action connection is unavailable")
+    items = db.query(OperationActionExecutionItem).filter_by(action_id=action.id).all()
+    if not items or any(item.attempt_count >= 3 and item.status != "succeeded" for item in items):
+        raise HTTPException(status_code=409, detail="Retry limit reached")
+    for item in items:
+        if item.status != "succeeded":
+            item.status = "pending"
+            item.error = None
+    action.status = "queued"
+    action.error = None
+    action.version += 1
+    _history(db, action, actor, "retry_queued", "internal_invoice_activity_v1")
+    _audit(db, "agent_action_retry_queued", actor, request, str(action.id))
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Action changed concurrently") from exc
+    return {"action": _action_out(task, action, actor, membership.role, db)}
 
 
 @router.post(

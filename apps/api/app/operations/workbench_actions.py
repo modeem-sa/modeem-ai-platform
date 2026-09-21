@@ -17,6 +17,7 @@ from app.models import (
     AgentToolCall,
     Connection,
     OperationAction,
+    OperationActionExecutionItem,
     OperationActionHistory,
     OperationTask,
     ServiceRequest,
@@ -158,9 +159,26 @@ def _action_query(db: Session, request: ServiceRequest) -> list[tuple[OperationT
 
 
 def _action_out(
-    task: OperationTask, action: OperationAction, actor: User | None = None, actor_role: str | None = None
+    task: OperationTask, action: OperationAction, actor: User | None = None,
+    actor_role: str | None = None, db: Session | None = None
 ) -> dict[str, Any]:
     proposal = json.loads(action.proposal_json)
+    items = (
+        db.query(OperationActionExecutionItem)
+        .filter_by(action_id=action.id, tenant_id=action.tenant_id)
+        .order_by(OperationActionExecutionItem.invoice_id)
+        .all()
+        if db is not None else []
+    )
+    verified_count = sum(
+        item.status == "succeeded" and item.external_activity_id is not None
+        for item in items
+    )
+    retryable = (
+        action.status == "failed" and bool(items)
+        and any(item.status != "succeeded" and item.attempt_count < 3 for item in items)
+        and action.error not in {"stale_requires_reapproval", "proposal_validation_failed"}
+    )
     return {
         "id": str(action.id),
         "task_id": str(task.id),
@@ -179,7 +197,7 @@ def _action_out(
         "updated_at": action.updated_at,
         "version": action.version,
         "rejection_reason": task.decision_note if action.status == "proposed" else None,
-        "not_executed": True,
+        "not_executed": action.status != "succeeded",
         "can_edit": bool(actor and action.status == "proposed" and task.created_by_user_id == actor.id),
         "can_submit": bool(actor and action.status == "proposed" and task.created_by_user_id == actor.id),
         "can_approve": bool(actor and action.status == "awaiting_approval"
@@ -188,6 +206,29 @@ def _action_out(
         "can_reject": bool(actor and action.status == "awaiting_approval"
                            and actor.id != task.created_by_user_id
                            and _is_manager_role(actor_role)),
+        "execution_items": [
+            {
+                "id": str(item.id), "invoice_id": item.invoice_id,
+                "idempotency_marker": item.idempotency_marker,
+                "status": item.status, "attempt_count": item.attempt_count,
+                "external_activity_id": item.external_activity_id, "error": item.error,
+                "receipt": json.loads(item.receipt_json) if item.receipt_json else None,
+                "started_at": item.started_at, "finished_at": item.finished_at,
+                "verified_at": item.verified_at,
+            } for item in items
+        ],
+        "execution_item_count": len(items),
+        "target_count": len(proposal.get("target_records", [])),
+        "verified_count": verified_count,
+        "last_execution_at": max(
+            (item.finished_at for item in items if item.finished_at), default=None
+        ),
+        "can_queue_execution": bool(
+            actor and action.status == "approved" and _is_manager_role(actor_role)
+        ),
+        "can_retry_execution": bool(
+            actor and retryable and _is_manager_role(actor_role)
+        ),
     }
 
 
@@ -356,6 +397,8 @@ def prepare_collection_followup(
                 "customer_id": row["customer_id"],
                 "customer": row["customer"],
                 "invoice_number": row["invoice_number"],
+                "reference": row["invoice_number"],
+                "due_date": row["due_date"],
                 "currency_id": row["currency_id"],
                 "currency": row["currency"],
                 "remaining_amount": row["remaining_amount"],
@@ -409,4 +452,4 @@ def prepare_collection_followup(
     _history(db, action, actor, "generated")
     _audit(db, "agent_action_prepared", actor, request, str(action.id), {"action_key": COLLECTION_FOLLOWUP_KEY, "source_snapshot_hash": snapshot_hash})
     db.commit()
-    return _action_out(task, action, actor, "member")
+    return _action_out(task, action, actor, "member", db)

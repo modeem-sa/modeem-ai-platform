@@ -192,7 +192,7 @@ export interface WorkbenchAction {
   task_id: string;
   service_request_id: string;
   action_key: "finance.prepare_collection_followup";
-  status: "proposed" | "awaiting_approval" | "approved";
+  status: "proposed" | "awaiting_approval" | "approved" | "queued" | "executing" | "verifying" | "succeeded" | "failed";
   approval_policy: "internal_manager";
   proposal: WorkbenchProposal;
   proposal_hash: string;
@@ -210,6 +210,66 @@ export interface WorkbenchAction {
   can_submit: boolean;
   can_approve: boolean;
   can_reject: boolean;
+  can_queue_execution?: boolean;
+  can_retry_execution?: boolean;
+  execution_items?: WorkbenchExecutionItem[];
+  target_count?: number;
+  verified_count?: number;
+  last_execution_at?: string | null;
+}
+
+export interface WorkbenchExecutionItem {
+  id?: string;
+  invoice?: string | number;
+  customer?: string;
+  invoice_id?: string | number;
+  status: "pending" | "executing" | "verifying" | "succeeded" | "failed";
+  external_activity_id?: string | number | null;
+  attempt_count: number;
+  error?: string | null;
+  started_at?: string | null;
+  finished_at?: string | null;
+  verified_at?: string | null;
+  receipt?: Record<string, unknown> | null;
+}
+
+export interface WorkbenchCommunicationInvoice {
+  invoice_id: number | string;
+  invoice_number?: string;
+  customer?: string;
+  currency?: string;
+  remaining_amount?: string;
+  currency_id?: number | string;
+  [key: string]: unknown;
+}
+
+export type WorkbenchCommunicationStatus = "draft" | "awaiting_approval";
+
+export interface WorkbenchCommunication {
+  id: string;
+  service_request_id: string;
+  action_id: string;
+  partner_id: number;
+  customer?: string;
+  company_id: number;
+  invoice_ids: Array<number | string>;
+  invoice_records: WorkbenchCommunicationInvoice[];
+  status: WorkbenchCommunicationStatus;
+  policy_state: string;
+  prepared_by: string;
+  prepared_at: string;
+  source: string;
+  version: number;
+  draft_content: string;
+  draft_version: number;
+  draft_hash: string;
+  source_hash: string;
+  source_version: number;
+  submitted_at: string | null;
+  created_at: string;
+  updated_at: string;
+  can_edit: boolean;
+  can_submit: boolean;
 }
 
 export interface RequestModule {
@@ -406,6 +466,75 @@ export const approveWorkbenchAction = (
 export const rejectWorkbenchAction = (
   requestId: string, actionId: string, expected_action_version: number, expected_proposal_hash: string, rejection_reason: string,
 ) => transitionWorkbenchAction(requestId, actionId, "reject", { expected_action_version, expected_proposal_hash, rejection_reason });
+
+export const queueWorkbenchAction = (
+  requestId: string, actionId: string, expected_action_version: number, expected_proposal_hash: string,
+) => apiFetch<{ action: WorkbenchAction }>(
+  `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/actions/${encodeURIComponent(actionId)}/queue`,
+  { method: "POST", body: JSON.stringify({ expected_action_version, expected_proposal_hash }) },
+);
+
+export const retryWorkbenchAction = (
+  requestId: string, actionId: string, expected_action_version: number, expected_proposal_hash: string,
+) => apiFetch<{ action: WorkbenchAction }>(
+  `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/actions/${encodeURIComponent(actionId)}/retry`,
+  { method: "POST", body: JSON.stringify({ expected_action_version, expected_proposal_hash }) },
+);
+
+export function fetchWorkbenchCommunications(
+  requestId: string,
+  actionId: string,
+): Promise<{ messages: WorkbenchCommunication[] }> {
+  return apiFetch<{ messages: WorkbenchCommunication[] }>(
+    `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/actions/${encodeURIComponent(actionId)}/communications`,
+  );
+}
+
+export function prepareWorkbenchCommunications(
+  requestId: string,
+  actionId: string,
+  locale: "ar" | "en",
+): Promise<{ messages: WorkbenchCommunication[] }> {
+  return apiFetch<{ messages: WorkbenchCommunication[] }>(
+    `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/actions/${encodeURIComponent(actionId)}/communications/prepare`,
+    { method: "POST", body: JSON.stringify({ locale }) },
+  );
+}
+
+export function updateWorkbenchCommunication(
+  requestId: string,
+  messageId: string,
+  body: {
+    expected_message_version: number;
+    expected_draft_version: number;
+    expected_draft_hash: string;
+    expected_source_version: number;
+    expected_source_hash: string;
+    content: string;
+  },
+): Promise<{ message: WorkbenchCommunication }> {
+  return apiFetch<{ message: WorkbenchCommunication }>(
+    `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/communications/${encodeURIComponent(messageId)}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
+}
+
+export function submitWorkbenchCommunication(
+  requestId: string,
+  messageId: string,
+  body: {
+    expected_message_version: number;
+    expected_draft_version: number;
+    expected_draft_hash: string;
+    expected_source_version: number;
+    expected_source_hash: string;
+  },
+): Promise<{ message: WorkbenchCommunication }> {
+  return apiFetch<{ message: WorkbenchCommunication }>(
+    `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/communications/${encodeURIComponent(messageId)}/submit`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+}
 
 export function createServiceRequest(payload: {
   tenant_id: string;

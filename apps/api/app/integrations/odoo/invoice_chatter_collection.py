@@ -65,8 +65,8 @@ def _search_read(client, *, base_url, database, transport, login, secret, model,
 
 def _invoice(
     client, *, base_url, database, transport, login, secret, company_id, invoice_id,
-    as_of_date, now: datetime | None = None,
-) -> int:
+    as_of_date, now: datetime | None = None, include_snapshot: bool = False,
+) -> int | dict[str, Any]:
     rows = _search_read(
         client, base_url=base_url, database=database, transport=transport, login=login,
         secret=secret, model="account.move",
@@ -74,7 +74,7 @@ def _invoice(
                 ["move_type", "=", "out_invoice"], ["state", "=", "posted"]],
         fields=[
             "id", "company_id", "move_type", "state", "amount_residual",
-            "invoice_date_due", "commercial_partner_id",
+            "invoice_date_due", "commercial_partner_id", "currency_id", "name",
         ],
     )
     if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
@@ -145,6 +145,20 @@ def _invoice(
         raise CollectionMessagePolicyError(
             "customer is outside the permitted contact hours", code="outside_contact_hours"
         )
+    if include_snapshot:
+        currency = row.get("currency_id")
+        return {
+            "invoice_id": invoice_id,
+            "company_id": company_id,
+            "partner_id": partner_id,
+            "move_type": row.get("move_type"),
+            "state": row.get("state"),
+            "residual": str(residual),
+            "due_date": due_date.isoformat(),
+            "currency": currency[0] if isinstance(currency, (list, tuple)) and currency else currency,
+            "currency_name": currency[1] if isinstance(currency, (list, tuple)) and len(currency) > 1 else None,
+            "reference": row.get("name"),
+        }
     return partner_id
 
 
@@ -163,6 +177,32 @@ def read_invoice_collection_target(
         return _invoice(client, base_url=base_url, database=database, transport=transport,
                         login=login, secret=secret, company_id=company_id,
                         invoice_id=invoice_id, as_of_date=as_of_date, now=now)
+
+
+def read_invoice_collection_snapshot(
+    *, base_url: str, database: str | None, transport: str, login: str, secret: str,
+    environment: str, company_id: int, invoice_id: int, as_of_date: date,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Read-only eligibility snapshot for approval drift detection.
+
+    This intentionally performs the same policy checks as the legacy target
+    helper and never exposes a write-capable Odoo operation.
+    """
+    company_id = _positive(company_id, "company_id")
+    invoice_id = _positive(invoice_id, "invoice_id")
+    if transport not in _TRANSPORTS:
+        raise ConnectorError("invalid_configuration", "stale transport")
+    security.enforce_outbound_policy(base_url, environment=environment)
+    with safe_http.build_client(environment) as client:
+        result = _invoice(
+            client, base_url=base_url, database=database, transport=transport,
+            login=login, secret=secret, company_id=company_id, invoice_id=invoice_id,
+            as_of_date=as_of_date, now=now, include_snapshot=True,
+        )
+    if not isinstance(result, dict):
+        raise ConnectorError("unsupported_response", "snapshot unavailable")
+    return result
 
 
 def _find(

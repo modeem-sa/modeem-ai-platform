@@ -3,11 +3,12 @@
 import json
 import time
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 
 from pydantic import ValidationError
-from sqlalchemy import or_, text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import and_, or_, text
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from app.content_manager.provider import (
     OpenAICompatibleProvider,
@@ -16,7 +17,13 @@ from app.content_manager.provider import (
 )
 from app.core.config import get_settings
 from app.db.base import get_session_factory
-from app.integrations.odoo.activity_writer import create_invoice_activity
+from app.integrations.odoo.activity_writer import (
+    ActivityWritePolicyError,
+    create_invoice_activity,
+    preflight_invoice_collection_targets,
+    reconcile_invoice_activity,
+    resolve_standard_todo_activity_type,
+)
 from app.integrations.odoo.errors import ConnectorError
 from app.integrations.odoo.invoice_chatter_collection import (
     CollectionMessagePolicyError,
@@ -28,6 +35,7 @@ from app.models import (
     CollectionMessageEvent,
     Connection,
     OperationAction,
+    OperationActionExecutionItem,
     OperationActionHistory,
     OperationTask,
     User,
@@ -48,6 +56,7 @@ from app.operations.proposals import (
     invoice_summary_from_snapshot,
 )
 from app.operations.recurring import generate_occurrences
+from app.operations.workbench_actions import CollectionProposal, canonical_collection_proposal
 from app.services.audit import record_audit
 from app.services.connection_auth import AuthMaterialError, resolve_auth_material
 from app.services.credential_crypto import (
@@ -57,6 +66,8 @@ from app.services.credential_crypto import (
 )
 
 _AI_AUTOMATION_RETRY_AFTER = 0.0
+PHASE4B_POLICY_ID = "internal_invoice_activity_v1"
+PHASE4B_DEADLINE_DAYS = 7
 
 
 def generate_missing_ai_proposals_once() -> int:
@@ -328,6 +339,9 @@ def run_queued_actions_once() -> int:
                 )
                 auth = resolve_auth_material(conn.username, creds)
                 action.status = "executing"
+                action.version += 1
+                _record_worker_history(session, action, "executing")
+                session.flush()
                 action.attempt_count += 1
                 action.version += 1
                 _record_worker_history(session, action, "executing")
@@ -400,13 +414,287 @@ def _record_worker_history(
             detail=detail,
         )
     )
+    record_audit(
+        session,
+        action=f"operation_action.{event}",
+        actor_type="worker",
+        actor_id="operations-worker",
+        tenant_id=action.tenant_id,
+        resource_type="operation_action",
+        resource_id=str(action.id),
+        metadata={"detail": detail} if detail else {},
+    )
 
 
 def _fail_action(session, action: OperationAction, detail: str) -> None:
     action.status = "failed"
     action.error = detail
+    action.lease_expires_at = None
     action.version += 1
     _record_worker_history(session, action, "failed", detail=detail)
+    record_audit(
+        session,
+        action="operation_action.failed",
+        actor_type="worker",
+        actor_id="operations-worker",
+        tenant_id=action.tenant_id,
+        resource_type="operation_action",
+        resource_id=str(action.id),
+        metadata={"error_code": detail},
+    )
+
+
+def run_queued_workbench_actions_once() -> int:
+    """Run only the explicit Phase 4B invoice-activity queue."""
+    session = get_session_factory()()
+    done = 0
+    advisory_acquired = False
+    try:
+        if session.bind and session.bind.dialect.name == "postgresql":
+            advisory_acquired = bool(
+                session.execute(text("SELECT pg_try_advisory_lock(810051)")).scalar()
+            )
+            if not advisory_acquired:
+                return 0
+        now = datetime.now(UTC)
+        actions = session.query(OperationAction).filter(
+            OperationAction.workflow_key == "finance.prepare_collection_followup",
+            or_(
+                OperationAction.status == "queued",
+                and_(
+                    OperationAction.status == "executing",
+                    OperationAction.lease_expires_at.is_not(None),
+                    OperationAction.lease_expires_at < now,
+                ),
+            ),
+        ).with_for_update(skip_locked=True).limit(1).all()
+        for action in actions:
+            # Claim one action in its own committed transaction.  No batch of
+            # preselected rows may survive a mid-loop commit.
+            action.status = "executing"
+            action.version += 1
+            action.claimed_at = now
+            action.lease_expires_at = now + timedelta(minutes=5)
+            _record_worker_history(session, action, "execution_started", PHASE4B_POLICY_ID)
+            session.flush()
+            session.commit()
+            action = session.get(OperationAction, action.id)
+            task = session.query(OperationTask).filter_by(
+                id=action.task_id, tenant_id=action.tenant_id
+            ).one_or_none()
+            if task is None or task.source_type != "agent_workbench":
+                _fail_action(session, action, "source_validation_failed")
+                session.commit()
+                continue
+            try:
+                proposal = CollectionProposal.model_validate_json(action.proposal_json)
+                _, digest = canonical_collection_proposal(proposal)
+                if digest != action.proposal_hash or digest != action.approved_hash:
+                    _fail_action(session, action, "proposal_validation_failed")
+                    session.commit()
+                    continue
+                if (
+                    action.approved_by_user_id is None or action.approved_at is None
+                    or action.workflow_key != "finance.prepare_collection_followup"
+                    or action.workflow_config_version != 1
+                    or proposal.service_request_id != uuid.UUID(task.source_reference or "00000000-0000-0000-0000-000000000000")
+                    or proposal.tenant_id != action.tenant_id
+                    or proposal.connection_id != task.source_connection_id
+                ):
+                    action.status, action.error = "failed", "stale_requires_reapproval"
+                    action.lease_expires_at = None
+                    action.version += 1
+                    _record_worker_history(session, action, "failed", "stale_requires_reapproval")
+                    session.commit()
+                    continue
+                conn = session.query(Connection).filter_by(
+                    id=proposal.connection_id, tenant_id=action.tenant_id
+                ).with_for_update().one_or_none()
+                if (
+                    conn is None or not conn.is_active or conn.status != "configured"
+                    or conn.last_test_status != "success"
+                    or conn.selected_transport not in ("xmlrpc", "json2")
+                    or conn.odoo_company_id != proposal.company_id
+                    or conn.provider != "odoo"
+                    or conn.encrypted_credentials is None
+                    or conn.encryption_version is None
+                ):
+                    action.status, action.error = "failed", "stale_requires_reapproval"
+                    action.lease_expires_at = None
+                    action.version += 1
+                    _record_worker_history(session, action, "failed", "stale_requires_reapproval")
+                    session.commit()
+                    continue
+                creds = decrypt_credentials(
+                    conn.encrypted_credentials, tenant_id=conn.tenant_id,
+                    connection_id=conn.id, encryption_version=conn.encryption_version,
+                )
+                auth = resolve_auth_material(conn.username, creds)
+                items = session.query(OperationActionExecutionItem).filter_by(
+                    action_id=action.id, tenant_id=action.tenant_id
+                ).all()
+                expected = {int(target["invoice_id"]) for target in proposal.target_records}
+                actual = {item.invoice_id for item in items}
+                valid_items = (
+                    len(items) == len(actual) == len(expected)
+                    and actual == expected
+                    and all(
+                        item.task_id == task.id
+                        and item.idempotency_marker == sha256(
+                            f"{action.id}:{item.invoice_id}:internal_invoice_activity_v1".encode()
+                        ).hexdigest()
+                        for item in items
+                    )
+                )
+                if not valid_items or action.execution_policy_id != PHASE4B_POLICY_ID or not action.execution_deadline:
+                    _fail_action(session, action, "execution_items_invalid")
+                    session.commit()
+                    continue
+                if not preflight_invoice_collection_targets(
+                    base_url=conn.base_url, database=conn.database_name,
+                    transport=conn.selected_transport, login=auth.login,
+                    secret=auth.secret, environment=get_settings().environment,
+                    company_id=proposal.company_id, targets=proposal.target_records,
+                    execution_date=datetime.now(UTC).date().isoformat(),
+                ):
+                    action.status, action.error = "failed", "stale_requires_reapproval"
+                    action.lease_expires_at = None
+                    action.version += 1
+                    _record_worker_history(session, action, "preflight_failed", "stale_requires_reapproval")
+                    _record_worker_history(session, action, "failed", "stale_requires_reapproval")
+                    session.commit()
+                    continue
+                activity_type_id = resolve_standard_todo_activity_type(
+                    base_url=conn.base_url, database=conn.database_name,
+                    transport=conn.selected_transport, login=auth.login,
+                    secret=auth.secret, environment=get_settings().environment,
+                )
+                action.status = "verifying"
+                action.version += 1
+                _record_worker_history(session, action, "verifying", PHASE4B_POLICY_ID)
+                record_audit(
+                    session, action="operation_action.verifying",
+                    actor_type="worker", actor_id="operations-worker",
+                    tenant_id=action.tenant_id, resource_type="operation_action",
+                    resource_id=str(action.id),
+                    metadata={"policy_id": PHASE4B_POLICY_ID},
+                )
+                session.commit()
+                for item in items:
+                    if item.status == "succeeded" and item.external_activity_id:
+                        continue
+                    if item.attempt_count >= 3:
+                        item.status = "failed"
+                        item.error = "attempt_limit_reached"
+                        item.finished_at = datetime.now(UTC)
+                        continue
+                    target = next(
+                        (x for x in proposal.target_records if x["invoice_id"] == item.invoice_id),
+                        None,
+                    )
+                    if target is None:
+                        item.status, item.error = "failed", "target_missing"
+                        continue
+                    item.status = "executing"
+                    item.attempt_count += 1
+                    item.started_at = item.started_at or datetime.now(UTC)
+                    action.version += 1
+                    _record_worker_history(session, action, "target_started", PHASE4B_POLICY_ID)
+                    # Commit the claim and attempt before any network call.
+                    # Thus connector failures cannot roll back the durable
+                    # attempt counter and another worker cannot claim it.
+                    session.flush()
+                    session.commit()
+                    item.status = "verifying"
+                    session.flush()
+                    existing = reconcile_invoice_activity(
+                        base_url=conn.base_url, database=conn.database_name,
+                        transport=conn.selected_transport, login=auth.login,
+                        secret=auth.secret, environment=get_settings().environment,
+                        company_id=proposal.company_id, invoice_id=item.invoice_id,
+                        summary="Collection follow-up",
+                        idempotency_marker=item.idempotency_marker,
+                    )
+                    if existing.get("activity_id"):
+                        item.external_activity_id = existing["activity_id"]
+                        item.receipt_json = json.dumps(existing, sort_keys=True)
+                        item.status = "succeeded"
+                        item.verified_at = datetime.now(UTC)
+                        item.finished_at = datetime.now(UTC)
+                        session.commit()
+                        action.version += 1
+                        _record_worker_history(session, action, "target_verified", PHASE4B_POLICY_ID)
+                        continue
+                    receipt = create_invoice_activity(
+                        base_url=conn.base_url, database=conn.database_name,
+                        transport=conn.selected_transport, login=auth.login,
+                        secret=auth.secret, environment=get_settings().environment,
+                        company_id=proposal.company_id, invoice_id=item.invoice_id,
+                        activity_type_id=activity_type_id, summary="Collection follow-up",
+                        date_deadline=action.execution_deadline or (
+                            datetime.now(UTC).date() + timedelta(days=PHASE4B_DEADLINE_DAYS)
+                        ).isoformat(),
+                        idempotency_marker=item.idempotency_marker,
+                    )
+                    verified = reconcile_invoice_activity(
+                        base_url=conn.base_url, database=conn.database_name,
+                        transport=conn.selected_transport, login=auth.login,
+                        secret=auth.secret, environment=get_settings().environment,
+                        company_id=proposal.company_id, invoice_id=item.invoice_id,
+                        summary="Collection follow-up",
+                        idempotency_marker=item.idempotency_marker,
+                    )
+                    if not verified.get("activity_id"):
+                        item.status, item.error = "failed", "verification_missing"
+                        session.commit()
+                        continue
+                    item.external_activity_id = verified["activity_id"]
+                    item.receipt_json = json.dumps(receipt, sort_keys=True)
+                    item.status = "succeeded"
+                    item.verified_at = datetime.now(UTC)
+                    item.finished_at = datetime.now(UTC)
+                    action.version += 1
+                    _record_worker_history(session, action, "target_verified", PHASE4B_POLICY_ID)
+                    session.commit()
+                if items and all(i.status == "succeeded" for i in items):
+                    action.status = "succeeded"
+                    action.lease_expires_at = None
+                    action.verified_at = datetime.now(UTC)
+                    action.version += 1
+                    _record_worker_history(session, action, "succeeded")
+                    done += 1
+                else:
+                    action.status, action.error = "failed", "external_execution_failed"
+                    action.version += 1
+                    _record_worker_history(session, action, "failed", "external_execution_failed")
+                session.commit()
+            except (ActivityWritePolicyError, ConnectorError, CredentialDecryptionError, EncryptionConfigError,
+                    AuthMaterialError, ValidationError, ValueError, TypeError, KeyError):
+                session.rollback()
+                action = session.get(OperationAction, action.id)
+                if action:
+                    action.status, action.error = "failed", "external_execution_failed"
+                    action.lease_expires_at = None
+                    item = session.query(OperationActionExecutionItem).filter_by(
+                        action_id=action.id, tenant_id=action.tenant_id,
+                    ).filter(
+                        OperationActionExecutionItem.status.in_(("executing", "verifying"))
+                    ).order_by(OperationActionExecutionItem.started_at.desc()).first()
+                    if item:
+                        item.status = "failed"
+                        item.error = "external_execution_failed"
+                        item.finished_at = datetime.now(UTC)
+                    action.version += 1
+                    _record_worker_history(session, action, "failed", "external_execution_failed")
+                    session.commit()
+        return done
+    finally:
+        if advisory_acquired:
+            try:
+                session.execute(text("SELECT pg_advisory_unlock(810051)"))
+            except SQLAlchemyError:
+                session.rollback()
+        session.close()
 
 
 def run_queued_collection_messages_once() -> int:
@@ -655,6 +943,7 @@ def main() -> None:
     while True:
         generate_missing_ai_proposals_once()
         run_queued_actions_once()
+        run_queued_workbench_actions_once()
         run_queued_collection_messages_once()
         scan_connections_once()
         session = get_session_factory()()

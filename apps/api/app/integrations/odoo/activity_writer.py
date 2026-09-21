@@ -8,6 +8,7 @@ arbitrary Odoo operations or supply context.
 
 import re
 from datetime import date
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import httpx
@@ -109,7 +110,7 @@ def _search_read(
             domain=domain,
             fields=fields,
             offset=0,
-            limit=2,
+            limit=200,
             order="id asc",
         )
     return legacy_xmlrpc.search_read(
@@ -122,7 +123,7 @@ def _search_read(
         domain=domain,
         fields=fields,
         offset=0,
-        limit=2,
+        limit=200,
         order="id asc",
     )
 
@@ -137,6 +138,95 @@ def _one_record(raw: Any, *, unavailable_message: str) -> dict[str, Any]:
     record = raw[0]
     _upstream_id(record.get("id"))
     return record
+
+
+def resolve_standard_todo_activity_type(
+    *,
+    base_url: str,
+    database: str | None,
+    transport: str,
+    login: str,
+    secret: str,
+    environment: str,
+) -> int:
+    """Resolve Odoo's fixed todo activity XMLID; never accept a browser ID."""
+    if transport not in _ALLOWED_TRANSPORTS:
+        raise ConnectorError("invalid_configuration", "stale transport")
+    security.enforce_outbound_policy(base_url, environment=environment)
+    with safe_http.build_client(environment) as client:
+        record = _one_record(
+            _search_read(
+                client, base_url=base_url, database=database, transport=transport,
+                login=login, secret=secret, model="ir.model.data",
+                domain=[["module", "=", "mail"], ["name", "=", "mail_activity_data_todo"]],
+                fields=["res_id", "module", "name"],
+            ),
+            unavailable_message="standard todo activity type is unavailable",
+        )
+    return _positive_id(record.get("res_id"), "activity_type_id")
+
+
+def preflight_invoice_collection_targets(
+    *,
+    base_url: str, database: str | None, transport: str, login: str, secret: str,
+    environment: str, company_id: int, targets: list[dict[str, Any]],
+    execution_date: str,
+) -> bool:
+    """Read the complete approved invoice set in one fixed, bounded call."""
+    ids = [target.get("invoice_id") for target in targets]
+    if not ids or len(ids) > 200 or any(not isinstance(i, int) or i < 1 for i in ids):
+        return False
+    if len(set(ids)) != len(ids):
+        return False
+    security.enforce_outbound_policy(base_url, environment=environment)
+    with safe_http.build_client(environment) as client:
+        raw = _search_read(
+            client, base_url=base_url, database=database, transport=transport,
+            login=login, secret=secret, model="account.move",
+            domain=[["id", "in", ids], ["company_id", "=", company_id],
+                    ["move_type", "=", "out_invoice"], ["state", "=", "posted"]],
+            fields=["id", "company_id", "partner_id", "currency_id", "amount_residual",
+                    "invoice_date_due", "state", "payment_state"],
+        )
+    # The bounded fixed call must return the complete set.  Never accept a
+    # truncated page: a missing invoice could otherwise turn into a partial
+    # external write.
+    if not isinstance(raw, list) or len(raw) != len(ids):
+        return False
+    by_id = {row.get("id"): row for row in raw if isinstance(row, dict)}
+    for target in targets:
+        row = by_id.get(target["invoice_id"])
+        if row is None or row.get("state") != "posted" or row.get("payment_state") in {"paid", "reversed"}:
+            return False
+        try:
+            if _relation_id(row["company_id"]) != company_id:
+                return False
+            if _relation_id(row["partner_id"]) != target["customer_id"]:
+                return False
+            if _relation_id(row["currency_id"]) != target["currency_id"]:
+                return False
+            def canonical_amount(value: Any) -> Decimal:
+                if isinstance(value, bool) or value is None:
+                    raise ValueError("invalid amount")
+                parsed = Decimal(str(value))
+                if not parsed.is_finite():
+                    raise ValueError("invalid amount")
+                return parsed
+
+            # Odoo may decode a numeric residual as float while the approved
+            # proposal is a canonical string.  Decimal(str(...)) avoids binary
+            # float equality and compares the exact numeric values.
+            if (
+                canonical_amount(row["amount_residual"])
+                != canonical_amount(target["remaining_amount"])
+                or canonical_amount(row["amount_residual"]) <= 0
+            ):
+                return False
+            if not isinstance(row["invoice_date_due"], str) or row["invoice_date_due"] >= execution_date:
+                return False
+        except (KeyError, TypeError, ValueError, InvalidOperation, ConnectorError):
+            return False
+    return True
 
 
 def _upstream_id(value: Any) -> int:

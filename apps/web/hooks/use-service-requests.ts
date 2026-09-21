@@ -25,12 +25,20 @@ import {
   executeFinanceTool,
   FinanceToolKey,
   WorkbenchAction,
+  WorkbenchCommunication,
+  fetchWorkbenchCommunications,
+  prepareWorkbenchCommunications,
+  updateWorkbenchCommunication,
+  submitWorkbenchCommunication,
   prepareWorkbenchAction,
   updateWorkbenchAction,
   submitWorkbenchAction,
   approveWorkbenchAction,
   rejectWorkbenchAction,
+  queueWorkbenchAction,
+  retryWorkbenchAction,
 } from "@/lib/service-requests";
+import { hasVerifiedExecutionSuccess } from "@/lib/workbench-presentation";
 
 export function useServiceRequests(tenantId: string | undefined, employeeInbox = false, includeAll = false) {
   const [requests, setRequests] = useState<ServiceRequest[]>([]);
@@ -135,6 +143,9 @@ export function useRequestAssignees(tenantId: string | undefined, enabled = true
 
 export function useRequestWorkbench(requestId: string | undefined, locale: "ar" | "en", enabled = true) {
   const [workbench, setWorkbench] = useState<AgentSessionResponse | null>(null);
+  const [communications, setCommunications] = useState<Record<string, WorkbenchCommunication[]>>({});
+  const [communicationLoading, setCommunicationLoading] = useState(false);
+  const [communicationError, setCommunicationError] = useState<Error | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Error | null>(null);
 
@@ -195,6 +206,80 @@ export function useRequestWorkbench(requestId: string | undefined, locale: "ar" 
     }
   }, []);
 
+  const loadCommunications = useCallback(async (actionIds: string[]) => {
+    if (!requestId || !enabled || !actionIds.length) return;
+    setCommunicationLoading(true);
+    try {
+      const entries = await Promise.all(actionIds.map(async (actionId) => {
+        const result = await fetchWorkbenchCommunications(requestId, actionId);
+        return [actionId, result.messages] as const;
+      }));
+      setCommunications((current) => ({ ...current, ...Object.fromEntries(entries) }));
+      setCommunicationError(null);
+    } catch (err) {
+      setCommunicationError(err instanceof Error ? err : new Error(String(err)));
+    } finally {
+      setCommunicationLoading(false);
+    }
+  }, [requestId, enabled]);
+
+  const verifiedActionIds = (workbench?.actions ?? [])
+    .filter(hasVerifiedExecutionSuccess)
+    .map((action) => action.id)
+    .join(",");
+
+  useEffect(() => {
+    const actionIds = verifiedActionIds ? verifiedActionIds.split(",") : [];
+    if (!actionIds.length) return;
+    void loadCommunications(actionIds);
+    const interval = setInterval(() => void loadCommunications(actionIds), 15000);
+    return () => clearInterval(interval);
+  }, [loadCommunications, verifiedActionIds]);
+
+  const runCommunication = useCallback(async (
+    operation: () => Promise<{ message: WorkbenchCommunication }>,
+  ) => {
+    setCommunicationLoading(true);
+    try {
+      const result = await operation();
+      setCommunications((current) => {
+        const actionId = result.message.action_id;
+        const previous = current[actionId] ?? [];
+        return {
+          ...current,
+          [actionId]: previous.some((item) => item.id === result.message.id)
+            ? previous.map((item) => item.id === result.message.id ? result.message : item)
+            : [...previous, result.message],
+        };
+      });
+      setCommunicationError(null);
+      return result.message;
+    } catch (err) {
+      const next = err instanceof Error ? err : new Error(String(err));
+      setCommunicationError(next);
+      throw next;
+    } finally {
+      setCommunicationLoading(false);
+    }
+  }, []);
+
+  const prepareCommunicationsForAction = useCallback(async (action: WorkbenchAction) => {
+    if (!requestId) throw new Error("Request is unavailable");
+    setCommunicationLoading(true);
+    try {
+      const result = await prepareWorkbenchCommunications(requestId, action.id, locale);
+      setCommunications((current) => ({ ...current, [action.id]: result.messages }));
+      setCommunicationError(null);
+      return result.messages;
+    } catch (err) {
+      const next = err instanceof Error ? err : new Error(String(err));
+      setCommunicationError(next);
+      throw next;
+    } finally {
+      setCommunicationLoading(false);
+    }
+  }, [locale, requestId]);
+
   return {
     workbench,
     loading,
@@ -222,6 +307,32 @@ export function useRequestWorkbench(requestId: string | undefined, locale: "ar" 
       runAction(() => approveWorkbenchAction(requestId!, action.id, action.version, action.proposal_hash)),
     rejectAction: (action: WorkbenchAction, rejection_reason: string) =>
       runAction(() => rejectWorkbenchAction(requestId!, action.id, action.version, action.proposal_hash, rejection_reason)),
+    queueAction: (action: WorkbenchAction) =>
+      runAction(() => queueWorkbenchAction(requestId!, action.id, action.version, action.proposal_hash)),
+    retryAction: (action: WorkbenchAction) =>
+      runAction(() => retryWorkbenchAction(requestId!, action.id, action.version, action.proposal_hash)),
+    communications,
+    communicationLoading,
+    communicationError,
+    refreshCommunications: loadCommunications,
+    prepareCommunications: prepareCommunicationsForAction,
+    updateCommunication: (message: WorkbenchCommunication, content: string) =>
+      runCommunication(() => updateWorkbenchCommunication(requestId!, message.id, {
+        expected_message_version: message.version,
+        expected_draft_version: message.draft_version,
+        expected_draft_hash: message.draft_hash,
+        expected_source_version: message.source_version,
+        expected_source_hash: message.source_hash,
+        content,
+      })),
+    submitCommunication: (message: WorkbenchCommunication) =>
+      runCommunication(() => submitWorkbenchCommunication(requestId!, message.id, {
+        expected_message_version: message.version,
+        expected_draft_version: message.draft_version,
+        expected_draft_hash: message.draft_hash,
+        expected_source_version: message.source_version,
+        expected_source_hash: message.source_hash,
+      })),
   };
 }
 

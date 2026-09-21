@@ -1,4 +1,5 @@
 import type { WorkbenchAction } from "./service-requests";
+import type { WorkbenchCommunication } from "./service-requests";
 
 export const workbenchStatusLabels: Record<string, { en: string; ar: string }> = {
   proposed: { en: "Proposed", ar: "مقترح" },
@@ -21,4 +22,20 @@ export function hasVerifiedExecutionSuccess(action: WorkbenchAction) {
     && items.length > 0
     && items.every((item) => item.status === "succeeded" && Boolean(item.verified_at) && item.external_activity_id != null)
     && (action.verified_count ?? 0) >= (action.target_count ?? items.length);
+}
+
+export function canPrepareCustomerCommunication(action: WorkbenchAction) {
+  return hasVerifiedExecutionSuccess(action);
+}
+
+export function communicationCardIsEditable(message: WorkbenchCommunication) {
+  return message.status === "draft" && message.can_edit && message.can_submit;
+}
+
+export function communicationActions(message: WorkbenchCommunication) {
+  return {
+    canEdit: communicationCardIsEditable(message),
+    canSubmit: message.status === "draft" && message.can_submit,
+    canSend: false as const,
+  };
 }

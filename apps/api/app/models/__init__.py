@@ -9,11 +9,14 @@ from app.models.operation_task import (
     CollectionMessage,
     CollectionMessageEvent,
     OperationAction,
+    OperationActionExecutionItem,
     OperationActionHistory,
     OperationTask,
     OperationTaskHistory,
     RecurringTaskOccurrence,
     RecurringTaskTemplate,
+    WorkbenchCollectionMessage,
+    WorkbenchCollectionMessageEvent,
 )
 from app.models.operations_task import OperationsTask
 from app.models.service_request import (
@@ -41,6 +44,7 @@ __all__ = [
     "Execution",
     "InvoiceDocument",
     "OperationAction",
+    "OperationActionExecutionItem",
     "OperationActionHistory",
     "OperationTask",
     "OperationTaskHistory",
@@ -54,5 +58,7 @@ __all__ = [
     "Tenant",
     "TenantMembership",
     "User",
+    "WorkbenchCollectionMessage",
+    "WorkbenchCollectionMessageEvent",
     "Workflow",
 ]

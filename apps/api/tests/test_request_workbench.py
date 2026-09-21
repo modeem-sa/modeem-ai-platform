@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from sqlalchemy import text
 
 from app.api import workbench as workbench_api
 from app.content_manager.provider import ProviderUnavailableError
@@ -904,38 +905,6 @@ def test_collection_followup_action_is_server_bound_reviewable_and_approval_only
             headers=_csrf(manager_client),
         )
         assert response.status_code == 409
-    db = TestingSession()
-    stored = db.query(OperationAction).one()
-    stored.status = "queued"
-    db.commit()
-    db.close()
-    with patch("app.workers.operations.create_invoice_activity") as writer:
-        from app.workers.operations import run_queued_actions_once
-        with patch("app.workers.operations.get_session_factory", lambda: TestingSession):
-            assert run_queued_actions_once() == 0
-        writer.assert_not_called()
-    db = TestingSession()
-    stored = db.query(OperationAction).one()
-    assert stored.status == "queued"
-    stored.workflow_key = None
-    task = db.query(OperationTask).one()
-    task.source_type = "agent_workbench"
-    db.commit()
-    db.close()
-    with patch("app.workers.operations.create_invoice_activity") as writer:
-        with patch("app.workers.operations.get_session_factory", lambda: TestingSession):
-            assert run_queued_actions_once() == 0
-        writer.assert_not_called()
-    db = TestingSession()
-    assert db.query(OperationAction).one().status == "queued"
-    db.close()
-    db = TestingSession()
-    stored = db.query(OperationAction).one()
-    stored.workflow_key = "finance.prepare_collection_followup"
-    stored.status = "approved"
-    db.commit()
-    db.close()
-
     customer = _client("workbench-customer@example.com")
     assert customer.get(f"{request_path}/agent/actions").status_code == 404
     db = TestingSession()
@@ -947,11 +916,17 @@ def test_collection_followup_action_is_server_bound_reviewable_and_approval_only
     with pytest.raises(ValueError, match="immutable"):
         db.flush()
     db.rollback()
+    db.close()
+    # A failed flush expires the identity state; use a fresh transaction for
+    # the second independent corruption assertion.
+    db = TestingSession()
     stored = db.query(OperationAction).one()
     stored.proposal_hash = "0" * 64
     with pytest.raises(ValueError, match="immutable"):
         db.flush()
     db.rollback()
+    db.close()
+    db = TestingSession()
     stored = db.query(OperationAction).one()
     assert (stored.proposal_json, stored.proposal_hash) == (original_json, original_hash)
     assert {row.event for row in db.query(OperationActionHistory).all()} >= {
@@ -969,6 +944,38 @@ def test_collection_followup_action_is_server_bound_reviewable_and_approval_only
         "agent_action_submitted_for_approval",
         "agent_action_approved",
     }
+    # Generic worker isolation. Deliberately corrupt only these fixtures with
+    # SQL: the ORM listener must reject source identity edits.
+    db.close()
+    db = TestingSession()
+    stored = db.query(OperationAction).one()
+    stored.status = "queued"
+    db.commit()
+    db.close()
+    with patch("app.workers.operations.create_invoice_activity") as writer:
+        from app.workers.operations import run_queued_actions_once
+        with patch("app.workers.operations.get_session_factory", lambda: TestingSession):
+            assert run_queued_actions_once() == 0
+        writer.assert_not_called()
+    db = TestingSession()
+    action_id = str(db.query(OperationAction).one().id)
+    task_id = str(db.query(OperationTask).one().id)
+    db.execute(
+        text("UPDATE operation_actions SET workflow_key = NULL WHERE id = :id"),
+        {"id": action_id},
+    )
+    db.execute(
+        text("UPDATE operation_tasks SET source_type = 'agent_workbench' WHERE id = :id"),
+        {"id": task_id},
+    )
+    db.commit()
+    db.close()
+    with patch("app.workers.operations.create_invoice_activity") as writer:
+        with patch("app.workers.operations.get_session_factory", lambda: TestingSession):
+            assert run_queued_actions_once() == 0
+        writer.assert_not_called()
+    db = TestingSession()
+    assert db.query(OperationAction).one().status == "queued"
     db.close()
 
 
