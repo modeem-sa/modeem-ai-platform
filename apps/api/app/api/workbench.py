@@ -26,8 +26,25 @@ from app.models import (
     AgentSession,
     AgentToolCall,
     Connection,
+    OperationAction,
+    OperationTask,
     ServiceRequest,
+    TenantMembership,
     User,
+)
+from app.operations.workbench_actions import (
+    ACTION_REGISTRY,
+    APPROVAL_POLICY,
+    COLLECTION_FOLLOWUP_KEY,
+    CollectionProposal,
+    PrepareActionInput,
+    TransitionActionInput,
+    UpdateActionInput,
+    _action_out,
+    _audit,
+    _history,
+    canonical_collection_proposal,
+    prepare_collection_followup,
 )
 from app.operations.workbench_tools import (
     FINANCE_TOOLS,
@@ -126,9 +143,10 @@ def _session_out(
     db: Session,
     session: AgentSession | None,
     transient_tool_results: dict[uuid.UUID, dict] | None = None,
+    actor: User | None = None,
 ) -> dict:
     if session is None:
-        return {"session": None, "messages": [], "tool_calls": []}
+        return {"session": None, "messages": [], "tool_calls": [], "actions": []}
     messages = (
         db.query(AgentMessage)
         .filter(AgentMessage.session_id == session.id, AgentMessage.tenant_id == session.tenant_id)
@@ -145,6 +163,34 @@ def _session_out(
         .order_by(AgentToolCall.started_at, AgentToolCall.id)
         .all()
     )
+    actor_role = None
+    if actor is not None:
+        membership = (
+            db.query(TenantMembership)
+            .filter(
+                TenantMembership.tenant_id == session.tenant_id,
+                TenantMembership.user_id == actor.id,
+                TenantMembership.is_active.is_(True),
+            )
+            .one_or_none()
+        )
+        actor_role = membership.role if membership else None
+    actions = [
+        _action_out(task, action, actor, actor_role)
+        for task, action in (
+            db.query(OperationTask, OperationAction)
+            .join(OperationAction, OperationAction.task_id == OperationTask.id)
+            .filter(
+                OperationTask.tenant_id == session.tenant_id,
+                OperationTask.source_type == "agent_workbench",
+                OperationTask.source_reference == str(session.service_request_id),
+                OperationTask.source_signal == COLLECTION_FOLLOWUP_KEY,
+                OperationAction.tenant_id == session.tenant_id,
+            )
+            .order_by(OperationTask.created_at.desc(), OperationTask.id.desc())
+            .all()
+        )
+    ]
     return {
         "session": {
             "id": str(session.id),
@@ -171,6 +217,7 @@ def _session_out(
             }
             for item in messages
         ],
+        "actions": actions,
         "tool_calls": [
             {
                 "id": str(item.id),
@@ -192,6 +239,30 @@ def _session_out(
             for item in tool_calls
         ],
     }
+
+
+def _action_for_request(
+    db: Session, request: ServiceRequest, action_id: uuid.UUID
+) -> tuple[OperationTask, OperationAction]:
+    row = (
+        db.query(OperationTask, OperationAction)
+        .join(OperationAction, OperationAction.task_id == OperationTask.id)
+        .filter(
+            OperationTask.id == OperationAction.task_id,
+            OperationTask.tenant_id == request.tenant_id,
+            OperationTask.source_type == "agent_workbench",
+            OperationTask.source_reference == str(request.id),
+            OperationTask.source_signal == COLLECTION_FOLLOWUP_KEY,
+            OperationAction.id == action_id,
+            OperationAction.tenant_id == request.tenant_id,
+            OperationAction.workflow_key == COLLECTION_FOLLOWUP_KEY,
+        )
+        .with_for_update()
+        .one_or_none()
+    )
+    if row is None:
+        raise HTTPException(status_code=404, detail="Workbench action not found")
+    return row
 
 
 def _authorized_request(
@@ -554,7 +625,207 @@ def get_agent_session(
     db: Session = Depends(get_db),
 ) -> dict:
     request, _ = _authorized_request(db, actor, request_id)
-    return _session_out(db, _get_session(db, request, actor))
+    return _session_out(db, _get_session(db, request, actor), actor=actor)
+
+
+@router.get("/{request_id}/agent/actions")
+def list_agent_actions(
+    request_id: uuid.UUID,
+    actor: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    request, membership = _authorized_request(db, actor, request_id)
+    return {
+        "actions": [
+            _action_out(task, action, actor, membership.role)
+            for task, action in (
+                db.query(OperationTask, OperationAction)
+                .join(OperationAction, OperationAction.task_id == OperationTask.id)
+                .filter(
+                    OperationTask.tenant_id == request.tenant_id,
+                    OperationTask.source_type == "agent_workbench",
+                    OperationTask.source_reference == str(request.id),
+                    OperationTask.source_signal == COLLECTION_FOLLOWUP_KEY,
+                    OperationAction.tenant_id == request.tenant_id,
+                )
+                .order_by(OperationTask.created_at.desc(), OperationTask.id.desc())
+                .all()
+            )
+        ]
+    }
+
+
+@router.post(
+    "/{request_id}/agent/actions/prepare",
+    dependencies=[Depends(require_csrf)],
+)
+def prepare_agent_action(
+    request_id: uuid.UUID,
+    body: PrepareActionInput,
+    actor: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    request, _ = _authorized_request(db, actor, request_id)
+    if COLLECTION_FOLLOWUP_KEY not in ACTION_REGISTRY:
+        raise HTTPException(status_code=422, detail="Unsupported Workbench action")
+    session, connection = _ensure_session(db, request, actor)
+    result = prepare_collection_followup(
+        db=db,
+        actor=actor,
+        request=request,
+        connection=connection,
+        session=session,
+        body=body,
+        read_page=_operations_read_page,
+    )
+    return {"action": result, "session": _session_out(db, session, actor=actor)}
+
+
+@router.patch(
+    "/{request_id}/agent/actions/{action_id}",
+    dependencies=[Depends(require_csrf)],
+)
+def update_agent_action(
+    request_id: uuid.UUID,
+    action_id: uuid.UUID,
+    body: UpdateActionInput,
+    actor: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    request, _ = _authorized_request(db, actor, request_id)
+    task, action = _action_for_request(db, request, action_id)
+    if (
+        action.status != "proposed"
+        or action.version != body.expected_action_version
+        or action.proposal_hash != body.expected_proposal_hash
+        or task.created_by_user_id != actor.id
+    ):
+        raise HTTPException(status_code=409, detail="Workbench action is not editable")
+    proposal = CollectionProposal.model_validate(
+        json.loads(action.proposal_json), strict=False
+    ).model_copy(
+        update={
+            "draft_message": body.draft_message,
+            "internal_note": body.internal_note,
+            "followup_type": body.followup_type,
+        }
+    )
+    payload, digest = canonical_collection_proposal(proposal)
+    action.proposal_json = payload
+    action.proposal_hash = digest
+    action.version += 1
+    task.decision_note = None
+    _history(db, action, actor, "regenerated", "editable_fields_updated")
+    _audit(db, "agent_action_updated", actor, request, str(action.id), {"changed": "editable_fields"})
+    db.commit()
+    return {"action": _action_out(task, action, actor, "member")}
+
+
+@router.post(
+    "/{request_id}/agent/actions/{action_id}/submit",
+    dependencies=[Depends(require_csrf)],
+)
+def submit_agent_action(
+    request_id: uuid.UUID,
+    action_id: uuid.UUID,
+    body: TransitionActionInput,
+    actor: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    request, _ = _authorized_request(db, actor, request_id)
+    task, action = _action_for_request(db, request, action_id)
+    if (
+        action.status != "proposed"
+        or action.version != body.expected_action_version
+        or action.proposal_hash != body.expected_proposal_hash
+        or task.created_by_user_id != actor.id
+    ):
+        raise HTTPException(status_code=409, detail="Workbench action has been modified")
+    action.status = "awaiting_approval"
+    action.version += 1
+    task.status = "submitted_for_approval"
+    task.submitted_at = datetime.now(UTC)
+    _history(db, action, actor, "submitted")
+    _audit(db, "agent_action_submitted_for_approval", actor, request, str(action.id))
+    db.commit()
+    return {"action": _action_out(task, action, actor, "member")}
+
+
+@router.post(
+    "/{request_id}/agent/actions/{action_id}/approve",
+    dependencies=[Depends(require_csrf)],
+)
+def approve_agent_action(
+    request_id: uuid.UUID,
+    action_id: uuid.UUID,
+    body: TransitionActionInput,
+    actor: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    request, membership = _authorized_request(db, actor, request_id)
+    task, action = _action_for_request(db, request, action_id)
+    if membership.role not in {"owner", "admin", "manager"}:
+        raise HTTPException(status_code=403, detail="Manager approval is required")
+    if task.created_by_user_id == actor.id:
+        raise HTTPException(status_code=403, detail="The preparer cannot approve this action")
+    if (
+        action.status != "awaiting_approval"
+        or action.version != body.expected_action_version
+        or action.proposal_hash != body.expected_proposal_hash
+    ):
+        raise HTTPException(status_code=409, detail="Workbench action has been modified")
+    _current_payload, current_hash = canonical_collection_proposal(
+        CollectionProposal.model_validate(json.loads(action.proposal_json), strict=False)
+    )
+    if current_hash != action.proposal_hash:
+        raise HTTPException(status_code=409, detail="Approval hash is invalid")
+    action.status = "approved"
+    action.approved_hash = current_hash
+    action.approved_by_user_id = actor.id
+    action.approved_at = datetime.now(UTC)
+    action.version += 1
+    task.status = "approved"
+    task.decided_at = datetime.now(UTC)
+    task.decision_note = None
+    _history(db, action, actor, "approved")
+    _audit(db, "agent_action_approved", actor, request, str(action.id), {"approval_policy": APPROVAL_POLICY})
+    db.commit()
+    return {"action": _action_out(task, action, actor, membership.role)}
+
+
+@router.post(
+    "/{request_id}/agent/actions/{action_id}/reject",
+    dependencies=[Depends(require_csrf)],
+)
+def reject_agent_action(
+    request_id: uuid.UUID,
+    action_id: uuid.UUID,
+    body: TransitionActionInput,
+    actor: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    request, membership = _authorized_request(db, actor, request_id)
+    task, action = _action_for_request(db, request, action_id)
+    if membership.role not in {"owner", "admin", "manager"}:
+        raise HTTPException(status_code=403, detail="Manager approval is required")
+    if task.created_by_user_id == actor.id:
+        raise HTTPException(status_code=403, detail="The preparer cannot reject this action")
+    if (
+        action.status != "awaiting_approval"
+        or action.version != body.expected_action_version
+        or action.proposal_hash != body.expected_proposal_hash
+    ):
+        raise HTTPException(status_code=409, detail="Workbench action has been modified")
+    action.status = "proposed"
+    action.approved_hash = action.approved_by_user_id = action.approved_at = None
+    action.version += 1
+    task.status = "rejected"
+    task.decided_at = datetime.now(UTC)
+    task.decision_note = "Rejected: " + (body.rejection_reason or "No reason provided.")
+    _history(db, action, actor, "rejected", "manager_rejected")
+    _audit(db, "agent_action_rejected", actor, request, str(action.id))
+    db.commit()
+    return {"action": _action_out(task, action, actor, membership.role)}
 
 
 @router.post(
@@ -571,7 +842,7 @@ def start_agent_session(
     session, _ = _ensure_session(db, request, actor)
     session.prompt_version = PROMPT_VERSION
     db.commit()
-    return _session_out(db, session)
+    return _session_out(db, session, actor=actor)
 
 
 @router.post(
@@ -597,7 +868,7 @@ def execute_agent_tool(
         tool_input,
         body.locale,
     )
-    return _session_out(db, session, {call_id: result})
+    return _session_out(db, session, {call_id: result}, actor=actor)
 
 
 @router.post(
@@ -667,7 +938,7 @@ def analyze_request(
         metadata={"service_request_id": str(request.id)},
     )
     db.commit()
-    return _session_out(db, session)
+    return _session_out(db, session, actor=actor)
 
 
 @router.get("/{request_id}/agent/messages")
@@ -677,7 +948,7 @@ def get_agent_messages(
     db: Session = Depends(get_db),
 ) -> dict:
     request, _ = _authorized_request(db, actor, request_id)
-    return _session_out(db, _get_session(db, request, actor))
+    return _session_out(db, _get_session(db, request, actor), actor=actor)
 
 
 @router.post(
@@ -713,7 +984,7 @@ def post_agent_message(
             finance_tool_input_from_instruction(body.content, selected_tool),
             body.locale,
         )
-        return _session_out(db, session, {call_id: result})
+        return _session_out(db, session, {call_id: result}, actor=actor)
     prompt = PROMPT_PATH.read_text(encoding="utf-8").strip()
     payload = _analysis_payload(request, connection, body.locale)
     payload["conversation"] = _conversation_context(db, session, user_message.id)
@@ -770,4 +1041,4 @@ def post_agent_message(
     session.provider_model = str(getattr(provider, "model", "unknown"))
     session.last_error = None
     db.commit()
-    return _session_out(db, session)
+    return _session_out(db, session, actor=actor)

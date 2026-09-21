@@ -24,6 +24,12 @@ import {
   executeOverdueInvoiceTool,
   executeFinanceTool,
   FinanceToolKey,
+  WorkbenchAction,
+  prepareWorkbenchAction,
+  updateWorkbenchAction,
+  submitWorkbenchAction,
+  approveWorkbenchAction,
+  rejectWorkbenchAction,
 } from "@/lib/service-requests";
 
 export function useServiceRequests(tenantId: string | undefined, employeeInbox = false, includeAll = false) {
@@ -163,6 +169,32 @@ export function useRequestWorkbench(requestId: string | undefined, locale: "ar" 
     }
   }, []);
 
+  const runAction = useCallback(async (operation: () => Promise<{ action: WorkbenchAction; session?: AgentSessionResponse }>) => {
+    setLoading(true);
+    try {
+      const result = await operation();
+      setWorkbench((current) => {
+        const nextAction = result.action;
+        if (!current) return result.session ?? current;
+        return {
+          ...current,
+          ...(result.session ?? {}),
+          actions: current.actions.some((item) => item.id === nextAction.id)
+            ? current.actions.map((item) => item.id === nextAction.id ? nextAction : item)
+            : [nextAction, ...current.actions],
+        };
+      });
+      setError(null);
+      return result.action;
+    } catch (err) {
+      const next = err instanceof Error ? err : new Error(String(err));
+      setError(next);
+      throw next;
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
   return {
     workbench,
     loading,
@@ -175,6 +207,21 @@ export function useRequestWorkbench(requestId: string | undefined, locale: "ar" 
       run(() => executeOverdueInvoiceTool(requestId!, locale, minimumDaysOverdue)),
     runFinanceTool: (toolKey: FinanceToolKey, input: Record<string, unknown> = {}) =>
       run(() => executeFinanceTool(requestId!, locale, toolKey, input)),
+    prepareAction: (sourceToolCallId: string) =>
+      runAction(() => prepareWorkbenchAction(requestId!, sourceToolCallId, locale)),
+    updateAction: (action: WorkbenchAction, fields: {
+      draft_message: string; internal_note: string; followup_type: WorkbenchAction["proposal"]["followup_type"];
+    }) => runAction(() => updateWorkbenchAction(requestId!, action.id, {
+      expected_action_version: action.version,
+      expected_proposal_hash: action.proposal_hash,
+      ...fields,
+    })),
+    submitAction: (action: WorkbenchAction) =>
+      runAction(() => submitWorkbenchAction(requestId!, action.id, action.version, action.proposal_hash)),
+    approveAction: (action: WorkbenchAction) =>
+      runAction(() => approveWorkbenchAction(requestId!, action.id, action.version, action.proposal_hash)),
+    rejectAction: (action: WorkbenchAction, rejection_reason: string) =>
+      runAction(() => rejectWorkbenchAction(requestId!, action.id, action.version, action.proposal_hash, rejection_reason)),
   };
 }
 

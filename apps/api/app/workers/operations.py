@@ -6,7 +6,7 @@ import uuid
 from datetime import UTC, datetime
 
 from pydantic import ValidationError
-from sqlalchemy import text
+from sqlalchemy import or_, text
 from sqlalchemy.exc import IntegrityError
 
 from app.content_manager.provider import (
@@ -218,12 +218,26 @@ def run_queued_actions_once() -> int:
             row[0]
             for row in session.query(OperationAction.id)
             .filter_by(status="queued")
+            .filter(
+                or_(
+                    OperationAction.workflow_key.is_(None),
+                    OperationAction.workflow_key != "finance.prepare_collection_followup",
+                )
+            )
             .limit(20)
             .all()
         ]
         for action_id in action_ids:
             action = session.get(OperationAction, action_id)
             if action is None:
+                continue
+            if (
+                action.workflow_key == "finance.prepare_collection_followup"
+                or (task := session.query(OperationTask).filter_by(
+                    id=action.task_id, tenant_id=action.tenant_id
+                ).one_or_none()) is not None
+                and task.source_type == "agent_workbench"
+            ):
                 continue
             task = (
                 session.query(OperationTask)

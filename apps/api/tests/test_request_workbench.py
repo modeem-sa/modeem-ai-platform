@@ -1,6 +1,10 @@
 """Request-bound AI Workbench authorization and persistence tests."""
 
+import hashlib
+import json
+import uuid
 from datetime import UTC, date, datetime, timedelta
+from unittest.mock import patch
 
 import pytest
 from fastapi import HTTPException
@@ -16,10 +20,14 @@ from app.models import (
     AgentToolCall,
     AuditLog,
     Connection,
+    OperationAction,
+    OperationActionHistory,
+    OperationTask,
     ServiceRequest,
     TenantMembership,
     User,
 )
+from app.operations.workbench_actions import _action_out
 from app.operations.workbench_tools import (
     CUSTOMER_INVOICES_TOOL_KEY,
     FINANCE_TOOLS,
@@ -699,6 +707,269 @@ def test_customer_and_cross_tenant_employee_cannot_execute_finance_tool(seed):
         other_employee.post(path, json={}, headers=_csrf(other_employee)).status_code
         == 404
     )
+
+
+def test_collection_followup_action_is_server_bound_reviewable_and_approval_only(
+    seed, monkeypatch
+):
+    data = _fixture(seed)
+    _enable_finance_connection(seed)
+    as_of = date(2026, 9, 21)
+    monkeypatch.setattr(
+        workbench_api,
+        "_operations_read_page",
+        _single_page([_invoice(1, due_date=as_of - timedelta(days=40), residual=245)]),
+    )
+    employee = _client("workbench-employee@example.com")
+    request_path = f"/api/v1/service-requests/{data['request']}"
+    assert employee.post(
+        f"{request_path}/agent/session", json={}, headers=_csrf(employee)
+    ).status_code == 200
+    read = employee.post(
+        f"{request_path}/agent/tools/execute",
+        json={
+            "tool_key": "finance.get_overdue_customer_invoices",
+            "input": {"minimum_days_overdue": 30, "max_records": 100},
+        },
+        headers=_csrf(employee),
+    )
+    assert read.status_code == 200, read.text
+    source_call_id = read.json()["tool_calls"][0]["id"]
+
+    prepare = employee.post(
+        f"{request_path}/agent/actions/prepare",
+        json={"source_tool_call_id": source_call_id, "locale": "en"},
+        headers=_csrf(employee),
+    )
+    assert prepare.status_code == 200, prepare.text
+    action = prepare.json()["action"]
+    assert action["status"] == "proposed"
+    assert action["proposal"]["target_records"][0]["invoice_id"] == 1
+    assert action["proposal"]["source_tool_call_id"] != action["proposal"]["requested_source_tool_call_id"]
+    db = TestingSession()
+    original = db.get(AgentToolCall, uuid.UUID(source_call_id))
+    refreshed = db.get(
+        AgentToolCall, uuid.UUID(action["proposal"]["source_tool_call_id"])
+    )
+    assert original is not None and refreshed is not None
+    assert refreshed.status == "completed"
+    assert str(original.id) == action["proposal"]["requested_source_tool_call_id"]
+    assert str(refreshed.id) == action["proposal"]["source_tool_call_id"]
+    snapshot = {
+        "as_of": action["proposal"]["source_as_of"],
+        "target_records": [
+            {
+                "invoice_id": row["invoice_id"],
+                "customer_id": row["customer_id"],
+                "currency_id": row["currency_id"],
+                "remaining_amount": row["remaining_amount"],
+            }
+            for row in action["proposal"]["target_records"]
+        ],
+        "totals_by_currency": action["proposal"]["totals_by_currency"],
+    }
+    snapshot_hash = hashlib.sha256(
+        json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    assert snapshot_hash == action["proposal"]["source_snapshot_hash"]
+    assert json.loads(refreshed.safe_result_summary_json)["source_snapshot_hash"] == snapshot_hash
+    db.close()
+    assert "tenant_id" not in prepare.request.content.decode()
+    invalid = employee.post(
+        f"{request_path}/agent/actions/prepare",
+        json={
+            "source_tool_call_id": source_call_id,
+            "tenant_id": str(seed["tenant_b"]),
+            "invoice_ids": [999],
+        },
+        headers=_csrf(employee),
+    )
+    assert invalid.status_code == 422
+
+    updated = employee.patch(
+        f"{request_path}/agent/actions/{action['id']}",
+        json={
+            "expected_action_version": action["version"],
+            "expected_proposal_hash": action["proposal_hash"],
+            "draft_message": "Edited safe draft",
+            "internal_note": "Review before sending",
+            "followup_type": "phone",
+        },
+        headers=_csrf(employee),
+    )
+    assert updated.status_code == 200, updated.text
+    updated_action = updated.json()["action"]
+    assert updated_action["proposal"]["draft_message"] == "Edited safe draft"
+    assert updated_action["proposal_hash"] != action["proposal_hash"]
+    submitted = employee.post(
+        f"{request_path}/agent/actions/{action['id']}/submit",
+        json={
+            "expected_action_version": updated_action["version"],
+            "expected_proposal_hash": updated_action["proposal_hash"],
+        },
+        headers=_csrf(employee),
+    )
+    assert submitted.status_code == 200, submitted.text
+    awaiting = submitted.json()["action"]
+    db = TestingSession()
+    other = User(
+        email="workbench-other@example.com",
+        full_name="Other Employee",
+        password_hash=hash_password(PASSWORD),
+    )
+    db.add(other)
+    db.flush()
+    db.add(TenantMembership(tenant_id=seed["tenant_a"], user_id=other.id, role="member"))
+    db.commit()
+    db.close()
+    other_caps = _action_out(
+        db.query(OperationTask).one(),
+        db.query(OperationAction).one(),
+        other,
+        "member",
+    )
+    assert not any(
+        other_caps[key] for key in ("can_edit", "can_submit", "can_approve", "can_reject")
+    )
+    db.close()
+
+    db = TestingSession()
+    manager = User(
+        email="workbench-manager@example.com",
+        full_name="Workbench Manager",
+        password_hash=hash_password(PASSWORD),
+    )
+    db.add(manager)
+    db.flush()
+    db.add(TenantMembership(tenant_id=seed["tenant_a"], user_id=manager.id, role="manager"))
+    db.commit()
+    db.close()
+    manager_client = _client("workbench-manager@example.com")
+    own_rejection = employee.post(
+        f"{request_path}/agent/actions/{action['id']}/reject",
+        json={
+            "expected_action_version": awaiting["version"],
+            "expected_proposal_hash": awaiting["proposal_hash"],
+            "rejection_reason": "self rejection must be blocked",
+        },
+        headers=_csrf(employee),
+    )
+    assert own_rejection.status_code == 403
+    own_approval = employee.post(
+        f"{request_path}/agent/actions/{action['id']}/approve",
+        json={
+            "expected_action_version": awaiting["version"],
+            "expected_proposal_hash": awaiting["proposal_hash"],
+        },
+        headers=_csrf(employee),
+    )
+    assert own_approval.status_code == 403
+    approved = manager_client.post(
+        f"{request_path}/agent/actions/{action['id']}/approve",
+        json={
+            "expected_action_version": awaiting["version"],
+            "expected_proposal_hash": awaiting["proposal_hash"],
+        },
+        headers=_csrf(manager_client),
+    )
+    assert approved.status_code == 200, approved.text
+    approved_action = approved.json()["action"]
+    assert approved_action["status"] == "approved"
+    assert approved_action["approved_hash"] == approved_action["proposal_hash"]
+    assert approved_action["not_executed"] is True
+    assert approved_action["can_edit"] is False
+    assert approved_action["can_submit"] is False
+    assert approved_action["can_approve"] is False
+    assert approved_action["can_reject"] is False
+    blocked_edit = employee.patch(
+        f"{request_path}/agent/actions/{action['id']}",
+        json={
+            "expected_action_version": approved_action["version"],
+            "expected_proposal_hash": approved_action["proposal_hash"],
+            "draft_message": "Must not change",
+        },
+        headers=_csrf(employee),
+    )
+    assert blocked_edit.status_code == 409
+
+    generic_body = {
+        "expected_version": 1,
+        "expected_action_version": approved_action["version"],
+        "expected_proposal_hash": approved_action["proposal_hash"],
+    }
+    for endpoint in ("submit", "approve", "retry"):
+        response = manager_client.post(
+            f"/api/v1/operations/tasks/{approved_action['task_id']}/action/{endpoint}",
+            json=generic_body,
+            headers=_csrf(manager_client),
+        )
+        assert response.status_code == 409
+    db = TestingSession()
+    stored = db.query(OperationAction).one()
+    stored.status = "queued"
+    db.commit()
+    db.close()
+    with patch("app.workers.operations.create_invoice_activity") as writer:
+        from app.workers.operations import run_queued_actions_once
+        with patch("app.workers.operations.get_session_factory", lambda: TestingSession):
+            assert run_queued_actions_once() == 0
+        writer.assert_not_called()
+    db = TestingSession()
+    stored = db.query(OperationAction).one()
+    assert stored.status == "queued"
+    stored.workflow_key = None
+    task = db.query(OperationTask).one()
+    task.source_type = "agent_workbench"
+    db.commit()
+    db.close()
+    with patch("app.workers.operations.create_invoice_activity") as writer:
+        with patch("app.workers.operations.get_session_factory", lambda: TestingSession):
+            assert run_queued_actions_once() == 0
+        writer.assert_not_called()
+    db = TestingSession()
+    assert db.query(OperationAction).one().status == "queued"
+    db.close()
+    db = TestingSession()
+    stored = db.query(OperationAction).one()
+    stored.workflow_key = "finance.prepare_collection_followup"
+    stored.status = "approved"
+    db.commit()
+    db.close()
+
+    customer = _client("workbench-customer@example.com")
+    assert customer.get(f"{request_path}/agent/actions").status_code == 404
+    db = TestingSession()
+    stored = db.query(OperationAction).one()
+    assert stored.status == "approved"
+    assert stored.approved_hash == stored.proposal_hash
+    original_json, original_hash = stored.proposal_json, stored.proposal_hash
+    stored.proposal_json = "{}"
+    with pytest.raises(ValueError, match="immutable"):
+        db.flush()
+    db.rollback()
+    stored = db.query(OperationAction).one()
+    stored.proposal_hash = "0" * 64
+    with pytest.raises(ValueError, match="immutable"):
+        db.flush()
+    db.rollback()
+    stored = db.query(OperationAction).one()
+    assert (stored.proposal_json, stored.proposal_hash) == (original_json, original_hash)
+    assert {row.event for row in db.query(OperationActionHistory).all()} >= {
+        "generated",
+        "regenerated",
+        "submitted",
+        "approved",
+    }
+    assert {
+        row.action
+        for row in db.query(AuditLog).all()
+    } >= {
+        "agent_action_prepared",
+        "agent_action_updated",
+        "agent_action_submitted_for_approval",
+        "agent_action_approved",
+    }
+    db.close()
 
 
 def test_finance_tool_enforces_module_and_service_scopes(seed, monkeypatch):

@@ -14,6 +14,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
     event,
+    inspect,
 )
 from sqlalchemy.orm import Mapped, mapped_column, validates
 
@@ -205,6 +206,19 @@ class OperationAction(Base):
     workflow_config_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow, onupdate=_utcnow)
+
+
+@event.listens_for(OperationAction, "before_update")
+def _approved_workbench_action_identity_cannot_change(_mapper, _connection, target) -> None:
+    status_history = inspect(target).attrs.status.history
+    was_approved = "approved" in status_history.deleted
+    if target.workflow_key != "finance.prepare_collection_followup" or (
+        target.status != "approved" and not was_approved
+    ):
+        return
+    state = inspect(target)
+    if state.attrs.proposal_json.history.has_changes() or state.attrs.proposal_hash.history.has_changes():
+        raise ValueError("Approved Workbench action proposal is immutable")
 
 
 class OperationActionHistory(Base):

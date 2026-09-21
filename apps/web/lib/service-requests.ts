@@ -151,6 +151,65 @@ export interface AgentSessionResponse {
   session: AgentSession | null;
   messages: AgentMessage[];
   tool_calls: FinanceToolCall[];
+  actions: WorkbenchAction[];
+}
+
+export type WorkbenchFollowupType = "phone" | "email" | "message" | "review";
+
+export interface WorkbenchTargetRecord {
+  invoice_id: number | string;
+  customer_id: number | string;
+  customer: string;
+  invoice_number: string;
+  currency_id: number;
+  currency: string;
+  remaining_amount: string;
+  days_overdue: number;
+}
+
+export interface WorkbenchProposal {
+  action_key: "finance.prepare_collection_followup";
+  approval_policy: "internal_manager";
+  service_request_id: string;
+  tenant_id: string;
+  connection_id: string;
+  company_id: number;
+  source_tool_call_id: string;
+  requested_source_tool_call_id: string;
+  source_snapshot_hash: string;
+  source_as_of: string;
+  source_tool_input: Record<string, unknown>;
+  target_records: WorkbenchTargetRecord[];
+  totals_by_currency: FinanceCurrencyTotal[];
+  followup_type: WorkbenchFollowupType;
+  draft_message: string;
+  internal_note: string;
+  reverify_before_execution: true;
+}
+
+export interface WorkbenchAction {
+  id: string;
+  task_id: string;
+  service_request_id: string;
+  action_key: "finance.prepare_collection_followup";
+  status: "proposed" | "awaiting_approval" | "approved";
+  approval_policy: "internal_manager";
+  proposal: WorkbenchProposal;
+  proposal_hash: string;
+  proposal_hash_short: string;
+  approved_hash: string | null;
+  approved_by_user_id: string | null;
+  approved_at: string | null;
+  prepared_by_user_id: string;
+  prepared_at: string;
+  updated_at: string;
+  version: number;
+  rejection_reason: string | null;
+  not_executed: true;
+  can_edit: boolean;
+  can_submit: boolean;
+  can_approve: boolean;
+  can_reject: boolean;
 }
 
 export interface RequestModule {
@@ -295,6 +354,58 @@ export function executeFinanceTool(
     },
   );
 }
+
+export function prepareWorkbenchAction(
+  requestId: string,
+  sourceToolCallId: string,
+  locale: "ar" | "en",
+): Promise<{ action: WorkbenchAction; session: AgentSessionResponse }> {
+  return apiFetch<{ action: WorkbenchAction; session: AgentSessionResponse }>(
+    `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/actions/prepare`,
+    { method: "POST", body: JSON.stringify({ source_tool_call_id: sourceToolCallId, locale }) },
+  );
+}
+
+export function updateWorkbenchAction(
+  requestId: string,
+  actionId: string,
+  body: {
+    expected_action_version: number;
+    expected_proposal_hash: string;
+    draft_message: string;
+    internal_note: string;
+    followup_type: WorkbenchFollowupType;
+  },
+): Promise<{ action: WorkbenchAction }> {
+  return apiFetch<{ action: WorkbenchAction }>(
+    `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/actions/${encodeURIComponent(actionId)}`,
+    { method: "PATCH", body: JSON.stringify(body) },
+  );
+}
+
+function transitionWorkbenchAction(
+  requestId: string,
+  actionId: string,
+  transition: "submit" | "approve" | "reject",
+  body: { expected_action_version: number; expected_proposal_hash: string; rejection_reason?: string },
+): Promise<{ action: WorkbenchAction }> {
+  return apiFetch<{ action: WorkbenchAction }>(
+    `/api/v1/service-requests/${encodeURIComponent(requestId)}/agent/actions/${encodeURIComponent(actionId)}/${transition}`,
+    { method: "POST", body: JSON.stringify(body) },
+  );
+}
+
+export const submitWorkbenchAction = (
+  requestId: string, actionId: string, expected_action_version: number, expected_proposal_hash: string,
+) => transitionWorkbenchAction(requestId, actionId, "submit", { expected_action_version, expected_proposal_hash });
+
+export const approveWorkbenchAction = (
+  requestId: string, actionId: string, expected_action_version: number, expected_proposal_hash: string,
+) => transitionWorkbenchAction(requestId, actionId, "approve", { expected_action_version, expected_proposal_hash });
+
+export const rejectWorkbenchAction = (
+  requestId: string, actionId: string, expected_action_version: number, expected_proposal_hash: string, rejection_reason: string,
+) => transitionWorkbenchAction(requestId, actionId, "reject", { expected_action_version, expected_proposal_hash, rejection_reason });
 
 export function createServiceRequest(payload: {
   tenant_id: string;

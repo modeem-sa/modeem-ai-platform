@@ -1309,6 +1309,7 @@ def _transition(
 ) -> OperationTaskOut:
     task = _scoped_task(db, user, task_id, lock=True)
     _require_task_scope(db, user, task)
+    _reject_workbench_task(db, task)
     role = _role_in_tenant(db, user, task.tenant_id)
     if role is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found")
@@ -1386,9 +1387,29 @@ def reject_task(task_id: uuid.UUID, body: OperationTaskAction, user: User = Depe
 def _manager_task(db: Session, user: User, task_id: uuid.UUID) -> OperationTask:
     task = _scoped_task(db, user, task_id, lock=True)
     _require_task_scope(db, user, task)
+    _reject_workbench_task(db, task)
     if not _is_manager(_role_in_tenant(db, user, task.tenant_id)):
         raise HTTPException(status_code=403, detail="Insufficient role")
     return task
+
+
+def _reject_workbench_task(db: Session, task: OperationTask) -> None:
+    has_workbench_action = (
+        db.query(OperationAction.id)
+        .filter(
+            OperationAction.task_id == task.id,
+            OperationAction.tenant_id == task.tenant_id,
+            OperationAction.workflow_key == "finance.prepare_collection_followup",
+        )
+        .first()
+        is not None
+    )
+    if (
+        task.source_type == "agent_workbench"
+        or task.source_signal == "finance.prepare_collection_followup"
+        or has_workbench_action
+    ):
+        raise HTTPException(status_code=409, detail="Workbench actions use the request-bound approval boundary")
 
 
 def _single_invoice_summary(
